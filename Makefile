@@ -29,7 +29,7 @@ WARNINGS := -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wdouble-promotion \
             -Wformat=2 -Wundef -Wstrict-prototypes -Wmissing-prototypes \
             -Wnull-dereference -Wvla
 
-CPPFLAGS += -I$(INC_DIR)
+CPPFLAGS += -I$(INC_DIR) -I$(SRC_DIR)
 CFLAGS   += -std=$(STD) $(WARNINGS)
 DEPFLAGS  = -MMD -MP
 LDFLAGS  +=
