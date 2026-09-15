@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "state.h"
+
 int cmd_name_col(void)
 {
     int w = 0;
@@ -38,4 +40,25 @@ int cmd_lookup(const char *word)
         }
     }
     return -1;
+}
+
+void cmd_clear(AppState *state)
+{
+    input_reset(&state->input); /* draw() schreibt eh jeden frame
+                                 * komplett, "clear" = input leeren */
+}
+
+void cmd_models(AppState *state)
+{
+    state->models_dialog = true;
+    state->dialog = (DialogState){0}; /* frisch: leere suche */
+    input_reset(&state->input);
+}
+
+void cmd_settings(AppState *state)
+{
+    state->settings_dialog = true;
+    state->theme_sub = false;
+    state->dialog = (DialogState){0}; /* frisch: leere suche */
+    input_reset(&state->input);
 }

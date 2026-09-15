@@ -17,6 +17,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "keys.h"
+#include "state.h"
+
 /* terminal-zustand ist privat fuer dieses modul */
 static int g_raw = 0;
 static int g_alt = 0;
@@ -272,4 +275,123 @@ int term_size(int *rows, int *cols)
         return 0;
     }
     return -1;
+}
+
+UIMode ui_mode(const AppState *st)
+{
+    if (st->models_dialog) {
+        return MODE_MODELS;
+    }
+    if (st->settings_dialog) {
+        if (st->theme_sub) {
+            return MODE_THEME;
+        }
+        return MODE_SETTINGS;
+    }
+    return MODE_INPUT;
+}
+
+/* gemeinsame dialog-navigation: suchen + cursor. alle drei dialoge
+ * (modelle, settings, themes) benutzen dasselbe DialogState-objekt,
+ * das beim dialog-wechsel jeweils frisch gesetzt wird. */
+bool dialog_navigate(AppState *state, Key k)
+{
+    switch (k.kind) {
+    case KEY_BACKSPACE: {
+        size_t b_len = strlen(state->dialog.search);
+        if (b_len == 0) {
+            return true;
+        }
+        state->dialog.search[b_len - 1] = '\0';
+        state->dialog.selected = 0;
+        state->dialog.scroll = 0;
+        return true;
+    }
+    case KEY_UP:
+        if (state->dialog.selected > 0) {
+            state->dialog.selected--;
+        }
+        return true;
+    case KEY_DOWN:
+        /* obere kante kennt erst das layout -> einfach erhoehen,
+         * layout_compute() klemmt zurueck */
+        state->dialog.selected++;
+        return true;
+    case KEY_CHAR: {
+        size_t c_len = strlen(state->dialog.search);
+        if (c_len + 1 >= sizeof state->dialog.search) {
+            return true;
+        }
+        state->dialog.search[c_len] = k.ch;
+        state->dialog.search[c_len + 1] = '\0';
+        state->dialog.selected = 0;
+        state->dialog.scroll = 0;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+const char *on_off(bool on)
+{
+    if (on) {
+        return "on";
+    }
+    return "off";
+}
+
+const Model *model_at(const Config *cfg, int idx, const char **url)
+{
+    for (size_t p = 0; p < cfg->providers_len; p++) {
+        const Provider *pr = &cfg->providers[p];
+        if (idx < (int)pr->models_len) {
+            *url = pr->base_url;
+            return &pr->models[idx];
+        }
+        idx -= (int)pr->models_len;
+    }
+    return NULL;
+}
+
+int models_total(const Config *cfg)
+{
+    int n = 0;
+    for (size_t p = 0; p < cfg->providers_len; p++) {
+        n += (int)cfg->providers[p].models_len;
+    }
+    return n;
+}
+
+int models_match(const Config *cfg, const char *search, int *out, int out_max)
+{
+    int n = 0;
+    int total = models_total(cfg);
+    size_t slen = strlen(search);
+    for (int i = 0; i < total && n < out_max; i++) {
+        const char *url = "";
+        const Model *m = model_at(cfg, i, &url);
+        if (m != NULL && m->id != NULL && strncmp(m->id, search, slen) == 0) {
+            out[n++] = i;
+        }
+    }
+    return n;
+}
+
+int main_width(int cols)
+{
+    int dw = dbg_width(cols);
+    return (dw > 0) ? (cols - dw - 1) : cols;
+}
+
+int names_col(const char *const *names, int total)
+{
+    int w = 0;
+    for (int i = 0; i < total; i++) {
+        int len = (int)strlen(names[i]);
+        if (len > w) {
+            w = len;
+        }
+    }
+    return w;
 }

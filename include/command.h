@@ -1,6 +1,8 @@
 #ifndef MAX_AGENT_COMMAND
 #define MAX_AGENT_COMMAND
 
+#include "input.h"
+#include "state.h"
 #define COMMAND_CLEAR    "clear"
 #define COMMAND_QUIT     "quit"
 #define COMMAND_MODELS   "models"
@@ -31,5 +33,11 @@ static const Command COMMANDS[] = {
 int cmd_lookup(const char *word);
 int cmd_name_col(void);
 int cmd_match(const char *prefix, int *out, int out_max);
+
+/* dialog-oeffner: setzen die dialog-flags im state und leeren die
+ * chat-eingabe (das input liegt als member im state) */
+void cmd_clear(AppState *state);
+void cmd_models(AppState *state);
+void cmd_settings(AppState *state);
 
 #endif

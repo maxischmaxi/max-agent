@@ -3,10 +3,17 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <unistd.h>
 
+#include "command.h"
+#include "config.h"
+#include "debug.h"
+#include "settings.h"
+#include "theme.h"
 #include "utils.h"
 
 /* tastatur-puffer ist privat fuer dieses modul */
@@ -37,6 +44,97 @@ static bool is_csi_final(char c)
     return false;
 }
 
+/* ------------------------------------------------------------------ */
+/* POSIX/readline-shortcuts: eine tabelle fuer beide terminal-        */
+/* encodings. legacy terminals senden das nackte ctrl-byte (raw mode),*/
+/* kitty-protokoll sendet "\x1b[<codepoint>;5u" (5 = ctrl-modifikator, */
+/* codepoint = kleinbuchstabe). ctrl+c/ctrl+q sind app-spezifisch,     */
+/* laufen aber ueber dasselbe encoding und stehen deshalb mit in der */
+/* tabelle.                                                           */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    unsigned char byte; /* ctrl-byte im legacy-encoding */
+    int cp;             /* kitty-codepoint (kleinbuchstabe) */
+    KeyKind kind;
+} CtrlKey;
+
+static const CtrlKey CTRL_KEYS[] = {
+    {0x01, 'a', KEY_CTRL_A}, {0x02, 'b', KEY_CTRL_B}, {0x04, 'd', KEY_CTRL_D},
+    {0x05, 'e', KEY_CTRL_E}, {0x06, 'f', KEY_CTRL_F}, {0x08, 'h', KEY_CTRL_H},
+    {0x0b, 'k', KEY_CTRL_K}, {0x0c, 'l', KEY_CTRL_L}, {0x0e, 'n', KEY_CTRL_N},
+    {0x10, 'p', KEY_CTRL_P}, {0x14, 't', KEY_CTRL_T}, {0x15, 'u', KEY_CTRL_U},
+    {0x17, 'w', KEY_CTRL_W}, {0x03, 'c', KEY_CTRL_C}, /* app: quit-confirm /
+                                                         dialog zu */
+    {0x11, 'q', KEY_CTRL_Q},                          /* app: sofort beenden */
+};
+
+static KeyKind ctrl_from_byte(unsigned char c)
+{
+    size_t n = sizeof CTRL_KEYS / sizeof CTRL_KEYS[0];
+    for (size_t i = 0; i < n; i++) {
+        if (CTRL_KEYS[i].byte == c) {
+            return CTRL_KEYS[i].kind;
+        }
+    }
+    return KEY_NONE;
+}
+
+static KeyKind ctrl_from_kitty(int cp)
+{
+    size_t n = sizeof CTRL_KEYS / sizeof CTRL_KEYS[0];
+    for (size_t i = 0; i < n; i++) {
+        if (CTRL_KEYS[i].cp == cp) {
+            return CTRL_KEYS[i].kind;
+        }
+    }
+    return KEY_NONE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Meta-bindings (alt+x). legacy-terminals senden ESC + zeichen, das  */
+/* kitty-protokoll CSI <codepoint>;3u (3 = alt-modifikator).          */
+/* ------------------------------------------------------------------ */
+static const struct {
+    unsigned char byte; /* legacy: byte NACH ESC */
+    int cp;             /* kitty-codepoint */
+    KeyKind kind;
+} ALT_KEYS[] = {
+    {'b', 'b', KEY_ALT_B}, {'f', 'f', KEY_ALT_F},
+    {'d', 'd', KEY_ALT_D}, {0x7f, 127, KEY_ALT_BACKSPACE},
+    {'t', 't', KEY_ALT_T}, {'u', 'u', KEY_ALT_U},
+    {'l', 'l', KEY_ALT_L}, {'c', 'c', KEY_ALT_C},
+};
+
+static KeyKind alt_from_byte(unsigned char c)
+{
+    size_t n = sizeof ALT_KEYS / sizeof ALT_KEYS[0];
+    /* alt+shift liefert grossbuchstaben: wie die kleingeschriebene
+     * variante behandeln (readline macht dasselbe) */
+    if (c >= 'A' && c <= 'Z') {
+        c = (unsigned char)(c + ('a' - 'A'));
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (ALT_KEYS[i].byte == c) {
+            return ALT_KEYS[i].kind;
+        }
+    }
+    return KEY_NONE;
+}
+
+static KeyKind alt_from_kitty(int cp)
+{
+    size_t n = sizeof ALT_KEYS / sizeof ALT_KEYS[0];
+    if (cp >= 'A' && cp <= 'Z') {
+        cp = cp + ('a' - 'A');
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (ALT_KEYS[i].cp == cp) {
+            return ALT_KEYS[i].kind;
+        }
+    }
+    return KEY_NONE;
+}
+
 static bool wait_readable(int timeout_ms)
 {
     fd_set fds;
@@ -52,6 +150,57 @@ static bool wait_readable(int timeout_ms)
     return false;
 }
 
+/* modifikator-bits aus dem encoding (uebertragen wird 1 + bitmaske:
+ * 1 = shift, 2 = alt, 4 = ctrl). caps lock (64) und num lock (128)
+ * werden ausmaskiert, sonst faellt jeder shortcut aus, sobald eine
+ * lock-taste aktiv ist. */
+static unsigned mods_bits(int mods)
+{
+    if (mods < 1) {
+        return 0;
+    }
+    unsigned bits = (unsigned)(mods - 1);
+    return bits & ~(64U | 128U);
+}
+
+static KeyKind modified_key(int cp, unsigned bits)
+{
+    if ((bits & 4U) != 0U) {
+        return ctrl_from_kitty(cp);
+    }
+    if ((bits & 2U) != 0U) {
+        return alt_from_kitty(cp);
+    }
+    return KEY_NONE;
+}
+
+/* CSI <codepoint>;<mods> u (kitty) und CSI 27;<mods>;<codepoint> ~
+ * (xterm modifyOtherKeys) tragen dieselbe information */
+static KeyKind key_from_csi_codepoint(int cp, unsigned bits)
+{
+    if (cp == 13 && (bits & 7U) != 0U) {
+        return KEY_NEWLINE; /* shift/alt/ctrl + enter */
+    }
+    if (cp == 106 && (bits & 4U) != 0U) {
+        return KEY_NEWLINE; /* ctrl+j */
+    }
+    if (bits == 0U) {
+        /* unmodifizierte tasten, die das kitty-protokoll ebenfalls
+         * als CSI u meldet */
+        if (cp == 9) {
+            return KEY_TAB;
+        }
+        if (cp == 13) {
+            return KEY_ENTER;
+        }
+        if (cp == 27) {
+            return KEY_ESCAPE;
+        }
+        return KEY_NONE;
+    }
+    return modified_key(cp, bits);
+}
+
 Key key_from_escape(const char *seq, ssize_t len)
 {
     Key k = {KEY_NONE, 0};
@@ -64,6 +213,13 @@ Key key_from_escape(const char *seq, ssize_t len)
     if (len == 2 && seq[1] == '\r') {
         k.kind = KEY_NEWLINE;
         return k;
+    }
+    if (len == 2) {
+        /* meta-binding im legacy-encoding: ESC + zeichen */
+        k.kind = alt_from_byte((unsigned char)seq[1]);
+        if (k.kind != KEY_NONE) {
+            return k;
+        }
     }
     if (len < 3 || seq[1] != '[') {
         return k;
@@ -94,20 +250,23 @@ Key key_from_escape(const char *seq, ssize_t len)
         return k;
     }
 
-    int mods = (p[1] > 0) ? p[1] : 1;
+    if (final == 'A' && len == 3) {
+        k.kind = KEY_UP;
+        return k;
+    }
+    if (final == 'B' && len == 3) {
+        k.kind = KEY_DOWN;
+        return k;
+    }
+
     if (final == 'u') {
-        if ((p[0] == 13 && (mods == 2 || mods == 3 || mods == 5)) ||
-            (p[0] == 106 && mods == 5)) {
-            k.kind = KEY_NEWLINE;
-        } else if (p[0] == 99 && mods == 5) {
-            k.kind = KEY_CTRL_C;
-        } else if (p[0] == 113 && mods == 5) {
-            k.kind = KEY_CTRL_Q;
-        }
-    } else if (final == '~') {
-        if (p[0] == 27 && p[2] == 13 && (p[1] == 2 || p[1] == 5)) {
-            k.kind = KEY_NEWLINE;
-        }
+        /* kitty-protokoll: CSI <codepoint>;<mods> u. shift+tab
+         * (9;2u bzw. CSI Z) bleibt frei, z.B. fuer spaeteres
+         * reverse-completion */
+        k.kind = key_from_csi_codepoint(p[0], mods_bits(p[1]));
+    } else if (final == '~' && p[0] == 27 && p[2] >= 0) {
+        /* xterm modifyOtherKeys: CSI 27;<mods>;<codepoint> ~ */
+        k.kind = key_from_csi_codepoint(p[2], mods_bits(p[1]));
     }
     return k;
 }
@@ -119,71 +278,630 @@ Key key_from_byte(char c)
         k.kind = KEY_ENTER;
     } else if (c == '\n') {
         k.kind = KEY_NEWLINE;
-    } else if (c == 0x03) {
-        k.kind = KEY_CTRL_C;
-    } else if (c == 0x11) {
-        k.kind = KEY_CTRL_Q;
     } else if (c == 0x7f) {
         k.kind = KEY_BACKSPACE;
+    } else if (c == '\t') {
+        /* tab: im raw mode kommt kein escape-code, sondern das
+         * nackte byte 0x09 */
+        k.kind = KEY_TAB;
     } else if (c >= 32 && c <= 126) {
         k.kind = KEY_CHAR;
         k.ch = c;
+    } else {
+        /* ctrl-shortcuts aus dem steuerzeichen-bereich (tabelle) */
+        k.kind = ctrl_from_byte((unsigned char)c);
     }
     return k;
 }
 
-Key key_read(void)
+size_t key_seq_len(const char *buf, size_t len)
 {
-    if (g_pending_len > 0) {
-        if (g_pending[0] == 0x1b) {
-            /* esc mitten in einem batch: den rest als sequenz
-             * interpretieren, sonst wuerden die folgebytes als
-             * normale zeichen durchrutschen */
-            Key k = key_from_escape(g_pending, (ssize_t)g_pending_len);
-            g_pending_len = 0;
-            return k;
-        }
-        char c = g_pending[0];
-        memmove(g_pending, g_pending + 1, g_pending_len - 1);
-        g_pending_len--;
-        return key_from_byte(c);
+    if (len == 0) {
+        return 0;
     }
+    if (buf[0] != 0x1b) {
+        return 1; /* normales zeichen */
+    }
+    if (len == 1) {
+        return 0; /* nur esc: der rest koennte noch unterwegs sein */
+    }
+    if (buf[1] == 0x1b) {
+        return 1; /* esc esc: das erste esc ist fuer sich fertig */
+    }
+    if (buf[1] == '[') {
+        for (size_t i = 2; i < len; i++) {
+            if (is_csi_final(buf[i])) {
+                return i + 1;
+            }
+        }
+        return 0; /* final-byte fehlt noch */
+    }
+    if (buf[1] == 'O') {
+        return (len >= 3) ? 3 : 0; /* SS3 */
+    }
+    return 2; /* meta-binding: esc + zeichen */
+}
 
-    char seq[SEQ_MAX];
-    ssize_t n = read(STDIN_FILENO, seq, SEQ_MAX - 1);
+typedef enum {
+    FILL_OK,   /* neue bytes im puffer */
+    FILL_NONE, /* unterbrochen, z.B. SIGWINCH */
+    FILL_EOF,  /* pane zu */
+} FillResult;
+
+static FillResult fill_pending(void)
+{
+    if (g_pending_len >= SEQ_MAX) {
+        g_pending_len = 0; /* voller puffer ohne gueltige sequenz */
+    }
+    ssize_t n =
+        read(STDIN_FILENO, g_pending + g_pending_len, SEQ_MAX - g_pending_len);
     if (n < 0) {
         if (errno == EINTR) {
-            return (Key){KEY_NONE, 0}; /* z.B. SIGWINCH */
+            return FILL_NONE;
         }
         die("read failed");
     }
-    if (n == 0) { /* EOF: pane zu */
-        return (Key){KEY_CTRL_Q, 0};
+    if (n == 0) {
+        return FILL_EOF;
+    }
+    g_pending_len += (size_t)n;
+    return FILL_OK;
+}
+
+/* die ersten seq_len bytes als eine taste auswerten und entfernen */
+static Key take_pending(size_t seq_len)
+{
+    Key k = (g_pending[0] == 0x1b)
+                ? key_from_escape(g_pending, (ssize_t)seq_len)
+                : key_from_byte(g_pending[0]);
+    g_pending_len -= seq_len;
+    memmove(g_pending, g_pending + seq_len, g_pending_len);
+    return k;
+}
+
+/* wartezeiten fuer unvollstaendige sequenzen (ms): ein einzelnes esc
+ * ist nach kurzer pause wirklich die escape-taste. eine angefangene
+ * CSI-sequenz ist dagegen nur unterwegs (langsame verbindung, voller
+ * puffer) und bekommt deutlich mehr zeit - sonst landen ihre bytes
+ * als text im input. */
+#define ESC_WAIT_MS  30
+#define SEQ_WAIT_MS  200
+#define WAIT_STEP_MS 10
+
+/* eine taste aus dem puffer holen, bei leerem puffer von stdin
+ * nachlesen. enthaelt EIN read mehrere tasten (tastenwiederholung,
+ * schnelles tippen, paste), bleibt der rest im puffer und wird beim
+ * naechsten aufruf ausgewertet - es geht nichts verloren. */
+Key key_read(void)
+{
+    int waited = 0;
+    for (;;) {
+        if (g_pending_len > 0) {
+            size_t seq_len = key_seq_len(g_pending, g_pending_len);
+            if (seq_len > 0) {
+                return take_pending(seq_len);
+            }
+            int budget = (g_pending_len == 1) ? ESC_WAIT_MS : SEQ_WAIT_MS;
+            if (waited >= budget) {
+                /* es kommt nichts mehr: das bisherige als ganzes
+                 * werten (einzelnes esc, abgebrochene sequenz) */
+                return take_pending(g_pending_len);
+            }
+            if (!wait_readable(WAIT_STEP_MS)) {
+                waited += WAIT_STEP_MS;
+                continue;
+            }
+        }
+        FillResult r = fill_pending();
+        if (r == FILL_EOF) {
+            return (Key){KEY_CTRL_Q, 0};
+        }
+        if (r == FILL_NONE) {
+            return (Key){KEY_NONE, 0}; /* EINTR: resize pruefen */
+        }
+        waited = 0; /* fortschritt: die wartezeit beginnt von vorn */
+    }
+}
+
+static void handle_ctrl_c(AppState *state, DebugState *dbg, const Config *cfg)
+{
+    (void)dbg; /* dbg_log: im release wegkompiliert */
+    dbg_log(dbg, "input count: %d", (int)state->input.count);
+
+    if (!state->models_dialog && !state->settings_dialog &&
+        state->input.count > 1) {
+        input_reset(&state->input);
+        state->dirty = true;
+        return;
     }
 
-    if (seq[0] != 0x1b) {
-        for (ssize_t i = 1; i < n; i++) {
-            g_pending[g_pending_len++] = seq[i];
+    if (!state->models_dialog && !state->settings_dialog &&
+        state->input.count == 1) {
+        char *last_line = state->input.lines[state->input.count - 1];
+        size_t len = strlen(last_line);
+        if (len > 0) {
+            input_reset(&state->input);
+            state->dirty = true;
+            return;
         }
-        return key_from_byte(seq[0]);
     }
 
-    ssize_t len = n;
-    while (len < SEQ_MAX - 1) {
-        if (!wait_readable(30)) {
-            break; /* rest kommt nicht: einzelnes esc */
-        }
-        char b[8];
-        ssize_t m = read(STDIN_FILENO, b, sizeof b);
-        if (m <= 0) {
-            break;
-        }
-        for (ssize_t i = 0; i < m && len < SEQ_MAX - 1; i++) {
-            seq[len++] = b[i];
-        }
-        if (len > 0 && seq[len - 1] != 0x1b && is_csi_final(seq[len - 1])) {
-            break;
-        }
+    /* in einem dialog schliesst ctrl+c erst den dialog */
+    if (state->models_dialog || state->settings_dialog) {
+        state->models_dialog = false;
+        state->settings_dialog = false;
+        state->theme_sub = false;
+        state->dialog = (DialogState){0};
+        state->confirm_quit = false;
+        state->dirty = true;
+        return;
     }
-    return key_from_escape(seq, len);
+
+    /* setting "confirm quit": aus -> ctrl+c beendet sofort */
+    if (!cfg->confirm_quit) {
+        state->quit = true;
+        return;
+    }
+
+    if (state->confirm_quit) {
+        state->quit = true;
+    } else {
+        state->confirm_quit = true;
+        state->dirty = true;
+    }
+}
+
+static void handle_settings(AppState *state, Config *cfg, DebugState *dbg,
+                            Key k)
+{
+    /* suchen + cursor: bei allen dialogs identisch */
+    if (dialog_navigate(state, k)) {
+        state->dirty = true;
+        return;
+    }
+
+    switch (k.kind) {
+    case KEY_ESCAPE:
+        state->settings_dialog = false;
+        state->theme_sub = false;
+        state->dialog = (DialogState){0};
+        state->confirm_quit = false;
+        state->dirty = true;
+        break;
+    case KEY_ENTER:
+    case KEY_NEWLINE: {
+        /* was enter tut, entscheidet der typ des eintrags */
+        int hits[DIALOG_MATCH_MAX];
+        int n = names_match(SETTING_NAMES, SET_COUNT, state->dialog.search,
+                            hits, DIALOG_MATCH_MAX);
+        if (n == 0 || state->dialog.selected >= n) {
+            break; /* kein treffer: nichts zu tun */
+        }
+        switch ((SettingId)hits[state->dialog.selected]) {
+        case SET_THEME:
+            /* submenu: theme-optionen, frische suche */
+            state->theme_sub = true;
+            state->dialog = (DialogState){0};
+            state->dirty = true;
+            break;
+        case SET_CONFIRM_QUIT:
+            /* boolean: enter schaltet nur um, dialog bleibt offen,
+             * damit man den neuen wert direkt sieht */
+            if (cfg->confirm_quit) {
+                cfg->confirm_quit = false;
+            } else {
+                cfg->confirm_quit = true;
+            }
+            dbg_log(dbg, "confirm quit: %s", on_off(cfg->confirm_quit));
+            config_persist(cfg, dbg);
+            state->dirty = true;
+            break;
+        case SET_COUNT:
+            break;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void handle_theme(AppState *state, Config *cfg, DebugState *dbg, Key k)
+{
+    if (dialog_navigate(state, k)) {
+        state->dirty = true;
+        return;
+    }
+
+    switch (k.kind) {
+    case KEY_ESCAPE:
+        /* zurueck in die settings-liste (nicht dialog schliessen) */
+        state->theme_sub = false;
+        state->dialog = (DialogState){0};
+        state->confirm_quit = false;
+        state->dirty = true;
+        break;
+    case KEY_ENTER:
+    case KEY_NEWLINE: {
+        /* theme live anwenden; dialog bleibt offen, damit man
+         * mehrere themes direkt ausprobieren kann. esc geht zurueck
+         * in die settings-liste. */
+        const char *names[16];
+        int total = theme_names(names, (int)(sizeof names / sizeof names[0]));
+        int hits[DIALOG_MATCH_MAX];
+        int n = names_match(names, total, state->dialog.search, hits,
+                            DIALOG_MATCH_MAX);
+        if (n > 0 && state->dialog.selected < n) {
+            const char *name = names[hits[state->dialog.selected]];
+            if (theme_select(name)) {
+                free(cfg->theme);
+                cfg->theme = dup_str(name);
+                if (cfg->theme == NULL) {
+                    die("out of memory");
+                }
+                dbg_log(dbg, "theme: %s (match=%s)", theme_current()->name,
+                        theme_current()->match);
+                config_persist(cfg, dbg);
+                state->dirty = true; /* farben gelten sofort */
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void handle_models(AppState *state, Config *cfg, DebugState *dbg, Key k)
+{
+    /* dialog-modus: suchtext ist der input, das chat-feld
+     * existiert hier nicht */
+    if (dialog_navigate(state, k)) {
+        state->dirty = true;
+        return;
+    }
+
+    switch (k.kind) {
+    case KEY_ESCAPE:
+        state->models_dialog = false;
+        state->dialog = (DialogState){0};
+        state->confirm_quit = false;
+        state->dirty = true;
+        break;
+    case KEY_ENTER:
+    case KEY_NEWLINE: {
+        /* treffer uebernehmen: layout-daten sind nur im draw
+         * gueltig -> hier nochmal filtern (billig), selected
+         * ist von layout_compute() schon angeglichen */
+        int hits[DIALOG_MATCH_MAX];
+        int n = models_match(cfg, state->dialog.search, hits, DIALOG_MATCH_MAX);
+        if (n > 0 && state->dialog.selected < n) {
+            const char *url = "";
+            const Model *m = model_at(cfg, hits[state->dialog.selected], &url);
+            if (m != NULL && m->id != NULL) {
+                free(cfg->active_model);
+                cfg->active_model = dup_str(m->id);
+                if (cfg->active_model == NULL) {
+                    die("out of memory");
+                }
+                dbg_log(dbg, "modell gewaehlt: %s", m->id);
+                config_persist(cfg, dbg);
+            }
+        }
+        state->models_dialog = false;
+        state->dialog = (DialogState){0};
+        state->dirty = true;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void autocomplete_command(Input *input, int id, int max_len)
+{
+    const char *name = COMMANDS[id].name;
+    char *last = input->lines[input->count - 1];
+    const char *word = last_word(input);
+    size_t keep = (size_t)(word - last); /* text VOR dem wort */
+    size_t name_len = strlen(name);
+
+    /* breitengrenze wie input_char: nichts erzwingen */
+    if (keep + 1 + name_len >= (size_t)max_len) {
+        return;
+    }
+
+    char *grown = realloc(last, keep + 1 + name_len + 1);
+    if (!grown) {
+        die("out of memory");
+    }
+    memcpy(grown + keep + 1, name, name_len + 1); /* '/' + name + '\0' */
+    input->lines[input->count - 1] = grown;
+    /* der befehl steht immer in der letzten zeile – der cursor
+     * gehoert danach hinter den neuen text */
+    input->cursor_line = input->count - 1;
+    input_cursor_end(input);
+}
+
+static int cmd_list_height(const AppState *st)
+{
+    if (!st->cmd_active) {
+        return 0;
+    }
+    char prefix[64];
+    int idx[COMMAND_COUNT];
+    cmd_prefix(&st->input, prefix, sizeof prefix);
+    int n = cmd_match(prefix, idx, COMMAND_COUNT);
+    return (n > 0) ? n : 1; /* kein treffer: hinweis-zeile reservieren */
+}
+
+static void cmd_parse(const AppState *st, char *word, size_t word_sz,
+                      char *args, size_t args_sz)
+{
+    word[0] = '\0';
+    args[0] = '\0';
+
+    const char *last = st->input.lines[st->input.count - 1];
+    if (last[0] != '/') {
+        return;
+    }
+
+    const char *sp = strchr(last, ' ');
+    size_t wlen = (sp != NULL) ? (size_t)(sp - last) : strlen(last);
+    if (wlen >= word_sz) {
+        wlen = word_sz - 1;
+    }
+    memcpy(word, last, wlen);
+    word[wlen] = '\0';
+
+    if (sp != NULL && args_sz > 0) {
+        sp++; /* leerzeichen ueberspringen */
+        size_t alen = strlen(sp);
+        if (alen >= args_sz) {
+            alen = args_sz - 1;
+        }
+        memcpy(args, sp, alen);
+        args[alen] = '\0';
+    }
+}
+
+static void handle_all(AppState *state, DebugState *dbg, int rows, int cols,
+                       Key k)
+{
+    (void)dbg; /* im handle_all derzeit unbenutzt */
+
+    /* kurzform: die chat-eingabe liegt als member im state */
+    Input *input = &state->input;
+
+    if (state->confirm_quit) {
+        state->confirm_quit = false;
+        state->dirty = true;
+    }
+
+    switch (k.kind) {
+    case KEY_NEWLINE:
+        input_newline(input, rows, cmd_list_height(state), state->confirm_quit);
+        state->dirty = true;
+        break;
+    case KEY_ENTER: {
+        char word[64];
+        char args[128];
+        cmd_parse(state, word, sizeof word, args, sizeof args);
+
+        if (word[0] == '/') {
+            switch (cmd_lookup(word)) {
+            case CMD_CLEAR:
+                cmd_clear(state);
+                break;
+            case CMD_MODELS:
+                cmd_models(state);
+                break;
+            case CMD_QUIT:
+                state->quit = true;
+                break;
+            case CMD_SETTINGS:
+                cmd_settings(state);
+                break;
+            default: {
+                char prefix[64];
+                int idx[COMMAND_COUNT];
+                cmd_prefix(input, prefix, sizeof(prefix));
+                int m = cmd_match(prefix, idx, COMMAND_COUNT);
+                if (m > 0) {
+                    switch (idx[0]) {
+                    case CMD_CLEAR:
+                        cmd_clear(state);
+                        break;
+                    case CMD_MODELS:
+                        cmd_models(state);
+                        break;
+                    case CMD_SETTINGS:
+                        cmd_settings(state);
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                break;
+            }
+            }
+            state->cmd_active = false;
+            state->dirty = true;
+        } else {
+            /* normale nachricht: bestehendes verhalten */
+            input_reset(input);
+            state->cmd_active = false;
+            state->dirty = true;
+        }
+        break;
+    }
+    case KEY_BACKSPACE:
+    case KEY_CTRL_H: /* posix: backward-delete-char = backspace */
+        input_backspace(input);
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_CHAR:
+        input_char(input, k.ch, main_width(cols));
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_ESCAPE:
+        input_reset(input);
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_TAB: {
+        if (state->cmd_active) {
+            char prefix[64];
+            int idx[COMMAND_COUNT];
+            cmd_prefix(input, prefix, sizeof(prefix));
+            int m = cmd_match(prefix, idx, COMMAND_COUNT);
+            if (m > 0) {
+                autocomplete_command(input, idx[0], main_width(cols));
+            }
+        }
+        state->dirty =
+            true; /* egal ob vervollstaendigt: redraw zeigt den log */
+        break;
+    }
+    /* POSIX/readline-shortcuts: nur im normalen chat-input aktiv
+     * (die dialog-handler ignorieren sie). alles laeuft ueber die
+     * multiline-faehige cursor-utility aus input.c. */
+    case KEY_CTRL_A:
+        /* cursor an den anfang der aktuellen zeile */
+        input_cursor_home(input);
+        state->dirty = true;
+        break;
+    case KEY_CTRL_E:
+        /* cursor an das ende der aktuellen zeile */
+        input_cursor_end(input);
+        state->dirty = true;
+        break;
+    case KEY_CTRL_B:
+        /* cursor ein zeichen zurueck */
+        (void)input_cursor_left(input); /* am anfang: nichts zu tun */
+        state->dirty = true;
+        break;
+    case KEY_CTRL_F:
+        /* cursor ein zeichen vor */
+        (void)input_cursor_right(input); /* am ende: nichts zu tun */
+        state->dirty = true;
+        break;
+    case KEY_CTRL_W:
+        /* letztes wort vor dem cursor loeschen; am zeilenanfang den
+         * umbruch davor (multiline) */
+        (void)input_kill_last_word(input);
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_CTRL_U:
+        /* von cursor bis zeilenanfang loeschen (bash) */
+        (void)input_kill_line(input);
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_CTRL_K:
+        /* von cursor bis zeilenende loeschen; am ende den umbruch
+         * dahinter (multiline) */
+        (void)input_kill_to_end(input);
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_CTRL_D:
+        /* zeichen UNTER dem cursor loeschen; am zeilenende den
+         * umbruch dahinter. bewusst NICHT das terminal-EOF-
+         * verhalten – beenden ist ctrl+q. */
+        (void)input_delete_forward(input);
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_CTRL_L:
+        /* bildschirm neu zeichnen (clear + redraw, wie resize) */
+        fputs("\x1b[2J", stdout);
+        state->dirty = true;
+        break;
+    case KEY_CTRL_T:
+        /* zeichen vor/mit dem cursor vertauschen */
+        (void)input_transpose_chars(input);
+        state->dirty = true;
+        break;
+
+    /* Meta-bindings: wort-operationen (alnum-grenzen, siehe input.h) */
+    case KEY_ALT_B:
+        /* an den anfang des vorherigen worts */
+        (void)input_word_left(input);
+        state->dirty = true;
+        break;
+    case KEY_ALT_F:
+        /* ans ende des naechsten worts */
+        (void)input_word_right(input);
+        state->dirty = true;
+        break;
+    case KEY_ALT_D:
+        /* wort ab cursor vorwaerts killen */
+        (void)input_kill_word(input);
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_ALT_BACKSPACE:
+        /* wort vor dem cursor killen (alnum-grenzen) */
+        (void)input_kill_word_back(input);
+        state->cmd_active = input_in_cmd(input);
+        state->dirty = true;
+        break;
+    case KEY_ALT_T:
+        /* wort vor dem cursor mit dem danach vertauschen */
+        (void)input_transpose_words(input);
+        state->dirty = true;
+        break;
+    case KEY_ALT_U:
+        /* aktuelles/folgendes wort GROSSschreiben */
+        (void)input_word_upcase(input);
+        state->dirty = true;
+        break;
+    case KEY_ALT_L:
+        /* aktuelles/folgendes wort kleinschreiben */
+        (void)input_word_downcase(input);
+        state->dirty = true;
+        break;
+    case KEY_ALT_C:
+        /* aktuelles/folgendes wort kapitalisieren */
+        (void)input_word_capitalize(input);
+        state->dirty = true;
+        break;
+    case KEY_CTRL_P:
+    case KEY_CTRL_N:
+        /* history: spaeter – bis dahin wie up/down ohne funktion */
+    case KEY_DOWN:
+    case KEY_UP:
+        /* im chat-modus noch ohne funktion (spaeter evtl.
+         * history) – auf keinen fall die eingabe loeschen */
+    case KEY_NONE:
+    case KEY_CTRL_C:
+    case KEY_CTRL_Q:
+        break; /* alle ohne wirkung im chat-modus */
+    }
+}
+
+void handle_key(AppState *state, Config *cfg, DebugState *dbg, int rows,
+                int cols)
+{
+    Key k = key_read();
+
+    if (k.kind == KEY_CTRL_C) {
+        handle_ctrl_c(state, dbg, cfg);
+    } else if (k.kind == KEY_CTRL_Q) {
+        state->quit = true;
+    } else if (k.kind == KEY_NONE) {
+        /* nur resize-interesse */
+    } else if (ui_mode(state) == MODE_SETTINGS) {
+        handle_settings(state, cfg, dbg, k);
+    } else if (ui_mode(state) == MODE_THEME) {
+        handle_theme(state, cfg, dbg, k);
+    } else if (ui_mode(state) == MODE_MODELS) {
+        handle_models(state, cfg, dbg, k);
+    } else {
+        handle_all(state, dbg, rows, cols, k);
+    }
 }

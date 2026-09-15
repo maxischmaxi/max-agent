@@ -50,22 +50,512 @@ void input_free(Input *in)
         free(in->lines[i]);
     }
     in->count = 0;
+    in->cursor = 0;
+}
+
+/* laenge der aktuellen zeile (lines[count-1]) */
+size_t input_len(const Input *in)
+{
+    return strlen(in->lines[in->cursor_line]);
+}
+
+/* ------------------------------------------------------------------ */
+/* cursor-utility: nur bewegung, kein text-aenderung. die invariante   */
+/* (cursor <= len) wird von jeder funktion bewahrt.                    */
+/* ------------------------------------------------------------------ */
+
+void input_cursor_set(Input *in, size_t pos)
+{
+    size_t len = input_len(in);
+    if (pos > len) {
+        pos = len; /* klemmen: nie hinter das zeilenende */
+    }
+    in->cursor = pos;
+}
+
+void input_cursor_line_set(Input *in, size_t line)
+{
+    if (line >= in->count) {
+        line = in->count - 1; /* klemmen: letzte zeile */
+    }
+    in->cursor_line = line;
+    /* byte-cursor an die neue zeile anpassen */
+    input_cursor_set(in, in->cursor);
+}
+
+void input_cursor_home(Input *in)
+{
+    in->cursor = 0;
+}
+
+void input_cursor_end(Input *in)
+{
+    in->cursor = input_len(in);
+}
+
+bool input_cursor_left(Input *in)
+{
+    if (in->cursor == 0) {
+        /* zeilenanfang: ueber die grenze in die vorherige zeile */
+        if (in->cursor_line == 0) {
+            return false; /* anfang des gesamten buffers */
+        }
+        in->cursor_line--;
+        in->cursor = input_len(in); /* ans ende der zeile davor */
+        return true;
+    }
+    in->cursor--;
+    return true;
+}
+
+bool input_cursor_right(Input *in)
+{
+    if (in->cursor >= input_len(in)) {
+        /* zeilenende: ueber die grenze in die naechste zeile */
+        if (in->cursor_line + 1 >= in->count) {
+            return false; /* ende des gesamten buffers */
+        }
+        in->cursor_line++;
+        in->cursor = 0;
+        return true;
+    }
+    in->cursor++;
+    return true;
+}
+
+/* zeilenumbruch VOR dem cursor loeschen: die aktuelle zeile haengt
+ * an die vorherige, der cursor landet an der ehemaligen grenze */
+bool input_join_prev(Input *in)
+{
+    if (in->cursor_line == 0) {
+        return false; /* es gibt keine vorherige zeile */
+    }
+    char *prev = in->lines[in->cursor_line - 1];
+    char *cur = in->lines[in->cursor_line];
+    size_t prev_len = strlen(prev);
+    size_t cur_len = strlen(cur);
+
+    char *grown = realloc(prev, prev_len + cur_len + 1);
+    if (!grown) {
+        die("out of memory");
+    }
+    memcpy(grown + prev_len, cur, cur_len + 1); /* incl. '\0' */
+    /* gemergte zeile zurueckschreiben, dann erst freigeben */
+    in->lines[in->cursor_line - 1] = grown;
+    free(cur);
+
+    /* lines[cursor_line] entfaellt: die zeilen dahinter eine
+     * position vorruecken */
+    memmove((void *)&in->lines[in->cursor_line],
+            (const void *)&in->lines[in->cursor_line + 1],
+            (in->count - in->cursor_line - 1) * sizeof in->lines[0]);
+    in->count--;
+    in->cursor_line--;
+    in->cursor = prev_len; /* an der jetzt geloeschten grenze */
+    return true;
+}
+
+/* zeilenumbruch HINTER dem cursor loeschen: die naechste zeile haengt
+ * an die aktuelle, der cursor bleibt an seiner position */
+bool input_join_next(Input *in)
+{
+    if (in->cursor_line + 1 >= in->count) {
+        return false; /* es gibt keine naechste zeile */
+    }
+    char *cur = in->lines[in->cursor_line];
+    char *next = in->lines[in->cursor_line + 1];
+    size_t cur_len = strlen(cur);
+    size_t next_len = strlen(next);
+
+    char *grown = realloc(cur, cur_len + next_len + 1);
+    if (!grown) {
+        die("out of memory");
+    }
+    memcpy(grown + cur_len, next, next_len + 1); /* incl. '\0' */
+    /* gemergte zeile zurueckschreiben, dann erst freigeben */
+    in->lines[in->cursor_line] = grown;
+    free(next);
+
+    /* lines[cursor_line+1] entfaellt: die zeilen dahinter eine
+     * position vorruecken */
+    memmove((void *)&in->lines[in->cursor_line + 1],
+            (const void *)&in->lines[in->cursor_line + 2],
+            (in->count - in->cursor_line - 2) * sizeof in->lines[0]);
+    in->count--;
+    return true; /* cursor bleibt an seiner position */
+}
+
+/* zeichen UNTER dem cursor loeschen; am zeilenende den umbruch */
+bool input_delete_forward(Input *in)
+{
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+    if (in->cursor < len) {
+        /* rest (inkl. '\0') eine position zurueckruecken */
+        memmove(line + in->cursor, line + in->cursor + 1, len - in->cursor);
+        return true;
+    }
+    return input_join_next(in); /* am zeilenende: umbruch dahinter */
+}
+
+/* von cursor bis zeilenende loeschen; am ende den umbruch dahinter */
+bool input_kill_to_end(Input *in)
+{
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+    if (in->cursor < len) {
+        line[in->cursor] = '\0';
+        return true;
+    }
+    return input_join_next(in);
+}
+
+/* von zeilenanfang bis cursor loeschen, cursor auf 0 (ctrl+u) */
+bool input_kill_line(Input *in)
+{
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+    if (in->cursor == 0) {
+        return false; /* nichts vor dem cursor */
+    }
+    if (in->cursor > len) {
+        in->cursor = len; /* defensively klemmen */
+    }
+    /* text ab cursor an den anfang schieben (inkl. '\0') */
+    memmove(line, line + in->cursor, len - in->cursor + 1);
+    in->cursor = 0;
+    return true;
+}
+
+/* letztes wort vor dem cursor loeschen (inkl. whitespace davor);
+ * am zeilenanfang loescht es den umbruch in die vorherige zeile */
+bool input_kill_last_word(Input *in)
+{
+    if (in->cursor == 0) {
+        /* am zeilenanfang ist der "umbruch" das letzte wort */
+        return input_join_prev(in);
+    }
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+    if (in->cursor > len) {
+        in->cursor = len; /* defensively klemmen */
+    }
+    size_t start = in->cursor;
+    while (start > 0 && line[start - 1] == ' ') {
+        start--; /* whitespace vor dem wort mit loeschen */
+    }
+    while (start > 0 && line[start - 1] != ' ') {
+        start--; /* bis zum wortanfang */
+    }
+    memmove(line + start, line + in->cursor, len - in->cursor + 1);
+    in->cursor = start;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Meta-bindings: readline-"woerter" sind alphanumerische sequenzen  */
+/* (a-z, A-Z, 0-9), satzzeichen sind grenzen. ASCII reicht hier –   */
+/* keine locale-abhaengigkeit gewuenscht.                              */
+/* ------------------------------------------------------------------ */
+
+static bool is_alnum(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return true;
+    }
+    if (c >= 'a' && c <= 'z') {
+        return true;
+    }
+    if (c >= 'A' && c <= 'Z') {
+        return true;
+    }
+    return false;
+}
+
+/* an den anfang des vorherigen worts; laeuft ueber zeilengrenzen */
+bool input_word_left(Input *in)
+{
+    for (;;) {
+        char *line = in->lines[in->cursor_line];
+        size_t pos = in->cursor;
+        while (pos > 0 && !is_alnum(line[pos - 1])) {
+            pos--; /* sonderzeichen ueberspringen */
+        }
+        while (pos > 0 && is_alnum(line[pos - 1])) {
+            pos--; /* bis zum wortanfang */
+        }
+        if (pos != in->cursor) {
+            in->cursor = pos;
+            return true;
+        }
+        /* in dieser zeile kein wort davor: zeile hoch, am ende
+         * weiter suchen */
+        if (in->cursor_line == 0) {
+            return false; /* anfang von allem */
+        }
+        in->cursor_line--;
+        in->cursor = input_len(in);
+    }
+}
+
+/* an das ende des naechsten worts; laeuft ueber zeilengrenzen */
+bool input_word_right(Input *in)
+{
+    for (;;) {
+        char *line = in->lines[in->cursor_line];
+        size_t len = strlen(line);
+        size_t pos = in->cursor;
+        while (pos < len && !is_alnum(line[pos])) {
+            pos++; /* sonderzeichen ueberspringen */
+        }
+        while (pos < len && is_alnum(line[pos])) {
+            pos++; /* bis zum wortende */
+        }
+        if (pos != in->cursor) {
+            in->cursor = pos;
+            return true;
+        }
+        if (in->cursor_line + 1 >= in->count) {
+            return false; /* ende von allem */
+        }
+        in->cursor_line++;
+        in->cursor = 0;
+    }
+}
+
+/* wort ab cursor vorwaerts killen (alt+d) */
+bool input_kill_word(Input *in)
+{
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+    size_t end = in->cursor;
+    while (end < len && !is_alnum(line[end])) {
+        end++; /* sonderzeichen ueberspringen */
+    }
+    while (end < len && is_alnum(line[end])) {
+        end++; /* bis zum wortende */
+    }
+    if (end > in->cursor) {
+        memmove(line + in->cursor, line + end, len - end + 1);
+        return true;
+    }
+    /* kein wort mehr in der zeile: umbruch dahinter loeschen */
+    return input_join_next(in);
+}
+
+/* wort vor dem cursor rueckwaerts killen (alt+backspace) */
+bool input_kill_word_back(Input *in)
+{
+    if (in->cursor == 0) {
+        return input_join_prev(in);
+    }
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+    if (in->cursor > len) {
+        in->cursor = len; /* defensively klemmen */
+    }
+    size_t start = in->cursor;
+    while (start > 0 && !is_alnum(line[start - 1])) {
+        start--; /* sonderzeichen ueberspringen */
+    }
+    while (start > 0 && is_alnum(line[start - 1])) {
+        start--; /* bis zum wortanfang */
+    }
+    if (start == in->cursor) {
+        return false; /* nur sonderzeichen, nichts zu killen */
+    }
+    memmove(line + start, line + in->cursor, len - in->cursor + 1);
+    in->cursor = start;
+    return true;
+}
+
+/* zeichen vor/mit cursor tauschen (ctrl+t) */
+bool input_transpose_chars(Input *in)
+{
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+    if (in->cursor == 0 || len < 2) {
+        return false; /* am anfang braucht readline ein zeichen davor */
+    }
+    size_t a;
+    size_t b;
+    if (in->cursor >= len) {
+        /* am ende: letzte zwei tauschen, cursor bleibt am ende */
+        a = len - 2;
+        b = len - 1;
+    } else {
+        a = in->cursor - 1;
+        b = in->cursor;
+        in->cursor++;
+    }
+    char tmp = line[a];
+    line[a] = line[b];
+    line[b] = tmp;
+    return true;
+}
+
+/* wort vor dem cursor mit dem wort danach vertauschen (alt+t).
+ * readline-tausch um den cursor: das "wort danach" ist das wort,
+ * in dem der cursor steht bzw. das direkt dahinter – am zeilen-
+ * ende tauscht das die letzten zwei woerter, wie von bash gewohnt */
+bool input_transpose_words(Input *in)
+{
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+
+    /* wort B bestimmen */
+    size_t bs;
+    size_t be;
+    if (in->cursor < len && is_alnum(line[in->cursor])) {
+        /* cursor steht mitten in einem wort: dieses ist B */
+        bs = in->cursor;
+        be = bs;
+        while (be < len && is_alnum(line[be])) {
+            be++;
+        }
+    } else if (in->cursor > 0 && is_alnum(line[in->cursor - 1])) {
+        /* cursor direkt hinter einem wort: dieses ist B */
+        be = in->cursor;
+        bs = be;
+        while (bs > 0 && is_alnum(line[bs - 1])) {
+            bs--;
+        }
+    } else {
+        /* auf sonderzeichen: das naechste wort vorwaerts */
+        bs = in->cursor;
+        while (bs < len && !is_alnum(line[bs])) {
+            bs++;
+        }
+        if (bs >= len) {
+            return false; /* kein wort im spiel */
+        }
+        be = bs;
+        while (be < len && is_alnum(line[be])) {
+            be++;
+        }
+    }
+
+    /* wort A: das wort vor B */
+    size_t ae = bs;
+    while (ae > 0 && !is_alnum(line[ae - 1])) {
+        ae--;
+    }
+    size_t as = ae;
+    while (as > 0 && is_alnum(line[as - 1])) {
+        as--;
+    }
+    if (as == ae) {
+        return false; /* kein wort davor */
+    }
+
+    /* [A][luecke][B] -> [B][luecke][A]: das segment in einem
+     * temp-puffer neu zusammensetzen (eine rotation waere nur bei
+     * gleich langen woertern korrekt) */
+    size_t alen = ae - as;
+    size_t gap_len = bs - ae;
+    size_t blen = be - bs;
+    char *tmp = malloc(alen + gap_len + blen);
+    if (!tmp) {
+        die("out of memory");
+    }
+    memcpy(tmp, line + bs, blen);                  /* B vorn */
+    memcpy(tmp + blen, line + ae, gap_len);        /* dann die luecke */
+    memcpy(tmp + blen + gap_len, line + as, alen); /* dann A */
+    memcpy(line + as, tmp, alen + gap_len + blen);
+    free(tmp);
+    in->cursor = be; /* hinter das (neu hinten liegende) A */
+    return true;
+}
+
+/* wort ab cursor transformieren, cursor landet an dessen ende.
+ * readline-semantik: steht der cursor MITTEN in einem wort, wird
+ * nur der rest ab cursor transformiert; auf einer grenze greift
+ * das folgende wort komplett. */
+typedef enum {
+    WORD_UP,   /* ganzes wort gross */
+    WORD_DOWN, /* ganzes wort klein */
+    WORD_CAP,  /* erster buchstabe gross, rest klein */
+} WordCase;
+
+static bool word_case(Input *in, WordCase mode)
+{
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+
+    size_t start = in->cursor;
+    if (start < len && !is_alnum(line[start])) {
+        /* auf einer grenze: vor zum anfang des naechsten worts */
+        while (start < len && !is_alnum(line[start])) {
+            start++;
+        }
+    }
+    if (start >= len) {
+        return false; /* kein wort mehr */
+    }
+    size_t end = start;
+    while (end < len && is_alnum(line[end])) {
+        end++;
+    }
+    for (size_t k = start; k < end; k++) {
+        char c = line[k];
+        bool upper = false;
+        switch (mode) {
+        case WORD_UP:
+            upper = true;
+            break;
+        case WORD_DOWN:
+            upper = false;
+            break;
+        case WORD_CAP:
+            upper = (k == start);
+            break;
+        }
+        if (c >= 'a' && c <= 'z' && upper) {
+            line[k] = (char)(c - ('a' - 'A'));
+        } else if (c >= 'A' && c <= 'Z' && !upper) {
+            line[k] = (char)(c + ('a' - 'A'));
+        }
+    }
+    in->cursor = end;
+    return true;
+}
+
+bool input_word_upcase(Input *in)
+{
+    return word_case(in, WORD_UP);
+}
+
+bool input_word_downcase(Input *in)
+{
+    return word_case(in, WORD_DOWN);
+}
+
+bool input_word_capitalize(Input *in)
+{
+    return word_case(in, WORD_CAP);
 }
 
 void input_char(Input *in, char c, int cols)
 {
-    char *last = in->lines[in->count - 1];
-    size_t len = strlen(last);
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
     if (len >= (size_t)(cols - 4)) {
         return;
     }
-    char *grown = realloc(last, len + 2);
+    /* defensively klemmen – die invariante sollte immer gelten */
+    if (in->cursor > len) {
+        in->cursor = len;
+    }
+    char *grown = realloc(line, len + 2);
     if (!grown) {
         die("out of memory");
     }
-    in->lines[in->count - 1] = grown;
-    grown[len] = c;
-    grown[len + 1] = '\0';
+    in->lines[in->cursor_line] = grown;
+    /* einfuegen AN der cursor-position: der rest (inkl. '\0')
+     * rueckt eine position weiter */
+    memmove(grown + in->cursor + 1, grown + in->cursor, len - in->cursor + 1);
+    grown[in->cursor] = c;
+    in->cursor++;
 }
 
 int bottom_border_for(int rows, int list_h, bool g_confirm_quit)
@@ -92,23 +582,52 @@ void input_newline(Input *in, int rows, int list_h, bool g_confirm_quit)
     if (bottom_border - (int)in->count - 1 < 2) {
         return;
     }
-    char *empty = calloc(1, 1);
-    if (!empty) {
+
+    /* aktuelle zeile an der cursor-position SPLITTEN: der text
+     * hinter dem cursor wird die neue zeile. am zeilenende ist das
+     * identisch zum alten verhalten (leere zeile anhaengen) */
+    char *cur = in->lines[in->cursor_line];
+    size_t len = strlen(cur);
+    if (in->cursor > len) {
+        in->cursor = len; /* defensively klemmen */
+    }
+    char *tail = dup_str(cur + in->cursor);
+    if (!tail) {
         die("out of memory");
     }
-    in->lines[in->count++] = empty;
+    char *head = realloc(cur, in->cursor + 1);
+    if (!head) {
+        free(tail);
+        die("out of memory");
+    }
+    head[in->cursor] = '\0';
+    in->lines[in->cursor_line] = head;
+
+    /* zeilen ab cursor_line+1 eine position nach hinten schieben */
+    memmove((void *)&in->lines[in->cursor_line + 2],
+            (const void *)&in->lines[in->cursor_line + 1],
+            (in->count - in->cursor_line - 1) * sizeof in->lines[0]);
+    in->lines[in->cursor_line + 1] = tail;
+    in->count++;
+    in->cursor_line++; /* cursor am anfang der neuen zeile */
+    in->cursor = 0;
 }
 
 void input_backspace(Input *in)
 {
-    char *last = in->lines[in->count - 1];
-    size_t len = strlen(last);
-    if (len > 0) {
-        last[len - 1] = '\0';
-    } else if (in->count > 1) {
-        free(last);
-        in->count--;
+    char *line = in->lines[in->cursor_line];
+    size_t len = strlen(line);
+    if (in->cursor > 0 && in->cursor <= len) {
+        /* zeichen VOR dem cursor loeschen: rest (inkl. '\0')
+         * rueckt eine position zurueck */
+        memmove(line + in->cursor - 1, line + in->cursor, len - in->cursor + 1);
+        in->cursor--;
+        return;
     }
+    /* am zeilenanfang: den zeilenumbruch davor loeschen. bei einer
+     * leeren letzten zeile entfernt das genau die zeile und der
+     * cursor landet am ende der zeile davor (wie bisher) */
+    (void)input_join_prev(in);
 }
 
 void input_reset(Input *in)

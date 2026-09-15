@@ -27,6 +27,14 @@ static int build_test_config(Config *cfg)
         return -1;
     }
 
+    /* settings, wie sie der settings-dialog schreibt */
+    cfg->theme = dup_str("tokyo-night");
+    cfg->confirm_quit = false;
+    cfg->active_model = dup_str("gpt-test");
+    if (!cfg->theme || !cfg->active_model) {
+        return -1;
+    }
+
     p->models = calloc(2, sizeof(Model));
     if (!p->models) {
         return -1;
@@ -89,6 +97,12 @@ int main(void)
     CHECK(m1->input_types_len == 0);
     CHECK(m1->inputTypes == NULL);
 
+    /* settings roundtrip */
+    CHECK(loaded.theme != NULL && strcmp(loaded.theme, "tokyo-night") == 0);
+    CHECK(!loaded.confirm_quit);
+    CHECK(loaded.active_model != NULL &&
+          strcmp(loaded.active_model, "gpt-test") == 0);
+
     free_config(&cfg);
     free_config(&loaded);
 
@@ -98,7 +112,19 @@ int main(void)
     CHECK(load_config_from(TEST_PATH, &empty) == 0);
     CHECK(empty.providers == NULL);
     CHECK(empty.providers_len == 0);
+    CHECK(empty.theme == NULL);        /* kein theme gesetzt = "auto" */
+    CHECK(empty.active_model == NULL); /* kein modell gewaehlt */
+    CHECK(empty.confirm_quit);         /* default: bestaetigung an */
     free_config(&empty);
+
+    /* --- settings ohne "settings"-objekt -> defaults --- */
+    CHECK(write_file(TEST_PATH, "{\"providers\":[]}",
+                     strlen("{\"providers\":[]}")) == 0);
+    Config nosettings;
+    CHECK(load_config_from(TEST_PATH, &nosettings) == 0);
+    CHECK(nosettings.confirm_quit);
+    CHECK(nosettings.theme == NULL);
+    free_config(&nosettings);
 
     /* --- kaputte datei -> fehler --- */
     CHECK(write_file(TEST_PATH, "kein json", strlen("kein json")) == 0);

@@ -24,6 +24,64 @@ static Theme g_theme = {
     .reset = "\x1b[39m",
 };
 
+/* ------------------------------------------------------------------ */
+/* benannte themes: match-farbe als palette-index (0 = normal, 9x =   */
+/* bright). das terminal mappt den index auf sein farbschema – wer z.B. */
+/* die catppuccin-palette installiert hat, sieht das rosa highlight.   */
+/* ------------------------------------------------------------------ */
+static const struct {
+    const char *name;
+    const char *match;
+} NAMED_THEMES[] = {
+    {"catppuccin", "\x1b[95m"},  /* bright magenta -> pink */
+    {"tokyo-night", "\x1b[94m"}, /* bright blue */
+    {"github-dark", "\x1b[92m"}, /* bright green */
+    {"dracula", "\x1b[35m"},     /* magenta -> purple */
+    {"gruvbox", "\x1b[93m"},     /* bright yellow */
+};
+#define NAMED_THEME_COUNT ((int)(sizeof NAMED_THEMES / sizeof NAMED_THEMES[0]))
+
+/* vorwaertsdeklaration: pick_auto() ist erst nach dem parser-teil
+ * definiert, theme_select() benutzt es aber schon frueher */
+static void pick_auto(void);
+
+int theme_option_count(void)
+{
+    return NAMED_THEME_COUNT + 1; /* "auto" + tabelle */
+}
+
+const char *theme_option_name(int idx)
+{
+    if (idx == 0) {
+        return "auto";
+    }
+    if (idx < 1 || idx > NAMED_THEME_COUNT) {
+        return NULL;
+    }
+    return NAMED_THEMES[idx - 1].name;
+}
+
+bool theme_select(const char *name)
+{
+    if (name == NULL) {
+        return false;
+    }
+    if (strcmp(name, "auto") == 0) {
+        pick_auto(); /* aus den abgefragten terminal-farben */
+        g_theme.name = "auto";
+        return true;
+    }
+    for (int i = 0; i < NAMED_THEME_COUNT; i++) {
+        if (strcmp(name, NAMED_THEMES[i].name) == 0) {
+            g_theme.name = NAMED_THEMES[i].name;
+            g_theme.match = NAMED_THEMES[i].match;
+            g_theme.reset = "\x1b[39m";
+            return true;
+        }
+    }
+    return false;
+}
+
 void theme_set(const Theme *t)
 {
     if (t != NULL) {
@@ -274,4 +332,29 @@ void theme_init(char *leftover, size_t cap, size_t *len)
 
     pick_auto();
     *len = p.len;
+}
+
+int theme_names(const char *out[], int out_max)
+{
+    int total = theme_option_count();
+    if (total > out_max) {
+        total = out_max;
+    }
+    for (int i = 0; i < total; i++) {
+        out[i] = theme_option_name(i);
+    }
+    return total;
+}
+
+int names_match(const char *const *names, int total, const char *search,
+                int *out, int out_max)
+{
+    int n = 0;
+    size_t slen = strlen(search);
+    for (int i = 0; i < total && n < out_max; i++) {
+        if (strncmp(names[i], search, slen) == 0) {
+            out[n++] = i;
+        }
+    }
+    return n;
 }

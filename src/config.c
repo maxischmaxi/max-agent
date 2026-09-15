@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "debug.h"
 #include "utils.h"
 
 static const char *input_type_to_str(InputType t)
@@ -175,9 +176,28 @@ static int load_provider(Provider *pro, cJSON *item)
     return 0;
 }
 
+static void load_settings(cJSON *root, Config *config)
+{
+    /* ein fehlendes "settings"-objekt ist kein fehler: defaults
+     * stehen schon (siehe load_config_from) */
+    cJSON *s = cJSON_GetObjectItem(root, "settings");
+    if (!cJSON_IsObject(s)) {
+        return;
+    }
+    (void)dup_json_str(s, "theme", &config->theme);
+    (void)dup_json_str(s, "activeModel", &config->active_model);
+
+    cJSON *cq = cJSON_GetObjectItem(s, "confirmQuit");
+    if (cJSON_IsBool(cq)) {
+        config->confirm_quit = (cJSON_IsTrue(cq) != 0);
+    }
+}
+
 int load_config_from(const char *path, Config *config)
 {
     memset(config, 0, sizeof *config);
+    config->confirm_quit =
+        true; /* default, kann von "settings" ueberschrieben werden */
 
     if (!is_file(path)) {
         return 0; /* keine datei -> leere config, kein fehler */
@@ -225,6 +245,7 @@ int load_config_from(const char *path, Config *config)
         }
     }
 
+    load_settings(root, config);
     cJSON_Delete(root);
     return 0;
 }
@@ -340,6 +361,41 @@ fail:
     return NULL;
 }
 
+static cJSON *settings_to_json(const Config *config)
+{
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return NULL;
+    }
+
+    cJSON *theme =
+        cJSON_CreateString((config->theme != NULL) ? config->theme : "auto");
+    if (!theme) {
+        goto fail;
+    }
+    cJSON_AddItemToObject(obj, "theme", theme);
+
+    cJSON *confirm = cJSON_CreateBool((cJSON_bool)config->confirm_quit);
+    if (!confirm) {
+        goto fail;
+    }
+    cJSON_AddItemToObject(obj, "confirmQuit", confirm);
+
+    if (config->active_model != NULL) {
+        cJSON *model = cJSON_CreateString(config->active_model);
+        if (!model) {
+            goto fail;
+        }
+        cJSON_AddItemToObject(obj, "activeModel", model);
+    }
+
+    return obj;
+
+fail:
+    cJSON_Delete(obj);
+    return NULL;
+}
+
 int save_config_to(const char *path, const Config *config)
 {
     cJSON *root = cJSON_CreateObject();
@@ -363,6 +419,13 @@ int save_config_to(const char *path, const Config *config)
         cJSON_AddItemToArray(providers, p);
     }
     cJSON_AddItemToObject(root, "providers", providers);
+
+    cJSON *settings = settings_to_json(config);
+    if (!settings) {
+        cJSON_Delete(root);
+        return -1;
+    }
+    cJSON_AddItemToObject(root, "settings", settings);
 
     char *json = cJSON_Print(root);
     cJSON_Delete(root);
@@ -400,7 +463,15 @@ int save_config(const Config *config)
 
 void free_config(Config *config)
 {
-    if (config == NULL || config->providers == NULL) {
+    if (config == NULL) {
+        return;
+    }
+    free(config->theme);
+    config->theme = NULL;
+    free(config->active_model);
+    config->active_model = NULL;
+
+    if (config->providers == NULL) {
         return;
     }
     for (size_t i = 0; i < config->providers_len; i++) {
@@ -416,4 +487,14 @@ void free_config(Config *config)
     free(config->providers);
     config->providers = NULL;
     config->providers_len = 0;
+}
+
+void config_persist(Config *cfg, DebugState *dbg)
+{
+    (void)dbg; /* dbg_log: im release wegkompiliert */
+    if (save_config(cfg) == 0) {
+        dbg_log(dbg, "config gespeichert");
+    } else {
+        dbg_log(dbg, "config speichern fehlgeschlagen");
+    }
 }

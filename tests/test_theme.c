@@ -63,9 +63,41 @@ static void test_set_get(void)
     CHECK(strcmp(theme_current()->name, "auto") == 0);
 }
 
+static void test_select_and_options(void)
+{
+    /* auswahl-tabelle: index 0 = "auto", danach die benannten themes */
+    CHECK(theme_option_count() >= 2);
+    CHECK(theme_option_name(0) != NULL);
+    CHECK(strcmp(theme_option_name(0), "auto") == 0);
+    CHECK(theme_option_name(-1) == NULL);
+    CHECK(theme_option_name(theme_option_count()) == NULL);
+
+    /* alle tabellen-namen sind anwaehlbar */
+    for (int i = 0; i < theme_option_count(); i++) {
+        CHECK(theme_select(theme_option_name(i)));
+    }
+
+    /* benanntes theme: name + match-color wechseln */
+    CHECK(theme_select("catppuccin"));
+    CHECK(strcmp(theme_current()->name, "catppuccin") == 0);
+    CHECK(theme_current()->match != NULL);
+
+    /* "auto" laesst den namen auf auto zurueckkehren */
+    CHECK(theme_select("auto"));
+    CHECK(strcmp(theme_current()->name, "auto") == 0);
+
+    /* unbekannt -> nichts aendern sich */
+    const Theme *before = theme_current();
+    CHECK(!theme_select("gibts-nicht"));
+    CHECK(theme_current() == before);
+    CHECK(!theme_select(NULL));
+    CHECK(theme_current() == before);
+}
+
 int main(void)
 {
     test_parse_color_reply();
     test_set_get();
+    test_select_and_options();
     return test_report();
 }

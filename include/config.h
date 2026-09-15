@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "debug.h"
+
 typedef enum {
     TEXT,
     IMAGE,
@@ -34,6 +36,11 @@ typedef struct {
 typedef struct {
     Provider *providers;
     size_t providers_len;
+
+    /* settings (settings-dialog, in der config unter "settings") */
+    char *theme;        /* theme-name oder NULL (= "auto") */
+    bool confirm_quit;  /* ctrl+c doppelt bestaetigen? (default: an) */
+    char *active_model; /* id des im models-dialog gewaehlten modells */
 } Config;
 
 int load_config(Config *config);
@@ -43,5 +50,6 @@ int load_config_from(const char *path, Config *config);
 int save_config_to(const char *path, const Config *config);
 
 void free_config(Config *config);
+void config_persist(Config *cfg, DebugState *dbg);
 
 #endif
