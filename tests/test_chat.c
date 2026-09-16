@@ -466,6 +466,168 @@ static void test_scroll_hints(void)
     chat_free(&st.chat);
 }
 
+/* soft-wrap im eingabefeld: die box waechst mit den umgebrochenen
+ * zeilen, ein resize rechnet neu – und der TEXT bleibt dabei
+ * unangetastet. das ist der grund, warum der umbruch nicht ins
+ * datenmodell geht. */
+static void test_input_wrap_layout(void)
+{
+    AppState st = {0};
+    input_init(&st.input);
+    Config cfg = {0};
+    Layout lt;
+
+    /* --- kurzer text: eine zeile, box wie gehabt --- */
+    input_set_text(&st.input, "kurz");
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    CHECK(lt.input_bottom - lt.input_top == 2); /* 1 zeile + 2 rahmen */
+    CHECK(lt.input_first == 0);
+    CHECK(lt.input_w > 0);
+    CHECK(layout_slot(&lt, lt.input_top + 1).kind == SLOT_INPUT);
+
+    /* --- text laenger als das feld: die box waechst --- */
+    size_t n = (size_t)lt.input_w * 3;
+    char *lang = malloc(n + 1);
+    CHECK(lang != NULL);
+    if (lang == NULL) {
+        return;
+    }
+    memset(lang, 'x', n);
+    lang[n] = '\0';
+    input_set_text(&st.input, lang);
+    CHECK(st.input.count == 1); /* EINE logische zeile */
+
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    CHECK(lt.input_bottom - lt.input_top == 4);  /* 3 zeilen + rahmen */
+    CHECK(strcmp(st.input.lines[0], lang) == 0); /* text unveraendert */
+
+    /* --- schmaleres fenster: mehr zeilen, gleicher text --- */
+    layout_compute(&lt, 24, 40, MODE_INPUT, &st, &cfg);
+    int narrow = lt.input_bottom - lt.input_top - 1;
+    CHECK(narrow > 3);
+    CHECK(strcmp(st.input.lines[0], lang) == 0);
+    CHECK(st.input.count == 1);
+
+    /* --- breiteres fenster: wieder weniger zeilen --- */
+    layout_compute(&lt, 24, 200, MODE_INPUT, &st, &cfg);
+    int wide = lt.input_bottom - lt.input_top - 1;
+    CHECK(wide < narrow);
+    CHECK(strcmp(st.input.lines[0], lang) == 0);
+    CHECK(st.input.count == 1);
+    free(lang);
+
+    /* --- sehr viel text: die box deckelt und scrollt mit --- */
+    char *riesig = malloc(4001);
+    CHECK(riesig != NULL);
+    if (riesig == NULL) {
+        return;
+    }
+    memset(riesig, 'y', 4000);
+    riesig[4000] = '\0';
+    input_set_text(&st.input, riesig);
+    free(riesig);
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    int box_h = lt.input_bottom - lt.input_top - 1;
+    CHECK(box_h > 0);
+    CHECK(lt.input_top >= 1);  /* nie ueber den rand hinaus */
+    CHECK(lt.input_top >= 2);  /* zwei zeilen bleiben oben frei */
+    CHECK(lt.input_first > 0); /* es wird gescrollt */
+    /* die cursor-zeile ist sichtbar */
+    size_t crow = 0;
+    input_cursor_screen(&st.input, lt.input_w, &crow, NULL);
+    CHECK(crow >= lt.input_first);
+    CHECK(crow < lt.input_first + (size_t)box_h);
+
+    /* cursor nach vorn: das feld scrollt zurueck */
+    input_cursor_line_set(&st.input, 0);
+    input_cursor_set(&st.input, 0);
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    CHECK(lt.input_first == 0);
+
+    /* --- explizite newlines bleiben eigene zeilen --- */
+    input_set_text(&st.input, "a\nb\nc");
+    CHECK(st.input.count == 3);
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    CHECK(lt.input_bottom - lt.input_top == 4); /* 3 zeilen + rahmen */
+
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
+/* die zwei statuszeilen unten: sie sind fest reserviert, gehoeren
+ * niemandem sonst, und alles andere rueckt darueber. */
+static void test_status_rows(void)
+{
+    AppState st = {0};
+    input_init(&st.input);
+    Config cfg = {0};
+    Layout lt;
+
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    /* zeile 24 bleibt frei (dort parkt frame_end den cursor),
+     * darueber die beiden statuszeilen */
+    CHECK(lt.status_row == 24 - STATUS_H);
+    CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
+    CHECK(layout_slot(&lt, lt.status_row + 1).kind == SLOT_STATUS_TOKENS);
+
+    /* das eingabefeld liegt komplett DARUEBER */
+    CHECK(lt.input_bottom < lt.status_row);
+    CHECK(lt.input_top < lt.input_bottom);
+
+    /* keine andere zeile beansprucht die statuszeilen */
+    for (int row = 1; row < lt.status_row; row++) {
+        Slot s = layout_slot(&lt, row);
+        CHECK(s.kind != SLOT_STATUS_MODEL);
+        CHECK(s.kind != SLOT_STATUS_TOKENS);
+    }
+
+    /* --- mit befehlsliste: alles rueckt hoch, status bleibt --- */
+    input_set_text(&st.input, "/");
+    st.cmd_active = true;
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    CHECK(lt.status_row == 24 - STATUS_H);
+    CHECK(lt.cmd_h > 0);
+    CHECK(lt.cmd_top + lt.cmd_h <= lt.status_row); /* kein ueberlapp */
+    CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
+    st.cmd_active = false;
+    input_reset(&st.input);
+
+    /* --- mit quit-meldung: die liegt ueber dem status --- */
+    st.confirm_quit = true;
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    CHECK(lt.quit_row > 0);
+    CHECK(lt.quit_row < lt.status_row);
+    CHECK(layout_slot(&lt, lt.quit_row).kind == SLOT_QUIT);
+    CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
+    st.confirm_quit = false;
+
+    /* --- in den dialogen ebenfalls immer sichtbar --- */
+    st.models_dialog = true;
+    layout_compute(&lt, 24, 80, MODE_MODELS, &st, &cfg);
+    CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
+    CHECK(layout_slot(&lt, lt.status_row + 1).kind == SLOT_STATUS_TOKENS);
+    CHECK(lt.box_bottom < lt.status_row); /* dialog bleibt darueber */
+    st.models_dialog = false;
+
+    /* --- kleine terminals: entweder passt der status sauber
+     *     darunter, oder er faellt ganz weg. nie ueberlappen. --- */
+    for (int rows = 1; rows <= 12; rows++) {
+        layout_compute(&lt, rows, 80, MODE_INPUT, &st, &cfg);
+        if (lt.status_row == 0) {
+            continue; /* kein platz: bewusst kein status */
+        }
+        CHECK(lt.status_row >= 1);
+        CHECK(lt.status_row + STATUS_H - 1 <= rows);
+        CHECK(lt.input_bottom < lt.status_row); /* box liegt darueber */
+        CHECK(lt.input_top >= 1);
+        CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
+        CHECK(layout_slot(&lt, lt.status_row + 1).kind == SLOT_STATUS_TOKENS);
+    }
+
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
 int main(void)
 {
     test_append_pop_clear();
@@ -473,5 +635,7 @@ int main(void)
     test_wrap();
     test_layout();
     test_scroll_hints();
+    test_input_wrap_layout();
+    test_status_rows();
     return test_report();
 }

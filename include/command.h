@@ -1,17 +1,24 @@
 #ifndef MAX_AGENT_COMMAND
 #define MAX_AGENT_COMMAND
 
+#include "config.h"
 #include "input.h"
 #include "state.h"
 #define COMMAND_CLEAR    "clear"
 #define COMMAND_QUIT     "quit"
 #define COMMAND_MODELS   "models"
 #define COMMAND_SETTINGS "settings"
+#define COMMAND_NEW      "new"
+#define COMMAND_RESUME   "resume"
+#define COMMAND_RENAME   "rename"
 
 typedef enum {
     CMD_CLEAR = 0,
     CMD_MODELS,
+    CMD_NEW,
     CMD_QUIT,
+    CMD_RENAME,
+    CMD_RESUME,
     CMD_SETTINGS,
     CMD_COUNT, /* muss immer letzter sein: COMMANDS[] sonst NULL-luecke */
 } CmdId;
@@ -24,7 +31,10 @@ typedef struct {
 static const Command COMMANDS[] = {
     [CMD_CLEAR] = {COMMAND_CLEAR, "start a new session"},
     [CMD_MODELS] = {COMMAND_MODELS, "select a model"},
+    [CMD_NEW] = {COMMAND_NEW, "start a new session"},
     [CMD_QUIT] = {COMMAND_QUIT, "quit max agent"},
+    [CMD_RENAME] = {COMMAND_RENAME, "name the current session"},
+    [CMD_RESUME] = {COMMAND_RESUME, "list and resume sessions"},
     [CMD_SETTINGS] = {COMMAND_SETTINGS, "max agent settings"},
 };
 
@@ -36,8 +46,15 @@ int cmd_match(const char *prefix, int *out, int out_max);
 
 /* dialog-oeffner: setzen die dialog-flags im state und leeren die
  * chat-eingabe (das input liegt als member im state) */
+void cmd_new(AppState *state);
 void cmd_clear(AppState *state);
 void cmd_models(AppState *state);
 void cmd_settings(AppState *state);
+void cmd_resume(AppState *state);
+
+/* die AKTUELLE session benennen. ist noch keine offen, entsteht
+ * sie hier (erst nur mit id, ohne nachrichten). leerer name ist
+ * ein fehler -> hinweis im verlauf. */
+void cmd_rename(AppState *state, const Config *cfg, const char *name);
 
 #endif

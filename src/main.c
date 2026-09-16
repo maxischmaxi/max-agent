@@ -9,10 +9,10 @@
 #include <unistd.h>
 
 #include "config.h"
-#include "debug.h"
 #include "draw.h"
 #include "input.h"
 #include "keys.h"
+#include "session.h"
 #include "state.h"
 #include "theme.h"
 #include "utils.h"
@@ -35,10 +35,6 @@ int main(void)
     AppState state = {0};
     input_init(&state.input);
 
-    /* debug-zustand gehoert main und wird als pointer durchgereicht.
-     * static: ~82KB, zero-initialisiert, kein stack-verbrauch. */
-    static DebugState dbg;
-
     atexit(restore);
     raw_enable();
     screen_enter();
@@ -55,8 +51,6 @@ int main(void)
     if (leftover_len > 0) {
         keys_unread(leftover, leftover_len);
     }
-    dbg_log(&dbg, "theme: %s (match=%s)", theme_current()->name,
-            theme_current()->match);
 
     int rows = 24;
     int cols = 80;
@@ -66,13 +60,17 @@ int main(void)
     if (load_config(&cfg) != 0) {
         die("failed to load config");
     }
-    /* theme aus der config anwenden (fehlt/unbekannt: wie ermittelt) */
-    if (cfg.theme != NULL && !theme_select(cfg.theme)) {
-        dbg_log(&dbg, "unbekanntes theme in config: '%s'", cfg.theme);
+    /* theme aus der config anwenden. schlaegt das fehl (name
+     * unbekannt), bleibt das aus den terminal-farben ermittelte. */
+    if (cfg.theme != NULL) {
+        (void)theme_select(cfg.theme);
     }
-    dbg_log(&dbg, "debug sidebar aktiv (%dx%d)", cols, rows);
 
-    draw(rows, cols, &state, &dbg, &cfg);
+    /* sessions-verzeichnis frueh anlegen, damit /resume und das
+     * anlegen der ersten session nichts mehr anlegen muessen */
+    (void)session_dir_ensure();
+
+    draw(rows, cols, &state, &cfg);
 
     while (!state.quit) {
         state.dirty = (state.resized != 0);
@@ -82,10 +80,10 @@ int main(void)
             fputs("\x1b[2J", stdout);
         }
 
-        handle_key(&state, &cfg, &dbg, rows, cols);
+        handle_key(&state, &cfg, rows, cols);
 
         if (state.dirty && !state.quit) {
-            draw(rows, cols, &state, &dbg, &cfg);
+            draw(rows, cols, &state, &cfg);
             state.dirty = false;
         }
     }
@@ -93,11 +91,13 @@ int main(void)
     /* config als letzten stand sichern – auch wenn seit dem letzten
      * aendern nichts passiert ist, garantiert das den backup beim
      * beenden (auch bei ctrl+c/ctrl-q) */
-    config_persist(&cfg, &dbg);
+    config_persist(&cfg);
 
     input_free(&state.input);
     chat_free(&state.chat);
     history_free(&state.history);
+    session_list_free(&state.sessions);
+    session_free(&state.session);
     free_config(&cfg);
     return 0;
 }

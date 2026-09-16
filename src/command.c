@@ -1,9 +1,11 @@
 #include "command.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "chat.h"
 #include "state.h"
+#include "utils.h"
 
 int cmd_name_col(void)
 {
@@ -43,13 +45,25 @@ int cmd_lookup(const char *word)
     return -1;
 }
 
+/* neue session beginnen: die aktuelle bleibt auf der platte liegen,
+ * wie sie ist (session_end schliesst nur), und der chat startet
+ * neu. /clear tut exakt dasselbe. die ctx-gesamtzaehler gehoeren
+ * zur sitzung und starten damit neu; die eichung (scale) bleibt,
+ * sie ist eine eigenschaft des schaetzers, nicht des verlaufs. */
+void cmd_new(AppState *state)
+{
+    input_reset(&state->input);   /* draw() schreibt eh jeden frame */
+    session_end(&state->session); /* dateien bleiben unangetastet */
+    chat_clear(&state->chat);     /* "start a new session" */
+    state->chat_scroll = 0;
+    state->ctx.dropped = 0;
+    state->ctx.total_prompt = 0;
+    state->ctx.total_completion = 0;
+}
+
 void cmd_clear(AppState *state)
 {
-    input_reset(&state->input); /* draw() schreibt eh jeden frame
-                                 * komplett, "clear" = input leeren */
-    chat_clear(&state->chat);   /* "start a new session": verlauf weg */
-    state->chat_scroll = 0;
-    state->ctx.dropped = 0; /* neuer verlauf, nichts mehr gekuerzt */
+    cmd_new(state);
 }
 
 void cmd_models(AppState *state)
@@ -65,4 +79,70 @@ void cmd_settings(AppState *state)
     state->theme_sub = false;
     state->dialog = (DialogState){0}; /* frisch: leere suche */
     input_reset(&state->input);
+}
+
+void cmd_resume(AppState *state)
+{
+    state->sessions_dialog = true;
+    state->dialog = (DialogState){0}; /* frisch: leere suche */
+    input_reset(&state->input);
+    /* liste frisch laden (alte vorher wegwerfen): das dialog liest
+     * sie beim zeichnen aus dem state */
+    session_list_free(&state->sessions);
+    (void)session_list_load(&state->sessions);
+}
+
+void cmd_rename(AppState *state, const Config *cfg, const char *name)
+{
+    input_reset(&state->input);
+
+    /* fuehrende/folgende leerzeichen weg, leeres feld = benutzungs-
+     * hinweis statt stiller fehler */
+    const char *p = (name != NULL) ? name : "";
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    size_t len = strlen(p);
+    while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) {
+        len--;
+    }
+    if (len == 0) {
+        if (chat_append(&state->chat, CHAT_ROLE_NOTICE,
+                        "benutzung: /rename <neuer-name>") != 0) {
+            die("out of memory");
+        }
+        return;
+    }
+
+    /* noch keine session offen: hier erzeugen – erst nur mit id,
+     * dann den namen draufsetzen (genau wie bei /rename einer
+     * laufenden session) */
+    if (!state->session.active && session_start(&state->session, cfg) != 0) {
+        if (chat_append(&state->chat, CHAT_ROLE_ERROR,
+                        "session liess sich nicht anlegen") != 0) {
+            die("out of memory");
+        }
+        return;
+    }
+
+    char trimmed[256];
+    if (len >= sizeof trimmed) {
+        len = sizeof trimmed - 1; /* der name muss aufs terminal */
+    }
+    memcpy(trimmed, p, len);
+    trimmed[len] = '\0';
+
+    if (session_rename(&state->session, trimmed) != 0) {
+        if (chat_append(&state->chat, CHAT_ROLE_ERROR,
+                        "umbenennen fehlgeschlagen") != 0) {
+            die("out of memory");
+        }
+        return;
+    }
+
+    char line[300];
+    (void)snprintf(line, sizeof line, "session umbenannt: %s", trimmed);
+    if (chat_append(&state->chat, CHAT_ROLE_NOTICE, line) != 0) {
+        die("out of memory");
+    }
 }

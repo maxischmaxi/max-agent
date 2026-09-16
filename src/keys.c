@@ -12,10 +12,10 @@
 #include "chat.h"
 #include "command.h"
 #include "config.h"
-#include "debug.h"
 #include "draw.h"
 #include "history.h"
 #include "send.h"
+#include "session.h"
 #include "settings.h"
 #include "theme.h"
 #include "utils.h"
@@ -505,20 +505,18 @@ static void history_forward(AppState *state, Input *input)
     history_apply(state, input, history_next(&state->history));
 }
 
-static void handle_ctrl_c(AppState *state, DebugState *dbg, const Config *cfg)
+static void handle_ctrl_c(AppState *state, const Config *cfg)
 {
-    (void)dbg; /* dbg_log: im release wegkompiliert */
-    dbg_log(dbg, "input count: %d", (int)state->input.count);
 
     if (!state->models_dialog && !state->settings_dialog &&
-        state->input.count > 1) {
+        !state->sessions_dialog && state->input.count > 1) {
         input_reset(&state->input);
         state->dirty = true;
         return;
     }
 
     if (!state->models_dialog && !state->settings_dialog &&
-        state->input.count == 1) {
+        !state->sessions_dialog && state->input.count == 1) {
         char *last_line = state->input.lines[state->input.count - 1];
         size_t len = strlen(last_line);
         if (len > 0) {
@@ -529,11 +527,14 @@ static void handle_ctrl_c(AppState *state, DebugState *dbg, const Config *cfg)
     }
 
     /* in einem dialog schliesst ctrl+c erst den dialog */
-    if (state->models_dialog || state->settings_dialog) {
+    if (state->models_dialog || state->settings_dialog ||
+        state->sessions_dialog) {
         state->models_dialog = false;
         state->settings_dialog = false;
+        state->sessions_dialog = false;
         state->theme_sub = false;
         state->dialog = (DialogState){0};
+        session_list_free(&state->sessions); /* liste nur fuer den dialog */
         state->confirm_quit = false;
         state->dirty = true;
         return;
@@ -553,8 +554,7 @@ static void handle_ctrl_c(AppState *state, DebugState *dbg, const Config *cfg)
     }
 }
 
-static void handle_settings(AppState *state, Config *cfg, DebugState *dbg,
-                            Key k)
+static void handle_settings(AppState *state, Config *cfg, Key k)
 {
     /* suchen + cursor: bei allen dialogs identisch */
     if (dialog_navigate(state, k)) {
@@ -600,8 +600,7 @@ static void handle_settings(AppState *state, Config *cfg, DebugState *dbg,
             } else {
                 cfg->confirm_quit = true;
             }
-            dbg_log(dbg, "confirm quit: %s", on_off(cfg->confirm_quit));
-            config_persist(cfg, dbg);
+            config_persist(cfg);
             state->dirty = true;
             break;
         case SET_COUNT:
@@ -614,7 +613,7 @@ static void handle_settings(AppState *state, Config *cfg, DebugState *dbg,
     }
 }
 
-static void handle_theme(AppState *state, Config *cfg, DebugState *dbg, Key k)
+static void handle_theme(AppState *state, Config *cfg, Key k)
 {
     if (dialog_navigate(state, k)) {
         state->dirty = true;
@@ -647,9 +646,7 @@ static void handle_theme(AppState *state, Config *cfg, DebugState *dbg, Key k)
                 if (cfg->theme == NULL) {
                     die("out of memory");
                 }
-                dbg_log(dbg, "theme: %s (match=%s)", theme_current()->name,
-                        theme_current()->match);
-                config_persist(cfg, dbg);
+                config_persist(cfg);
                 state->dirty = true; /* farben gelten sofort */
             }
         }
@@ -664,7 +661,7 @@ static void handle_theme(AppState *state, Config *cfg, DebugState *dbg, Key k)
  * direkt (der dialog bleibt offen, man sieht den neuen zustand
  * sofort); "edit" schliesst den dialog und uebergibt an das
  * eingabefeld, das den vollen zeilen-editor mitbringt. */
-static void handle_prompt(AppState *state, Config *cfg, DebugState *dbg, Key k)
+static void handle_prompt(AppState *state, Config *cfg, Key k)
 {
     if (dialog_navigate(state, k)) {
         state->dirty = true;
@@ -691,8 +688,8 @@ static void handle_prompt(AppState *state, Config *cfg, DebugState *dbg, Key k)
         case PROMPT_DEFAULT:
             free(cfg->system_prompt);
             cfg->system_prompt = NULL; /* eingebaute vorlage */
-            dbg_log(dbg, "system-prompt: default");
-            config_persist(cfg, dbg);
+            config_persist(cfg);
+            (void)session_prompt_changed(&state->session, NULL);
             state->dirty = true;
             break;
         case PROMPT_OFF:
@@ -701,8 +698,8 @@ static void handle_prompt(AppState *state, Config *cfg, DebugState *dbg, Key k)
             if (cfg->system_prompt == NULL) {
                 die("out of memory");
             }
-            dbg_log(dbg, "system-prompt: aus");
-            config_persist(cfg, dbg);
+            config_persist(cfg);
+            (void)session_prompt_changed(&state->session, "");
             state->dirty = true;
             break;
         case PROMPT_EDIT:
@@ -730,7 +727,7 @@ static void handle_prompt(AppState *state, Config *cfg, DebugState *dbg, Key k)
     }
 }
 
-static void handle_models(AppState *state, Config *cfg, DebugState *dbg, Key k)
+static void handle_models(AppState *state, Config *cfg, Key k)
 {
     /* dialog-modus: suchtext ist der input, das chat-feld
      * existiert hier nicht */
@@ -762,13 +759,92 @@ static void handle_models(AppState *state, Config *cfg, DebugState *dbg, Key k)
                 if (cfg->active_model == NULL) {
                     die("out of memory");
                 }
-                dbg_log(dbg, "modell gewaehlt: %s", m->id);
-                config_persist(cfg, dbg);
+                config_persist(cfg);
             }
         }
         state->models_dialog = false;
         state->dialog = (DialogState){0};
         state->dirty = true;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* resume-dialog: session-liste full-screen. suchen/cursor wie bei   */
+/* allen dialogs (dialog_navigate); enter laedt die gewaehlte        */
+/* session zurueck in den chat, esc laesst alles unangetastet.       */
+/* ------------------------------------------------------------------ */
+
+static void sessions_dialog_close(AppState *state)
+{
+    state->sessions_dialog = false;
+    state->dialog = (DialogState){0};
+    state->confirm_quit = false;
+    session_list_free(&state->sessions); /* nur der dialog liest sie */
+    state->dirty = true;
+}
+
+static void handle_sessions(AppState *state, Config *cfg, Key k)
+{
+    if (dialog_navigate(state, k)) {
+        state->dirty = true;
+        return;
+    }
+
+    switch (k.kind) {
+    case KEY_ESCAPE:
+        sessions_dialog_close(state);
+        break;
+    case KEY_ENTER:
+    case KEY_NEWLINE: {
+        /* treffer nochmal filtern: layout-daten sind nur im draw
+         * gueltig (wie bei handle_models) */
+        int hits[DIALOG_MATCH_MAX];
+        int n = sessions_match(&state->sessions, state->dialog.search, hits,
+                               DIALOG_MATCH_MAX);
+        if (n == 0 || state->dialog.selected >= n) {
+            break;
+        }
+        const char *id = state->sessions.items[hits[state->dialog.selected]].id;
+
+        /* die gerade offene session: nichts zu tun, nur dialog zu.
+         * jede andere: aktuelle bleibt auf der platte liegen, wie
+         * sie ist, die gewaehlte wird geoeffnet und ihr transcript
+         * in den chat zurueckgespielt. */
+        if (!state->session.active || strcmp(state->session.id, id) != 0) {
+            session_end(&state->session);
+            if (session_open(&state->session, id) == 0) {
+                /* prompt-snapshot der session wiederherstellen:
+                 * sie soll danach exakt so weitergehen, wie sie
+                 * angefangen wurde (NULL = default, "" = aus) */
+                free(cfg->system_prompt);
+                cfg->system_prompt = (state->session.system_prompt != NULL)
+                                         ? dup_str(state->session.system_prompt)
+                                         : NULL;
+                if (cfg->system_prompt == NULL &&
+                    state->session.system_prompt != NULL) {
+                    die("out of memory");
+                }
+                config_persist(cfg);
+
+                chat_clear(&state->chat);
+                state->ctx.total_prompt = 0;
+                state->ctx.total_completion = 0;
+                state->ctx.dropped = 0;
+                (void)session_read_transcript(&state->session, &state->chat,
+                                              &state->ctx);
+                state->chat_scroll = 0; /* ans ende folgen */
+            } else {
+                if (chat_append(&state->chat, CHAT_ROLE_ERROR,
+                                "session nicht lesbar") != 0) {
+                    die("out of memory");
+                }
+            }
+        }
+        sessions_dialog_close(state);
         break;
     }
     default:
@@ -810,7 +886,6 @@ static void autocomplete_command(Input *input, int id, int max_len)
 typedef struct {
     AppState *state;
     Config *cfg;
-    DebugState *dbg;
     int rows;
     int cols;
 } StreamRedrawCtx;
@@ -818,7 +893,7 @@ typedef struct {
 static void stream_redraw(void *ud)
 {
     StreamRedrawCtx *rc = ud;
-    draw(rc->rows, rc->cols, rc->state, rc->dbg, rc->cfg);
+    draw(rc->rows, rc->cols, rc->state, rc->cfg);
 }
 
 /* rueckfrage vor einem tool. haelt den agent-loop an, zeichnet die
@@ -843,7 +918,7 @@ static bool confirm_tool(const char *name, const char *arguments, void *ud)
              (name != NULL) ? name : "?");
     bool allow = false;
     for (;;) {
-        draw(rc->rows, rc->cols, st, rc->dbg, rc->cfg);
+        draw(rc->rows, rc->cols, st, rc->cfg);
         Key k = key_read();
         if (k.kind == KEY_ESCAPE || k.kind == KEY_CTRL_C ||
             k.kind == KEY_CTRL_Q) {
@@ -912,8 +987,7 @@ static void cmd_parse(const AppState *st, char *word, size_t word_sz,
     }
 }
 
-static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
-                       int cols, Key k)
+static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
 {
     /* kurzform: die chat-eingabe liegt als member im state */
     Input *input = &state->input;
@@ -930,7 +1004,7 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
         break;
     case KEY_ENTER: {
         char word[64];
-        char args[128];
+        char args[512];
         cmd_parse(state, word, sizeof word, args, sizeof args);
 
         /* system-prompt bearbeiten: enter speichert und geht zurueck
@@ -942,9 +1016,11 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
             char *text = chat_flatten_input(input);
             free(cfg->system_prompt);
             cfg->system_prompt = text; /* NULL = wieder default */
-            dbg_log(dbg, "system-prompt: %s",
-                    (text != NULL) ? "eigener text" : "default");
-            config_persist(cfg, dbg);
+            config_persist(cfg);
+            /* snapshot der offenen session nachziehen: ein resume soll
+             * den prompt wiederherstellen, den die session zuletzt
+             * hatte, nicht den von ihrem anfang */
+            (void)session_prompt_changed(&state->session, cfg->system_prompt);
             input_reset(input);
             state->prompt_edit = false;
             state->cmd_active = false;
@@ -962,10 +1038,19 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
         if (word[0] == '/') {
             switch (cmd_lookup(word)) {
             case CMD_CLEAR:
-                cmd_clear(state);
+            case CMD_NEW:
+                /* /clear und /new tun dasselbe: aktuelle session
+                 * hinterlassen wie sie ist, neu anfangen */
+                cmd_new(state);
                 break;
             case CMD_MODELS:
                 cmd_models(state);
+                break;
+            case CMD_RESUME:
+                cmd_resume(state);
+                break;
+            case CMD_RENAME:
+                cmd_rename(state, cfg, args);
                 break;
             case CMD_QUIT:
                 state->quit = true;
@@ -981,10 +1066,17 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
                 if (m > 0) {
                     switch (idx[0]) {
                     case CMD_CLEAR:
-                        cmd_clear(state);
+                    case CMD_NEW:
+                        cmd_new(state);
                         break;
                     case CMD_MODELS:
                         cmd_models(state);
+                        break;
+                    case CMD_RESUME:
+                        cmd_resume(state);
+                        break;
+                    case CMD_RENAME:
+                        cmd_rename(state, cfg, args);
                         break;
                     case CMD_SETTINGS:
                         cmd_settings(state);
@@ -1012,15 +1104,23 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
                 if (chat_append(&state->chat, CHAT_ROLE_USER, text) != 0) {
                     die("out of memory");
                 }
+                /* die erste nachricht oeffnet die session: erst jetzt
+                 * gibt es eine id, /rename und die statuszeile haben
+                 * ab hier etwas in der hand. scheitert das anlegen,
+                 * laeuft der chat ohne aufzeichnung weiter – die
+                 * unterhaltung ist immer wichtiger als das protokoll. */
+                if (!state->session.active) {
+                    (void)session_start(&state->session, cfg);
+                }
+                (void)session_log_user(&state->session, text);
                 free(text);
                 state->chat_scroll = 0; /* neue nachricht: folgen */
 
                 state->busy = true;
-                draw(rows, cols, state, dbg, cfg);
+                draw(rows, cols, state, cfg);
                 StreamRedrawCtx rc = {
                     .state = state,
                     .cfg = cfg,
-                    .dbg = dbg,
                     .rows = rows,
                     .cols = cols,
                 };
@@ -1029,7 +1129,7 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
                     .redraw = stream_redraw,
                     .confirm_tool = confirm_tool,
                 };
-                (void)send_stream(state, cfg, dbg, &hooks);
+                (void)send_stream(state, cfg, &hooks);
                 state->busy = false;
             }
             state->dirty = true;
@@ -1043,7 +1143,7 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
         state->dirty = true;
         break;
     case KEY_CHAR:
-        input_char(input, k.ch, main_width(cols));
+        input_char(input, k.ch);
         state->cmd_active = input_in_cmd(input);
         state->dirty = true;
         break;
@@ -1197,17 +1297,20 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
     case KEY_UP:
         /* in einer mehrzeiligen eingabe erst die zeile wechseln;
          * erst an der obersten zeile geht es in die history. genau
-         * so verhalten sich zsh und fish. */
-        if (input->cursor_line > 0) {
-            input_cursor_line_set(input, input->cursor_line - 1);
+         * so verhalten sich zsh und fish.
+         *
+         * gezaehlt wird ueber BILDSCHIRMzeilen: steht der cursor in
+         * der zweiten haelfte einer umgebrochenen zeile, soll pfeil-
+         * hoch sichtbar eine zeile hoch gehen und nicht die history
+         * aufrufen. */
+        if (input_screen_up(input, input_field_width(cols))) {
             state->dirty = true;
             break;
         }
         history_back(state, input);
         break;
     case KEY_DOWN:
-        if (input->cursor_line + 1 < input->count) {
-            input_cursor_line_set(input, input->cursor_line + 1);
+        if (input_screen_down(input, input_field_width(cols))) {
             state->dirty = true;
             break;
         }
@@ -1228,26 +1331,27 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
     }
 }
 
-void handle_key(AppState *state, Config *cfg, DebugState *dbg, int rows,
-                int cols)
+void handle_key(AppState *state, Config *cfg, int rows, int cols)
 {
     Key k = key_read();
 
     if (k.kind == KEY_CTRL_C) {
-        handle_ctrl_c(state, dbg, cfg);
+        handle_ctrl_c(state, cfg);
     } else if (k.kind == KEY_CTRL_Q) {
         state->quit = true;
     } else if (k.kind == KEY_NONE) {
         /* nur resize-interesse */
     } else if (ui_mode(state) == MODE_SETTINGS) {
-        handle_settings(state, cfg, dbg, k);
+        handle_settings(state, cfg, k);
     } else if (ui_mode(state) == MODE_THEME) {
-        handle_theme(state, cfg, dbg, k);
+        handle_theme(state, cfg, k);
     } else if (ui_mode(state) == MODE_PROMPT) {
-        handle_prompt(state, cfg, dbg, k);
+        handle_prompt(state, cfg, k);
+    } else if (ui_mode(state) == MODE_SESSIONS) {
+        handle_sessions(state, cfg, k);
     } else if (ui_mode(state) == MODE_MODELS) {
-        handle_models(state, cfg, dbg, k);
+        handle_models(state, cfg, k);
     } else {
-        handle_all(state, cfg, dbg, rows, cols, k);
+        handle_all(state, cfg, rows, cols, k);
     }
 }

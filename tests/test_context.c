@@ -231,6 +231,40 @@ static void test_calibrate(void)
     CHECK(u.scale >= 250 && u.scale < CTX_SCALE_ONE);
 }
 
+/* verbrauchs-buchhaltung fuer die statuszeile: getrennt von der
+ * eichung, summiert ueber die ganze sitzung. */
+static void test_account(void)
+{
+    ctx_account(NULL, 10, 5); /* darf nicht knallen */
+
+    CtxUsage u = {0};
+    CHECK(u.total_prompt == 0 && u.total_completion == 0);
+
+    ctx_account(&u, 100, 20);
+    CHECK(u.total_prompt == 100);
+    CHECK(u.total_completion == 20);
+
+    /* mehrere runden summieren sich */
+    ctx_account(&u, 250, 30);
+    CHECK(u.total_prompt == 350);
+    CHECK(u.total_completion == 50);
+
+    /* fehlende zahlen (api hat nichts geliefert) aendern nichts */
+    ctx_account(&u, 0, 0);
+    ctx_account(&u, -5, -1);
+    CHECK(u.total_prompt == 350);
+    CHECK(u.total_completion == 50);
+
+    /* einzeln zaehlen ist erlaubt: nur prompt, nur completion */
+    ctx_account(&u, 10, 0);
+    CHECK(u.total_prompt == 360 && u.total_completion == 50);
+    ctx_account(&u, 0, 7);
+    CHECK(u.total_prompt == 360 && u.total_completion == 57);
+
+    /* die buchhaltung fasst den korrekturfaktor nicht an */
+    CHECK(u.scale == 0);
+}
+
 int main(void)
 {
     test_tokens();
@@ -240,5 +274,6 @@ int main(void)
     test_trim_unfinished_round();
     test_trim_local_only();
     test_calibrate();
+    test_account();
     return test_report();
 }

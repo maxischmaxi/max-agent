@@ -12,6 +12,7 @@
 #include "context.h"
 #include "keys.h"
 #include "prompt.h"
+#include "session.h"
 #include "tools.h"
 #include "utils.h"
 
@@ -41,10 +42,18 @@ _Static_assert(sizeof(ChatToolCall) == sizeof(OaiToolCall),
 /* deckel fuer parallel tool-calls in EINER antwort */
 #define SEND_MAX_TOOLS 32
 
-/* puffer fuer fehlermeldungen, die im transcript landen: so breit
- * wie eine debug-sidebar-zeile, laengere server-texte werden
- * abgeschnitten (chat_wrap umbricht eh). */
-#define ERR_MAX DBG_LINE_MAX
+/* puffer fuer fehlermeldungen, die im transcript landen; laengere
+ * server-texte werden abgeschnitten (chat_wrap umbricht eh). */
+#define ERR_MAX 160
+
+/* monotone uhr in ms: messung der antwort- und tool-dauern (fuer
+ * das session-log) und redraw-drossel */
+static long long mono_ms(void)
+{
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((long long)ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+}
 
 int send_role(ChatRole role)
 {
@@ -157,31 +166,34 @@ const Model *send_find_model(const Config *cfg, const char *id,
 }
 
 /* fehlermeldung als ERROR-nachricht in den verlauf; OOM ist hier
- * fatal (die app hat keinen sinnvollen weg weiter) */
-static void fail(Chat *chat, const char *fmt, ...)
+ * fatal (die app hat keinen sinnvollen weg weiter). http_status
+ * landet nebenbei im session-log (0 = kein http-fehler). */
+static void fail(AppState *state, long http_status, const char *fmt, ...)
 {
     char buf[ERR_MAX];
     va_list ap;
     va_start(ap, fmt);
     (void)vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    if (chat_append(chat, CHAT_ROLE_ERROR, buf) != 0) {
+    if (chat_append(&state->chat, CHAT_ROLE_ERROR, buf) != 0) {
         die("out of memory");
     }
+    (void)session_log_error(&state->session, buf, http_status);
 }
 
 /* wie fail(), aber als neutraler hinweis der app (NOTICE): geht
  * ebenfalls nie an die api, wird aber nicht rot gezeichnet */
-static void notice(Chat *chat, const char *fmt, ...)
+static void notice(AppState *state, const char *fmt, ...)
 {
     char buf[ERR_MAX];
     va_list ap;
     va_start(ap, fmt);
     (void)vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    if (chat_append(chat, CHAT_ROLE_NOTICE, buf) != 0) {
+    if (chat_append(&state->chat, CHAT_ROLE_NOTICE, buf) != 0) {
         die("out of memory");
     }
+    (void)session_log_notice(&state->session, buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -206,11 +218,11 @@ static int send_setup(AppState *state, const Config *cfg, SendReq *req)
     const Provider *provider = NULL;
     const Model *model = send_find_model(cfg, cfg->active_model, &provider);
     if (model == NULL || provider == NULL) {
-        fail(&state->chat, "kein modell gewaehlt: /models");
+        fail(state, 0, "kein modell gewaehlt: /models");
         return -1;
     }
     if (provider->api_key == NULL || provider->api_key[0] == '\0') {
-        fail(&state->chat, "provider '%s' ohne api-key",
+        fail(state, 0, "provider '%s' ohne api-key",
              (provider->base_url != NULL) ? provider->base_url : "?");
         return -1;
     }
@@ -236,10 +248,8 @@ static void send_teardown(SendReq *req)
  * hier faellt auch die entscheidung, wieviel verlauf ins fenster
  * des modells passt: context.c liefert den startindex, alles davor
  * sieht das modell nicht mehr. */
-static int send_round_build(AppState *state, const Config *cfg, DebugState *dbg,
-                            SendReq *req)
+static int send_round_build(AppState *state, const Config *cfg, SendReq *req)
 {
-    (void)dbg; /* dbg_log: im release wegkompiliert */
     Chat *chat = &state->chat;
     send_teardown(req);
     req->system = prompt_build(cfg); /* NULL = kein system-prompt */
@@ -254,7 +264,7 @@ static int send_round_build(AppState *state, const Config *cfg, DebugState *dbg,
      * stand, damit ein wechsel auf ein groesseres modell (und spaeter
      * zurueck) wieder gemeldet wird. */
     if (from > state->ctx.dropped) {
-        notice(chat,
+        notice(state,
                "verlauf gekuerzt: %zu %s am anfang weggelassen "
                "(budget ~%zu tokens)",
                from, (from == 1) ? "nachricht" : "nachrichten", budget);
@@ -266,21 +276,11 @@ static int send_round_build(AppState *state, const Config *cfg, DebugState *dbg,
         return -1; /* leerer verlauf: nichts zu senden */
     }
     req->n = n;
-    if (budget == CTX_NO_LIMIT) {
-        dbg_log(dbg,
-                "kontext: ~%zu tokens, %d nachrichten (modell ohne "
-                "contextWindow: nicht gekuerzt)",
-                req->est, n);
-    } else {
-        dbg_log(dbg, "kontext: ~%zu von %zu tokens, %d nachrichten (%zu aus)",
-                req->est, budget, n, from);
-    }
     return 0;
 }
 
-int send_message(AppState *state, const Config *cfg, DebugState *dbg)
+int send_message(AppState *state, const Config *cfg)
 {
-    (void)dbg; /* dbg_log: im release wegkompiliert */
     if (state == NULL || cfg == NULL) {
         return -1;
     }
@@ -288,7 +288,7 @@ int send_message(AppState *state, const Config *cfg, DebugState *dbg)
 
     SendReq req;
     if (send_setup(state, cfg, &req) != 0 ||
-        send_round_build(state, cfg, dbg, &req) != 0) {
+        send_round_build(state, cfg, &req) != 0) {
         return -1;
     }
 
@@ -306,34 +306,29 @@ int send_message(AppState *state, const Config *cfg, DebugState *dbg)
     OaiClient client;
     if (oai_client_init(&client, &opts) != 0) {
         send_teardown(&req);
-        fail(chat, "client-init fehlgeschlagen");
+        fail(state, 0, "client-init fehlgeschlagen");
         return -1;
     }
 
-    dbg_log(dbg, "send: %s an %s (%d nachrichten, system-prompt %s)",
-            req.model->id,
-            (req.provider->base_url != NULL) ? req.provider->base_url
-                                             : "api.openai.com",
-            req.n, (req.system != NULL) ? "an" : "aus");
-
+    long long t_start = mono_ms();
     OaiCompletionResult result;
     int rc = oai_chat_completions_create(&client, &params, &result);
     oai_client_free(&client);
     send_teardown(&req);
+    long long t_done = mono_ms();
 
     if (rc != 0) {
-        fail(chat, "ungueltige anfrage-parameter");
+        fail(state, 0, "ungueltige anfrage-parameter");
         return -1;
     }
     if (!result.ok) {
         if (result.http_status > 0) {
-            fail(chat, "http %ld: %s", result.http_status,
+            fail(state, result.http_status, "http %ld: %s", result.http_status,
                  (result.error != NULL) ? result.error : "?");
         } else {
-            fail(chat, "verbindung: %s",
+            fail(state, 0, "verbindung: %s",
                  (result.error != NULL) ? result.error : "?");
         }
-        dbg_log(dbg, "send: fehler (http %ld)", result.http_status);
         oai_completion_result_free(&result);
         return -1;
     }
@@ -348,14 +343,21 @@ int send_message(AppState *state, const Config *cfg, DebugState *dbg)
     if (result.completion.has_usage) {
         ctx_calibrate(&state->ctx, req.est,
                       result.completion.usage.prompt_tokens);
-        dbg_log(dbg, "send: ok, %d+%d tokens (geschaetzt %zu, faktor %d)",
-                result.completion.usage.prompt_tokens,
-                result.completion.usage.completion_tokens, req.est,
-                state->ctx.scale);
+        ctx_account(&state->ctx, result.completion.usage.prompt_tokens,
+                    result.completion.usage.completion_tokens);
     }
     if (chat_append(chat, CHAT_ROLE_ASSISTANT, text) != 0) {
         die("out of memory");
     }
+    int ptok = -1;
+    int ctok = -1;
+    if (result.completion.has_usage) {
+        ptok = result.completion.usage.prompt_tokens;
+        ctok = result.completion.usage.completion_tokens;
+    }
+    (void)session_log_assistant(
+        &state->session, text, NULL, 0, t_done - t_start, t_done - t_start, 0,
+        (req.model->id != NULL) ? req.model->id : NULL, ptok, ctok, false);
     oai_completion_result_free(&result);
     return 0;
 }
@@ -463,25 +465,22 @@ static void acc_compact(ToolAcc *acc)
 
 typedef struct {
     Chat *chat;
-    DebugState *dbg;
+    Session *session;  /* NULL-sicher: inaktive session loggt nicht */
+    const char *model; /* id des modells dieser runde (fuer das log) */
+    int round;         /* agent-loop-runde, 0-basiert */
+    long long t_start; /* runden-beginn (request abgeschickt) */
+    long long t_first; /* erster chunk; 0 = noch nichts angekommen */
     void *redraw_ctx;
     void (*redraw)(void *);
-    long long last_ms; /* zeit des letzten gedrosselten redraw */
-    bool drew;         /* mindestens einmal gezeichnet */
-    bool error;        /* on_error kam */
-    ToolAcc acc;       /* tool-call-deltas waechsen hier zusammen */
-    int prompt_tokens; /* aus dem letzten chunk (include_usage): die  */
-                       /* eichgroesse fuer ctx_calibrate, 0 = keine   */
-    bool aborted;      /* benutzer hat esc/ctrl+c gedrueckt           */
+    long long last_ms;     /* zeit des letzten gedrosselten redraw */
+    bool drew;             /* mindestens einmal gezeichnet */
+    bool error;            /* on_error kam */
+    ToolAcc acc;           /* tool-call-deltas waechsen hier zusammen */
+    int prompt_tokens;     /* aus dem letzten chunk (include_usage): */
+                           /* eichgroesse fuer ctx_calibrate, 0 = keine */
+    int completion_tokens; /* dito, fuer die verbrauchs-anzeige */
+    bool aborted;          /* benutzer hat esc/ctrl+c gedrueckt           */
 } StreamCtx;
-
-/* monotone uhr in ms – allein fuer die redraw-drossel */
-static long long mono_ms(void)
-{
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ((long long)ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
-}
 
 /* der watchdog des clients fragt das hier ~alle 100ms, auch waehrend
  * das modell noch denkt – der abbruch wartet also nicht auf den
@@ -503,6 +502,12 @@ static int stream_on_chunk(const OaiChatCompletionChunk *chunk, void *ud)
 {
     StreamCtx *sc = ud;
 
+    /* erster datenverkehr aus dem modell: das ist die zeit, die es
+     * zum nachdenken gebraucht hat (time to first token) */
+    if (sc->t_first == 0) {
+        sc->t_first = mono_ms();
+    }
+
     for (size_t i = 0; i < chunk->choices_len; i++) {
         const char *delta = chunk->choices[i].content_delta;
         if (delta != NULL && !chat_append_text(sc->chat, delta)) {
@@ -516,8 +521,7 @@ static int stream_on_chunk(const OaiChatCompletionChunk *chunk, void *ud)
     }
     if (chunk->has_usage) {
         sc->prompt_tokens = chunk->usage.prompt_tokens;
-        dbg_log(sc->dbg, "stream: %d+%d tokens", chunk->usage.prompt_tokens,
-                chunk->usage.completion_tokens);
+        sc->completion_tokens = chunk->usage.completion_tokens;
     }
 
     /* erster chunk sofort, danach hoechstens alle SEND_REDRAW_MS */
@@ -549,20 +553,32 @@ static void stream_on_error(long http_status, const char *message, void *ud)
         chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT &&
         chat->msgs[chat->len - 1].text[0] == '\0') {
         chat_pop(chat);
+    } else if (chat->len > 0 &&
+               chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT) {
+        /* teil-antwort bleibt im verlauf -> auch ins session-log,
+         * sonst fehlt sie nach einem resume */
+        (void)session_log_assistant(
+            sc->session, chat->msgs[chat->len - 1].text, NULL, 0,
+            (sc->t_first > 0) ? sc->t_first - sc->t_start : -1,
+            mono_ms() - sc->t_start, sc->round, sc->model, -1, -1, false);
     }
+    char buf[ERR_MAX];
     if (http_status > 0) {
-        fail(chat, "http %ld: %s", http_status,
-             (message != NULL) ? message : "?");
+        (void)snprintf(buf, sizeof buf, "http %ld: %s", http_status,
+                       (message != NULL) ? message : "?");
+        (void)session_log_error(sc->session, buf, http_status);
     } else {
-        fail(chat, "verbindung: %s", (message != NULL) ? message : "?");
+        (void)snprintf(buf, sizeof buf, "verbindung: %s",
+                       (message != NULL) ? message : "?");
+        (void)session_log_error(sc->session, buf, 0);
     }
-    dbg_log(sc->dbg, "stream: fehler (http %ld)", http_status);
+    if (chat_append(chat, CHAT_ROLE_ERROR, buf) != 0) {
+        die("out of memory");
+    }
 }
 
-int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
-                const SendHooks *hooks)
+int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
 {
-    (void)dbg; /* dbg_log: im release wegkompiliert */
     if (state == NULL || cfg == NULL || hooks == NULL ||
         hooks->redraw == NULL) {
         return -1;
@@ -580,7 +596,7 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
     const OaiTool *tools = tool_registry(&tools_len);
 
     for (int round = 0;; round++) {
-        if (send_round_build(state, cfg, dbg, &req) != 0) {
+        if (send_round_build(state, cfg, &req) != 0) {
             send_teardown(&req);
             return -1;
         }
@@ -612,13 +628,16 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
         if (oai_client_init(&client, &opts) != 0) {
             send_teardown(&req);
             chat_pop(chat); /* platzhalter wieder weg */
-            fail(chat, "client-init fehlgeschlagen");
+            fail(state, 0, "client-init fehlgeschlagen");
             return -1;
         }
 
         StreamCtx sc = {
             .chat = chat,
-            .dbg = dbg,
+            .session = &state->session,
+            .model = (req.model->id != NULL) ? req.model->id : NULL,
+            .round = round,
+            .t_start = mono_ms(),
             .redraw_ctx = hooks->ctx,
             .redraw = hooks->redraw,
         };
@@ -629,10 +648,6 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
             .user_data = &sc,
         };
 
-        dbg_log(dbg, "stream runde %d: %s (%d nachrichten, system-prompt %s)",
-                round + 1, req.model->id, req.n,
-                (req.system != NULL) ? "an" : "aus");
-
         int rc = oai_chat_completions_create_stream(&client, &params, &cbs);
         oai_client_free(&client);
         send_teardown(&req);
@@ -640,7 +655,7 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
         if (rc != 0) {
             acc_free(&sc.acc);
             chat_pop(chat); /* platzhalter wieder weg */
-            fail(chat, "ungueltige anfrage-parameter");
+            fail(state, 0, "ungueltige anfrage-parameter");
             return -1;
         }
         if (sc.error) {
@@ -654,20 +669,29 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
          * platzhalter geht weg. */
         if (sc.aborted) {
             acc_free(&sc.acc);
-            if (chat->len > 0 && chat->msgs[chat->len - 1].text[0] == '\0' &&
+            bool partial = false;
+            if (chat->len > 0 && chat->msgs[chat->len - 1].text[0] != '\0' &&
                 chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT) {
+                partial = true;
+            } else if (chat->len > 0 &&
+                       chat->msgs[chat->len - 1].text[0] == '\0' &&
+                       chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT) {
                 chat_pop(chat);
             }
-            notice(chat, "abgebrochen");
-            dbg_log(dbg, "stream: vom benutzer abgebrochen");
+            if (partial) {
+                (void)session_log_assistant(
+                    &state->session, chat->msgs[chat->len - 1].text, NULL, 0,
+                    (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
+                    mono_ms() - sc.t_start, round, sc.model, -1, -1, true);
+            }
+            notice(state, "abgebrochen");
             return 0;
         }
 
         /* schaetzung gegen die api-zaehlung halten: die naechste
          * runde rechnet mit dem korrigierten faktor */
         ctx_calibrate(&state->ctx, req.est, sc.prompt_tokens);
-        dbg_log(dbg, "kontext: ~%zu geschaetzt, %d echt, faktor %d", req.est,
-                sc.prompt_tokens, state->ctx.scale);
+        ctx_account(&state->ctx, sc.prompt_tokens, sc.completion_tokens);
 
         /* akku uebernehmen: die letzte nachricht bekommt die calls.
          * chat_set_tool_calls uebernimmt das array (die() bei OOM
@@ -687,14 +711,30 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
             }
         }
 
-        /* agent-loop: keine tool-calls -> fertig, antwort steht */
+        /* agent-loop: keine tool-calls -> fertig, antwort steht.
+         * erst hier weiss die antwort endgueltig, was sie ist –
+         * jetzt (und nur bei erfolg) wandert sie ins session-log,
+         * mit allen messwerten der runde. */
         ChatMessage *last = &chat->msgs[chat->len - 1];
         if (last->tool_calls_len == 0) {
+            (void)session_log_assistant(
+                &state->session, last->text, NULL, 0,
+                (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
+                mono_ms() - sc.t_start, round, sc.model, sc.prompt_tokens,
+                sc.completion_tokens, false);
             return 0;
         }
 
+        /* antwort MIT tool-calls: calls haengen an der nachricht, die
+         * gleich ausgefuehrt werden – als eine zeile mitspeichern */
+        (void)session_log_assistant(
+            &state->session, last->text, last->tool_calls, last->tool_calls_len,
+            (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
+            mono_ms() - sc.t_start, round, sc.model, sc.prompt_tokens,
+            sc.completion_tokens, false);
+
         if (round + 1 >= SEND_MAX_ROUNDS) {
-            fail(chat, "tool-runden-limit (%d) erreicht", SEND_MAX_ROUNDS);
+            fail(state, 0, "tool-runden-limit (%d) erreicht", SEND_MAX_ROUNDS);
             return -1;
         }
 
@@ -714,22 +754,42 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
              * benutzer ab, bekommt das MODELL das als ergebnis: ohne
              * antwort auf den call wuerde die api die naechste runde
              * zurueckweisen, und das modell wuesste nicht, warum
-             * nichts passiert ist. */
-            if (hooks->confirm_tool != NULL && tool_needs_confirm(call->name) &&
-                !hooks->confirm_tool(call->name, call->arguments, hooks->ctx)) {
-                dbg_log(dbg, "tool: %s abgelehnt", call->name);
+             * nichts passiert ist. die entscheidung wandert mit ins
+             * session-log ("auto" = gar nicht erst gefragt). */
+            bool asked = false;
+            if (hooks->confirm_tool != NULL && tool_needs_confirm(call->name)) {
+                asked = true;
+            }
+            bool allowed = true;
+            if (asked) {
+                allowed = hooks->confirm_tool(call->name, call->arguments,
+                                              hooks->ctx);
+            }
+            if (asked && !allowed) {
                 if (chat_append_tool(chat, call->id,
                                      "error: vom benutzer abgelehnt") != 0) {
                     die("out of memory");
                 }
+                (void)session_log_tool(&state->session, call->id, call->name,
+                                       "error: vom benutzer abgelehnt", -1,
+                                       "no");
                 continue;
             }
+            const char *confirm = "auto";
+            if (asked && state->tools_always) {
+                confirm = "always";
+            } else if (asked) {
+                confirm = "yes";
+            }
 
-            dbg_log(dbg, "tool: %s(%s)", call->name, call->arguments);
+            long long t_tool = mono_ms();
             char *result = tool_execute(call->name, call->arguments);
+            long long dur = mono_ms() - t_tool;
             if (result == NULL) {
                 die("out of memory");
             }
+            (void)session_log_tool(&state->session, call->id, call->name,
+                                   result, dur, confirm);
             if (chat_append_tool(chat, call->id, result) != 0) {
                 die("out of memory");
             }

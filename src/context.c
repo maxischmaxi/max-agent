@@ -185,3 +185,16 @@ void ctx_calibrate(CtxUsage *usage, size_t estimated, int prompt_tokens)
     }
     usage->scale = (int)scale;
 }
+
+void ctx_account(CtxUsage *usage, int prompt_tokens, int completion_tokens)
+{
+    if (usage == NULL) {
+        return;
+    }
+    if (prompt_tokens > 0) {
+        usage->total_prompt += (size_t)prompt_tokens;
+    }
+    if (completion_tokens > 0) {
+        usage->total_completion += (size_t)completion_tokens;
+    }
+}

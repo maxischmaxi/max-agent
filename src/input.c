@@ -535,11 +535,11 @@ bool input_word_capitalize(Input *in)
     return word_case(in, WORD_CAP);
 }
 
-void input_char(Input *in, char c, int cols)
+void input_char(Input *in, char c)
 {
     char *line = in->lines[in->cursor_line];
     size_t len = strlen(line);
-    if (len >= (size_t)(cols - 4)) {
+    if (len >= INPUT_MAX_LINE_BYTES) {
         return;
     }
     /* defensively klemmen – die invariante sollte immer gelten */
@@ -675,4 +675,204 @@ void input_init(Input *in)
         die("out of memory");
     }
     in->count = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Soft-wrap (siehe input.h): eine logische zeile wird zeichenweise   */
+/* an der feldkante umgebrochen. alle funktionen hier lesen nur –     */
+/* der text aendert sich durch den umbruch nie.                       */
+/* ------------------------------------------------------------------ */
+
+/* ein codepoint ab s: byte-laenge. defekte sequenzen zaehlen als
+ * einzelbyte, gelesen wird nie ueber den terminator hinaus. */
+static size_t wrap_step(const char *s)
+{
+    unsigned char c = (unsigned char)s[0];
+    size_t n = 1;
+    if ((c & 0xE0U) == 0xC0U) {
+        n = 2;
+    } else if ((c & 0xF0U) == 0xE0U) {
+        n = 3;
+    } else if ((c & 0xF8U) == 0xF0U) {
+        n = 4;
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (((unsigned char)s[i] & 0xC0U) != 0x80U) {
+            return 1; /* abgebrochene sequenz */
+        }
+    }
+    return n;
+}
+
+/* breite auf etwas sinnvolles klemmen: 0 oder negativ waere eine
+ * endlosschleife, und ein feld unter einer zelle gibt es nicht */
+static size_t wrap_width(int width)
+{
+    return (width > 0) ? (size_t)width : 1;
+}
+
+/* wieviele bildschirmzeilen belegt EINE logische zeile? */
+static size_t line_rows(const char *s, size_t w)
+{
+    size_t rows = 1;
+    size_t cells = 0;
+    for (size_t i = 0; s[i] != '\0';) {
+        if (cells == w) {
+            rows++;
+            cells = 0;
+        }
+        i += wrap_step(s + i);
+        cells++;
+    }
+    return rows;
+}
+
+/* den n-ten abschnitt EINER logischen zeile: byte-offset + laenge.
+ * n muss < line_rows(s, w) sein. */
+static void line_slice(const char *s, size_t w, size_t n, size_t *off,
+                       size_t *len)
+{
+    size_t row = 0;
+    size_t start = 0;
+    size_t cells = 0;
+    size_t i = 0;
+    while (s[i] != '\0') {
+        if (cells == w) {
+            if (row == n) {
+                *off = start;
+                *len = i - start;
+                return;
+            }
+            row++;
+            start = i;
+            cells = 0;
+        }
+        i += wrap_step(s + i);
+        cells++;
+    }
+    *off = start;
+    *len = i - start; /* letzter abschnitt bis zum zeilenende */
+}
+
+size_t input_screen_rows(const Input *in, int width)
+{
+    if (in == NULL) {
+        return 0;
+    }
+    size_t w = wrap_width(width);
+    size_t rows = 0;
+    for (size_t i = 0; i < in->count; i++) {
+        rows += line_rows(in->lines[i], w);
+    }
+    return rows;
+}
+
+bool input_screen_row(const Input *in, int width, size_t idx, size_t *line,
+                      size_t *off, size_t *len)
+{
+    if (in == NULL) {
+        return false;
+    }
+    size_t w = wrap_width(width);
+    size_t seen = 0;
+    for (size_t i = 0; i < in->count; i++) {
+        size_t rows = line_rows(in->lines[i], w);
+        if (idx < seen + rows) {
+            size_t o = 0;
+            size_t l = 0;
+            line_slice(in->lines[i], w, idx - seen, &o, &l);
+            if (line != NULL) {
+                *line = i;
+            }
+            if (off != NULL) {
+                *off = o;
+            }
+            if (len != NULL) {
+                *len = l;
+            }
+            return true;
+        }
+        seen += rows;
+    }
+    return false;
+}
+
+void input_cursor_screen(const Input *in, int width, size_t *row, size_t *col)
+{
+    size_t r = 0;
+    size_t c = 0;
+    if (in == NULL) {
+        goto out;
+    }
+    size_t w = wrap_width(width);
+    for (size_t i = 0; i < in->cursor_line && i < in->count; i++) {
+        r += line_rows(in->lines[i], w);
+    }
+    /* in der cursor-zeile bis zur cursor-position mitzaehlen */
+    const char *s = in->lines[in->cursor_line];
+    size_t cur = in->cursor;
+    if (cur > strlen(s)) {
+        cur = strlen(s);
+    }
+    for (size_t i = 0; i < cur;) {
+        if (c == w) {
+            r++;
+            c = 0;
+        }
+        i += wrap_step(s + i);
+        c++;
+    }
+out:
+    if (row != NULL) {
+        *row = r;
+    }
+    if (col != NULL) {
+        *col = c;
+    }
+}
+
+/* cursor auf (bildschirmzeile, spalte) setzen. die spalte wird auf
+ * die laenge des abschnitts geklemmt. */
+static void cursor_to_screen(Input *in, int width, size_t row, size_t col)
+{
+    size_t line = 0;
+    size_t off = 0;
+    size_t len = 0;
+    if (!input_screen_row(in, width, row, &line, &off, &len)) {
+        return;
+    }
+    /* col zellen in den abschnitt hinein, utf-8-weise */
+    const char *s = in->lines[line] + off;
+    size_t i = 0;
+    size_t cells = 0;
+    while (cells < col && i < len) {
+        i += wrap_step(s + i);
+        cells++;
+    }
+    in->cursor_line = line;
+    in->cursor = off + i;
+}
+
+bool input_screen_up(Input *in, int width)
+{
+    size_t row = 0;
+    size_t col = 0;
+    input_cursor_screen(in, width, &row, &col);
+    if (row == 0) {
+        return false; /* schon in der obersten zeile */
+    }
+    cursor_to_screen(in, width, row - 1, col);
+    return true;
+}
+
+bool input_screen_down(Input *in, int width)
+{
+    size_t row = 0;
+    size_t col = 0;
+    input_cursor_screen(in, width, &row, &col);
+    if (row + 1 >= input_screen_rows(in, width)) {
+        return false; /* schon in der untersten zeile */
+    }
+    cursor_to_screen(in, width, row + 1, col);
+    return true;
 }

@@ -2,7 +2,6 @@
 #define MAX_AGENT_SEND
 
 #include "config.h"
-#include "debug.h"
 #include "openai_completions.h"
 #include "state.h"
 
@@ -46,7 +45,7 @@ const Model *send_find_model(const Config *cfg, const char *id,
  * rueckgabe: 0 bei antwort/fehler aus der api, -1 bei
  * benutzungsfehlern (kein modell/provider/api-key gewaehlt, OOM).
  * fehler landen IMMER als CHAT_ROLE_ERROR im verlauf. */
-int send_message(AppState *state, const Config *cfg, DebugState *dbg);
+int send_message(AppState *state, const Config *cfg);
 
 /* ------------------------------------------------------------------ */
 /* haken, die send_stream in die UI zurueckruft. beide bekommen den  */
@@ -75,7 +74,6 @@ typedef struct {
  * bekommen die fehlermeldung hinterher.
  * rueckgabe: 0 wenn der stream durchlief, -1 sonst (fehlermeldung
  * steht als ERROR-nachricht im verlauf). */
-int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
-                const SendHooks *hooks);
+int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks);
 
 #endif

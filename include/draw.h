@@ -39,6 +39,12 @@ typedef struct {
     int more_above_row;
     int more_below_row;
 
+    /* soft-wrap des eingabefelds: nutzbare textbreite und die erste
+     * sichtbare bildschirmzeile (gescrollt wird nur, wenn der text
+     * hoeher ist als die box werden darf) */
+    int input_w;
+    size_t input_first;
+
     /* befehlsliste direkt unter dem eingabefeld */
     int cmd_top;
     int cmd_h;
@@ -46,7 +52,8 @@ typedef struct {
      * eingabefeld gerade den system-prompt bearbeitet */
     bool prompt_hint;
 
-    int quit_row; /* 0 = keine quit-meldung anzeigen */
+    int quit_row;   /* 0 = keine quit-meldung anzeigen */
+    int status_row; /* erste der beiden statuszeilen */
 
     /* dialog-box (MODE_MODELS / MODE_SETTINGS / MODE_THEME),
      * box waechst von unten: */
@@ -65,6 +72,7 @@ typedef struct {
     int scroll;   /* erster sichtbarer treffer */
     int selected; /* flacher index des angewaehlten eintrags */
     int id_col;   /* breite der namens-spalte (alignment, wie cmd_name_col) */
+    int name_col; /* dito fuer die session-liste: name/preview-spalte */
 } Layout;
 
 typedef enum {
@@ -90,7 +98,10 @@ typedef enum {
     SLOT_THEME,         /* eintrag der theme-auswahl */
     SLOT_PROMPT_OPT,    /* eintrag der system-prompt-auswahl */
     SLOT_PROMPT_HINT,   /* hinweis: eingabefeld bearbeitet den prompt */
+    SLOT_SESSION,       /* eintrag der session-liste (resume-dialog) */
     SLOT_QUIT,          /* quit-bestaetigung */
+    SLOT_STATUS_MODEL,  /* statuszeile 1: modell + kontextfenster */
+    SLOT_STATUS_TOKENS, /* statuszeile 2: verbrauch (+ spaeter session) */
 } SlotKind;
 
 typedef struct {
@@ -113,10 +124,22 @@ void layout_dialog_box(Layout *lt, int rows, DialogState *d);
 
 void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
                     const Config *cfg);
+
+/* nutzbare textbreite einer eingabezeile bei dieser terminalbreite:
+ * ohne debug-sidebar, ohne das " > "-praefix und ohne die spalte,
+ * in der der cursor-block am zeilenende sitzt. keys.c braucht
+ * dieselbe zahl wie das layout, damit tippen und zeichnen
+ * denselben umbruch sehen. */
+int input_field_width(int cols);
+
+/* die beiden statuszeilen am unteren rand sind fest reserviert:
+ * sie zeigen immer, mit welchem modell gesprochen wird und was die
+ * sitzung bisher gekostet hat. eingabefeld und befehlsliste liegen
+ * darueber und rechnen deshalb mit entsprechend weniger zeilen. */
+#define STATUS_H 2
 Slot layout_slot(const Layout *lt, int row);
 void draw_slot(Frame *f, const Layout *lt, const Slot *s, const AppState *st,
                const Config *cfg);
-void draw(int rows, int cols, AppState *state, const DebugState *dbg,
-          const Config *cfg);
+void draw(int rows, int cols, AppState *state, const Config *cfg);
 
 #endif

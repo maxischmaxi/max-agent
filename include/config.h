@@ -4,8 +4,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#include "debug.h"
-
 typedef enum {
     TEXT,
     IMAGE,
@@ -55,6 +53,6 @@ int load_config_from(const char *path, Config *config);
 int save_config_to(const char *path, const Config *config);
 
 void free_config(Config *config);
-void config_persist(Config *cfg, DebugState *dbg);
+void config_persist(Config *cfg);
 
 #endif

@@ -307,10 +307,12 @@ static pid_t start_slow_server(int *port)
 /* redraw-zaehler statt echtem draw() */
 static int g_redraws = 0;
 
+static void *g_redraw_ctx = NULL;
+
 static void count_redraw(void *ud)
 {
-    (void)ud;
     g_redraws++;
+    g_redraw_ctx = ud; /* wird der ctx durchgereicht? siehe unten */
 }
 
 /* standard-haken der tests: nur zeichnen, keine rueckfrage –
@@ -443,11 +445,10 @@ static void test_agent(void)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
 
     g_redraws = 0;
-    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
+    int rc = send_stream(&st, &cfg, &HOOKS);
     CHECK(rc == 0);
 
     /* verlauf: user -> assistant mit tool-call -> tool-ergebnis
@@ -509,11 +510,10 @@ static void test_agent_broken_call(void)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
 
     g_redraws = 0;
-    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
+    int rc = send_stream(&st, &cfg, &HOOKS);
     CHECK(rc == 0);
 
     /* namenloser call verworfen -> keine tool-runde, loop endet */
@@ -552,7 +552,6 @@ static void test_context_trim(void)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
 
     /* ~8 kb alter verlauf (~2000 tokens) + eine kurze neue frage */
     char *old = malloc(8193);
@@ -567,7 +566,7 @@ static void test_context_trim(void)
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neue frage") == 0);
 
     g_redraws = 0;
-    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
+    int rc = send_stream(&st, &cfg, &HOOKS);
     CHECK(rc == 0);
 
     /* der server hat den alten block NICHT gesehen */
@@ -617,11 +616,10 @@ static void test_context_fits(void)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "URALTE-NACHRICHT hallo") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neue frage") == 0);
 
-    CHECK(send_stream(&st, &cfg, &dbg, &HOOKS) == 0);
+    CHECK(send_stream(&st, &cfg, &HOOKS) == 0);
     ChatMessage *answer = &st.chat.msgs[st.chat.len - 1];
     CHECK(answer->text != NULL && strcmp(answer->text, "JA") == 0);
     CHECK(st.ctx.dropped == 0);
@@ -656,7 +654,6 @@ static void test_stream_abort(void)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "erzaehl was langes") == 0);
 
     /* ctrl+c liegt an, bevor der stream laeuft: der watchdog des
@@ -667,7 +664,7 @@ static void test_stream_abort(void)
     struct timespec t0;
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
+    int rc = send_stream(&st, &cfg, &HOOKS);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     CHECK(rc == 0); /* abbruch ist kein fehler */
 
@@ -721,10 +718,9 @@ static void test_stream_no_abort(void)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "erzaehl was langes") == 0);
 
-    CHECK(send_stream(&st, &cfg, &dbg, &HOOKS) == 0);
+    CHECK(send_stream(&st, &cfg, &HOOKS) == 0);
 
     ChatMessage *answer = &st.chat.msgs[st.chat.len - 1];
     CHECK(answer->role == CHAT_ROLE_ASSISTANT);
@@ -838,7 +834,6 @@ static void test_agent_realloc(void)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
 
     /* den verlauf so fuellen, dass die naechsten anhaenge-vorgaenge
      * die kapazitaet sprengen (chat waechst 8 -> 16 -> ...) */
@@ -848,7 +843,7 @@ static void test_agent_realloc(void)
     }
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu vier dinge") == 0);
 
-    CHECK(send_stream(&st, &cfg, &dbg, &HOOKS) == 0);
+    CHECK(send_stream(&st, &cfg, &HOOKS) == 0);
 
     /* alle vier tool-ergebnisse sind im verlauf gelandet */
     size_t tools = 0;
@@ -902,7 +897,6 @@ static void run_confirm_case(bool answer, bool *out_ran, size_t *out_tools)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
 
     /* das mock-tool schreibt eine datei, an der sich ablesen laesst,
@@ -917,7 +911,7 @@ static void run_confirm_case(bool answer, bool *out_ran, size_t *out_tools)
         .redraw = count_redraw,
         .confirm_tool = answer_hook,
     };
-    CHECK(send_stream(&st, &cfg, &dbg, &hooks) == 0);
+    CHECK(send_stream(&st, &cfg, &hooks) == 0);
 
     /* gefragt wurde genau einmal, und zwar nach dem bash-tool */
     CHECK(g_asked == 1);
@@ -973,14 +967,50 @@ static void test_tool_confirm(void)
     build_mock_cfg(&cfg, port);
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
     (void)unlink(CONFIRM_MARK);
     g_asked = 0;
-    CHECK(send_stream(&st, &cfg, &dbg, &HOOKS) == 0);
+    CHECK(send_stream(&st, &cfg, &HOOKS) == 0);
     CHECK(g_asked == 0);                    /* niemand wurde gefragt */
     CHECK(access(CONFIRM_MARK, F_OK) == 0); /* und es lief */
     (void)unlink(CONFIRM_MARK);
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+/* der ctx aus SendHooks muss unveraendert im redraw-callback
+ * ankommen. das klingt trivial, ist aber die stelle, an der die UI
+ * ihren zeichen-kontext bekommt: geht sie verloren, dereferenziert
+ * stream_redraw NULL – und zwar erst im echten betrieb, weil die
+ * uebrigen tests mit ctx == NULL fahren. */
+static void test_hooks_ctx(void)
+{
+    int port = 0;
+    pid_t server = start_sse_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "hallo") == 0);
+
+    int marker = 4711;
+    g_redraw_ctx = NULL;
+    g_redraws = 0;
+    SendHooks hooks = {.ctx = &marker, .redraw = count_redraw};
+    CHECK(send_stream(&st, &cfg, &hooks) == 0);
+
+    CHECK(g_redraws > 0);
+    CHECK(g_redraw_ctx == &marker); /* exakt der uebergebene zeiger */
+
     chat_free(&st.chat);
     input_free(&st.input);
     free_mock_cfg(&cfg);
@@ -1023,12 +1053,11 @@ static void test_stream(void)
 
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "hi") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "moin") == 0);
 
     g_redraws = 0;
-    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
+    int rc = send_stream(&st, &cfg, &HOOKS);
     CHECK(rc == 0);
 
     /* verlauf: user, alte antwort, NEUE antwort aus den deltas */
@@ -1080,7 +1109,7 @@ static void test_stream(void)
     input_init(&st2.input);
     CHECK(chat_append(&st2.chat, CHAT_ROLE_USER, "hi") == 0);
 
-    rc = send_stream(&st2, &bad, &dbg, &HOOKS);
+    rc = send_stream(&st2, &bad, &HOOKS);
     CHECK(rc == -1);
     /* platzhalter ist weg: nur user + fehlermeldung */
     CHECK(st2.chat.len == 2);
@@ -1232,11 +1261,10 @@ int main(void)
     /* --- send_message: benutzungsfehler ohne netzwerk --- */
     AppState st = {0};
     input_init(&st.input);
-    DebugState dbg = {0};
 
     /* keine config: fehler landet im verlauf, nicht im crash */
     Config empty = {0};
-    CHECK(send_message(&st, &empty, &dbg) == -1);
+    CHECK(send_message(&st, &empty) == -1);
     CHECK(st.chat.len == 1);
     CHECK(st.chat.msgs[0].role == CHAT_ROLE_ERROR);
     CHECK(st.chat.msgs[0].text != NULL);
@@ -1250,7 +1278,7 @@ int main(void)
     nokey.providers_len = 1;
     nokey.active_model = dup_str("local-model");
     CHECK(nokey.active_model != NULL);
-    CHECK(send_message(&st, &nokey, &dbg) == -1);
+    CHECK(send_message(&st, &nokey) == -1);
     CHECK(st.chat.len == 1);
     CHECK(st.chat.msgs[0].role == CHAT_ROLE_ERROR);
     CHECK(st.chat.msgs[0].text != NULL &&
@@ -1281,6 +1309,7 @@ int main(void)
     test_stream_no_abort();
     test_agent_realloc();
     test_tool_confirm();
+    test_hooks_ctx();
 
     chat_free(&chat);
     return test_report();

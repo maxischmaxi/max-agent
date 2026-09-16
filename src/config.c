@@ -5,7 +5,6 @@
 #include <string.h>
 
 #include "cJSON.h"
-#include "debug.h"
 #include "utils.h"
 
 static const char *input_type_to_str(InputType t)
@@ -527,12 +526,10 @@ void free_config(Config *config)
     config->providers_len = 0;
 }
 
-void config_persist(Config *cfg, DebugState *dbg)
+void config_persist(Config *cfg)
 {
-    (void)dbg; /* dbg_log: im release wegkompiliert */
-    if (save_config(cfg) == 0) {
-        dbg_log(dbg, "config gespeichert");
-    } else {
-        dbg_log(dbg, "config speichern fehlgeschlagen");
-    }
+    /* fehler beim schreiben sind hier bewusst still: die aenderung
+     * gilt in der laufenden sitzung trotzdem, und ein dialog waere
+     * mitten in der bedienung mehr stoerung als hilfe. */
+    (void)save_config(cfg);
 }

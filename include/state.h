@@ -8,6 +8,7 @@
 #include "context.h"
 #include "history.h"
 #include "input.h"
+#include "session.h"
 
 /* ------------------------------------------------------------------ */
 /* DialogState: suchtext + cursor eines offenen dialogs. gehoert zur   */
@@ -41,8 +42,9 @@ typedef struct {
     bool models_dialog; /* when entering the models dialog */
     bool cmd_active;    /* when typing "/", currently writing a command */
     bool settings_dialog;
-    bool theme_sub;  /* theme-untermenue offen (nur mit settings_dialog) */
-    bool prompt_sub; /* system-prompt-untermenue (dito) */
+    bool sessions_dialog; /* resume-dialog: session-liste full-screen */
+    bool theme_sub;       /* theme-untermenue offen (nur mit settings_dialog) */
+    bool prompt_sub;      /* system-prompt-untermenue (dito) */
     /* das eingabefeld bearbeitet gerade den system-prompt statt
      * einer nachricht: enter speichert, escape verwirft */
     bool prompt_edit;
@@ -64,6 +66,15 @@ typedef struct {
      * verlauf dabei weggelassen wurde (context.c) */
     CtxUsage ctx;
     DialogState dialog;
+
+    /* die session, in die gerade aufgezeichnet wird (session.c):
+     * active = false, solange noch keine nachricht lief. beim
+     * app-ende gehoert session_free dazu. */
+    Session session;
+    /* session-liste des resume-dialogs: wird beim oeffnen geladen
+     * und beim schliessen (und am app-ende) freigegeben. ausser-
+     * halb des dialogs ist sie leer. */
+    SessionList sessions;
     bool quit;
     bool dirty;
 } AppState;

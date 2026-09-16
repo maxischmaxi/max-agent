@@ -5,7 +5,6 @@
 #include <sys/types.h>
 
 #include "config.h"
-#include "debug.h"
 #include "state.h"
 
 /* lesepuffer fuer tastatur-bytes. gross genug, dass eine
@@ -104,7 +103,6 @@ void keys_unread(const char *buf, size_t len);
  * eingabe dagegen verworfen: wer stoppt, will nicht gleichzeitig
  * tippen. */
 bool keys_abort_pressed(void);
-void handle_key(AppState *state, Config *cfg, DebugState *dbg, int rows,
-                int cols);
+void handle_key(AppState *state, Config *cfg, int rows, int cols);
 
 #endif

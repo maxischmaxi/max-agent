@@ -5,6 +5,12 @@
 #include <stddef.h>
 #define INPUT_MAX_LINES 16
 
+/* obergrenze je LOGISCHER zeile. frueher war das die feldbreite –
+ * seit dem soft-wrap bricht eine lange zeile einfach um, also
+ * begrenzt hier nur noch der gesunde menschenverstand (16 zeilen
+ * dieser laenge sind ein sehr langer system-prompt). */
+#define INPUT_MAX_LINE_BYTES 4096
+
 typedef struct {
     char *lines[INPUT_MAX_LINES];
     size_t count;
@@ -30,9 +36,48 @@ void input_reset(Input *in);
 void input_set_text(Input *in, const char *text);
 void input_backspace(Input *in);
 void input_newline(Input *in, int rows, int list_h, bool g_confirm_quit);
-void input_char(Input *in, char c, int cols);
+/* ein zeichen an der cursor-position einfuegen. die feldbreite
+ * spielt keine rolle mehr: zu langer text bricht beim zeichnen um
+ * (siehe soft-wrap unten), statt verschluckt zu werden. */
+void input_char(Input *in, char c);
 void input_free(Input *in);
 int bottom_border_for(int rows, int list_h, bool g_confirm_quit);
+
+/* ------------------------------------------------------------------ */
+/* Soft-wrap: lines[] sind die LOGISCHEN zeilen (durch shift+enter    */
+/* getrennt). laeuft eine davon ueber die feldbreite, wird sie beim   */
+/* ZEICHNEN auf mehrere bildschirmzeilen verteilt – der text selbst  */
+/* bleibt unveraendert.                                               */
+/*                                                                    */
+/* das ist der grund fuer die trennung: wuerde der umbruch echte      */
+/* zeilen einfuegen, waere nach einem resize nicht mehr zu erkennen,  */
+/* welche zeilenumbrueche der benutzer wollte und welche vom umbruch  */
+/* stammen – der abgeschickte text haenge dann an der fenstergroesse. */
+/*                                                                    */
+/* umgebrochen wird ZEICHENWEISE an der feldkante, nicht am wort      */
+/* (anders als im chat-verlauf): beim tippen soll text dort bleiben,  */
+/* wo er steht, und die cursor-position eindeutig sein. so machen es  */
+/* auch shells. utf-8-codepoints werden nie zerschnitten.             */
+/* ------------------------------------------------------------------ */
+
+/* wieviele bildschirmzeilen die eingabe bei dieser breite belegt.
+ * jede logische zeile ergibt mindestens eine – auch die leere. */
+size_t input_screen_rows(const Input *in, int width);
+
+/* den abschnitt der idx-ten bildschirmzeile bestimmen: logische
+ * zeile, byte-offset darin, byte-laenge. false = idx liegt hinter
+ * der letzten zeile. out-parameter duerfen NULL sein. */
+bool input_screen_row(const Input *in, int width, size_t idx, size_t *line,
+                      size_t *off, size_t *len);
+
+/* bildschirmzeile und spalte (in zellen) des cursors */
+void input_cursor_screen(const Input *in, int width, size_t *row, size_t *col);
+
+/* cursor eine bildschirmzeile hoch/runter, die spalte moeglichst
+ * halten. false = es gibt in der richtung keine zeile mehr (dann
+ * greift in keys.c die history). */
+bool input_screen_up(Input *in, int width);
+bool input_screen_down(Input *in, int width);
 
 /* ------------------------------------------------------------------ */
 /* Cursor-utility: alles, was man zum steuern braucht. die bewegungs-  */

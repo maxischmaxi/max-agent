@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L // NOLINT(bugprone-reserved-identifier)
+
 #include "draw.h"
 
 #include <limits.h>
@@ -5,9 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "chat.h"
 #include "command.h"
+#include "send.h"
+#include "session.h"
 #include "settings.h"
 #include "state.h"
 #include "theme.h"
@@ -21,6 +26,9 @@ static const char GLYPH_ARROW_DOWN[] = "\xE2\x86\x93"; /* utf-8: runter */
 /* breite des zeilen-labels ("you  ", "max  ", ...) bzw. der
  * einrueckung von folgezeilen */
 #define MSG_PREFIX_W 5
+
+/* " > " bzw. "   " vor jeder eingabezeile */
+#define INPUT_PREFIX_W 3
 
 /* ------------------------------------------------------------------ */
 /* zeilen-arena fuer den chat: layout_compute fuellt sie jeden frame  */
@@ -65,22 +73,13 @@ static void frame_end(Frame *f, int rows)
     free(f->buf);
 }
 
-void layout_dialog_box(Layout *lt, int rows, DialogState *d)
+/* cursor/scroll normalisieren: NUR hier sind trefferzahl und
+ * sichtbare hoehe gemeinsam bekannt -> zurueckschreiben in den
+ * state, damit die key-behandlung (enter) konsistente werte
+ * sieht, egal ob ein draw dazwischen lag */
+static void dialog_normalize(Layout *lt, DialogState *d, int entries_h)
 {
-    /* eintrags-bereich: max 50% des bildschirms,
-     * mind. 1 zeile (kein treffer: hinweis-zeile) */
-    lt->entries_h = (lt->match_count > 0) ? lt->match_count : 1;
-    if (lt->entries_h > rows / 2) {
-        lt->entries_h = rows / 2;
-    }
-    if (lt->entries_h < 1) {
-        lt->entries_h = 1;
-    }
-
-    /* cursor/scroll normalisieren: NUR hier sind trefferzahl und
-     * sichtbare hoehe gemeinsam bekannt -> zurueckschreiben in den
-     * state, damit die key-behandlung (enter) konsistente werte
-     * sieht, egal ob ein draw dazwischen lag */
+    lt->entries_h = entries_h;
     if (d->selected >= lt->match_count) {
         d->selected = lt->match_count - 1; /* filter schrumpfte */
     }
@@ -101,10 +100,55 @@ void layout_dialog_box(Layout *lt, int rows, DialogState *d)
     }
     lt->scroll = d->scroll;
     lt->selected = (lt->match_count > 0) ? lt->match_idx[d->selected] : -1;
+}
+
+void layout_dialog_box(Layout *lt, int rows, DialogState *d)
+{
+    /* eintrags-bereich: max 50% des bildschirms,
+     * mind. 1 zeile (kein treffer: hinweis-zeile) */
+    int entries_h = (lt->match_count > 0) ? lt->match_count : 1;
+    if (entries_h > rows / 2) {
+        entries_h = rows / 2;
+    }
+    if (entries_h < 1) {
+        entries_h = 1;
+    }
+    dialog_normalize(lt, d, entries_h);
 
     /* box von unten: border, suchzeile, dann die eintraege */
     lt->box_top = rows - lt->entries_h - 2;
     lt->box_bottom = rows - 1;
+}
+
+/* full-screen-variante fuer den resume-dialog: die suchzeile sitzt
+ * ganz oben (zeile 1), die eintraege fuellen den rest. box_top
+ * ist 0 – eine zeile, die es nicht gibt –, dadurch zeichnet der
+ * rahmen-slot nie, und die suchzeile rueckt auf zeile 1. die
+ * allerletzte zeile bleibt wie ueberall frei: dort parkt der
+ * cursor (frame_end), und die unterste rechte ecke zu beschreiben
+ * kann aeltere terminals zum scrollen bringen. eingabefeld und
+ * statuszeilen existieren in diesem modus nicht. */
+static void layout_dialog_full(Layout *lt, int rows, DialogState *d)
+{
+    int entries_h = (lt->match_count > 0) ? lt->match_count : 1;
+    if (entries_h > rows - 2) {
+        entries_h = rows - 2;
+    }
+    if (entries_h < 1) {
+        entries_h = 1;
+    }
+    dialog_normalize(lt, d, entries_h);
+
+    lt->box_top = 0; /* "rahmen" im nirgendwo: nur suche + eintraege */
+    lt->box_bottom = rows - 1;
+}
+
+int input_field_width(int cols)
+{
+    /* eine spalte mehr als umgebrochen wird: dort sitzt der
+     * cursor-block, wenn er am zeilenende steht */
+    int w = main_width(cols) - INPUT_PREFIX_W - 1;
+    return (w > 0) ? w : 1;
 }
 
 void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
@@ -115,8 +159,22 @@ void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
     lt->rows = rows;
     lt->main_w = main_width(cols);
 
+    /* die zwei statuszeilen ganz unten gehoeren niemandem sonst;
+     * zeile `rows` bleibt frei, dort parkt frame_end den cursor.
+     *
+     * sie bekommen den platz aber nur, wenn darueber noch eine
+     * eingabe-box passt (rahmen, textzeile, rahmen) – sonst wuerde
+     * bottom_border_for auf sein minimum klemmen und die box liefe
+     * in die statuszeilen hinein. */
+    int usable = rows;
+    lt->status_row = 0;
+    if (rows >= STATUS_H + 3) {
+        lt->status_row = rows - STATUS_H;
+        usable = rows - STATUS_H;
+    }
+
     if (st->confirm_quit) {
-        lt->quit_row = rows - 1;
+        lt->quit_row = usable - 1;
     }
 
     switch (mode) {
@@ -133,10 +191,44 @@ void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
             lt->cmd_h = 1;
             lt->prompt_hint = true;
         }
-        lt->input_bottom = bottom_border_for(rows, lt->cmd_h, st->confirm_quit);
-        lt->input_top = lt->input_bottom - (int)st->input.count - 1;
+        lt->input_bottom =
+            bottom_border_for(usable, lt->cmd_h, st->confirm_quit);
+
+        /* die hoehe kommt aus den BILDSCHIRMzeilen, nicht aus der
+         * zahl der logischen zeilen: eine lange zeile bricht um und
+         * braucht dann mehrere. bei einem resize faellt das hier neu
+         * aus, ohne dass der text angefasst wird. */
+        lt->input_w = input_field_width(cols);
+        size_t in_rows = input_screen_rows(&st->input, lt->input_w);
+
+        /* die box darf den verlauf nicht ganz verdraengen: zwei
+         * zeilen bleiben oben frei (dieselbe regel, nach der
+         * input_newline entscheidet). passt der text nicht, wird
+         * gescrollt statt gewachsen. */
+        int max_h = lt->input_bottom - 3;
+        if (max_h < 1) {
+            max_h = 1;
+        }
+        int in_h = (in_rows > (size_t)max_h) ? max_h : (int)in_rows;
+        if (in_h < 1) {
+            in_h = 1;
+        }
+        lt->input_top = lt->input_bottom - in_h - 1;
         if (lt->input_top < 1) {
             lt->input_top = 1;
+        }
+
+        /* mitscrollen, damit die zeile mit dem cursor sichtbar ist */
+        lt->input_first = 0;
+        if (in_rows > (size_t)in_h) {
+            size_t crow = 0;
+            input_cursor_screen(&st->input, lt->input_w, &crow, NULL);
+            if (crow >= (size_t)in_h) {
+                lt->input_first = crow - (size_t)in_h + 1;
+            }
+            if (lt->input_first + (size_t)in_h > in_rows) {
+                lt->input_first = in_rows - (size_t)in_h;
+            }
         }
         lt->cmd_top = lt->input_bottom + 1;
 
@@ -270,7 +362,7 @@ void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
                 }
             }
         }
-        layout_dialog_box(lt, rows, &st->dialog);
+        layout_dialog_box(lt, usable, &st->dialog);
         break;
     }
 
@@ -280,7 +372,7 @@ void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
             names_match(SETTING_NAMES, SET_COUNT, st->dialog.search,
                         lt->match_idx, DIALOG_MATCH_MAX);
         lt->id_col = names_col(SETTING_NAMES, SET_COUNT);
-        layout_dialog_box(lt, rows, &st->dialog);
+        layout_dialog_box(lt, usable, &st->dialog);
         break;
     }
 
@@ -290,7 +382,7 @@ void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
             names_match(PROMPT_OPT_NAMES, PROMPT_OPT_COUNT, st->dialog.search,
                         lt->match_idx, DIALOG_MATCH_MAX);
         lt->id_col = names_col(PROMPT_OPT_NAMES, PROMPT_OPT_COUNT);
-        layout_dialog_box(lt, rows, &st->dialog);
+        layout_dialog_box(lt, usable, &st->dialog);
         break;
 
     case MODE_THEME: {
@@ -301,7 +393,55 @@ void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
         lt->match_count = names_match(names, total, st->dialog.search,
                                       lt->match_idx, DIALOG_MATCH_MAX);
         lt->id_col = names_col(names, total);
-        layout_dialog_box(lt, rows, &st->dialog);
+        layout_dialog_box(lt, usable, &st->dialog);
+        break;
+    }
+
+    case MODE_SESSIONS: {
+        /* full screen: die statuszeilen gehoeren in diesem modus
+         * dem dialog, niemand sonst wertet sie hier aus */
+        lt->status_row = 0;
+        snprintf(lt->search, sizeof lt->search, "%s", st->dialog.search);
+        lt->match_count = sessions_match(&st->sessions, st->dialog.search,
+                                         lt->match_idx, DIALOG_MATCH_MAX);
+
+        /* spaltenbreiten: id fest, name/preview gedeckelt. die
+         * name-spalte bekommt nur, was nach id, datum und nach-
+         * richten-zahl uebrig bleibt – sonst drueckt eine lange
+         * erste nachricht die zeit-spalte vom rand. die rest-
+         * breite: (3 " > " + 2 abstand + id + 2 abstand + 11
+         * datum + 5 trenner + 16 "9999 nachrichten") */
+        lt->id_col = 0;
+        for (int i = 0; i < lt->match_count; i++) {
+            int idw = (int)strlen(st->sessions.items[lt->match_idx[i]].id);
+            if (idw > lt->id_col) {
+                lt->id_col = idw;
+            }
+        }
+        int free_w = lt->main_w - lt->id_col - 39;
+        if (free_w < 1) {
+            free_w = 1; /* sehr schmal: name-spalte kollabiert */
+        }
+        lt->name_col = 0;
+        for (int i = 0; i < lt->match_count; i++) {
+            const SessionInfo *si = &st->sessions.items[lt->match_idx[i]];
+            int nw = 0;
+            if (si->name != NULL) {
+                nw = (int)strlen(si->name);
+            } else if (si->preview != NULL) {
+                nw = (int)strlen(si->preview);
+            }
+            if (nw > 48) {
+                nw = 48;
+            }
+            if (nw > free_w) {
+                nw = free_w;
+            }
+            if (nw > lt->name_col) {
+                lt->name_col = nw;
+            }
+        }
+        layout_dialog_full(lt, rows, &st->dialog);
         break;
     }
     }
@@ -312,6 +452,12 @@ Slot layout_slot(const Layout *lt, int row)
     Slot s = {SLOT_BLANK, 0};
 
     /* die quit-meldung gewinnt immer, egal welcher modus aktiv ist */
+    if (lt->status_row > 0 && row >= lt->status_row &&
+        row < lt->status_row + STATUS_H) {
+        s.kind =
+            (row == lt->status_row) ? SLOT_STATUS_MODEL : SLOT_STATUS_TOKENS;
+        return s;
+    }
     if (lt->quit_row != 0 && row == lt->quit_row) {
         s.kind = SLOT_QUIT;
         return s;
@@ -382,11 +528,15 @@ Slot layout_slot(const Layout *lt, int row)
         break;
 
     /* alle dialoge haben dieselbe box-geometrie (border, suchzeile,
-     * eintraege) – nur der eintrags-slot ist modus-abhaengig */
+     * eintraege) – nur der eintrags-slot ist modus-abhaengig. der
+     * resume-dialog nutzt dieselbe struktur, nur halt full screen
+     * (layout_dialog_full setzt box_top auf 0: der rahmen-slot
+     * zeichnet dann nie, die suchzeile sitzt auf zeile 1) */
     case MODE_MODELS:
     case MODE_SETTINGS:
     case MODE_PROMPT:
     case MODE_THEME:
+    case MODE_SESSIONS:
         if (row == lt->box_top) {
             s.kind = SLOT_DLG_BORDER;
         } else if (row == lt->box_top + 1) {
@@ -411,6 +561,9 @@ Slot layout_slot(const Layout *lt, int row)
                     break;
                 case MODE_THEME:
                     s.kind = SLOT_THEME;
+                    break;
+                case MODE_SESSIONS:
+                    s.kind = SLOT_SESSION;
                     break;
                 default:
                     break;
@@ -488,29 +641,39 @@ static void row_border(Row *r)
     }
 }
 
-static void row_input(Row *r, const Input *in, int idx)
+/* eine BILDSCHIRMzeile des eingabefelds. idx zaehlt ueber alle
+ * umgebrochenen zeilen hinweg, nicht ueber die logischen. */
+static void row_input(Row *r, const Input *in, int width, size_t idx)
 {
-    if (idx < 0 || idx >= (int)in->count) {
+    size_t line = 0;
+    size_t off = 0;
+    size_t len = 0;
+    if (!input_screen_row(in, width, idx, &line, &off, &len)) {
         return; /* feld groesser als der text: leerzeile */
     }
+    /* das prompt-zeichen gehoert an den textanfang, nicht an jede
+     * umgebrochene zeile */
     row_puts(r, (idx == 0) ? " > " : "   ");
 
-    const char *text = in->lines[idx];
-    if (idx == (int)in->cursor_line) {
-        /* cursor-block an der cursor-position (in der cursor-zeile).
-         * klemmen ist defensively – die invariante gilt eigentlich
-         * immer, aber der renderer liest hier text + cursor und darf
-         * nie ueber das string-ende hinausschießen. */
-        size_t cur = in->cursor;
-        if (cur > strlen(text)) {
-            cur = strlen(text);
-        }
-        row_putn(r, text, (int)cur);
-        row_glyph(r, GLYPH_BLOCK);
-        row_puts(r, text + cur);
-    } else {
-        row_puts(r, text);
+    const char *text = in->lines[line] + off;
+
+    size_t crow = 0;
+    input_cursor_screen(in, width, &crow, NULL);
+    if (crow != idx) {
+        row_putn(r, text, (int)len);
+        return;
     }
+
+    /* der cursor steht in dieser zeile. sein byte-offset im
+     * abschnitt ist die differenz zum abschnittsanfang – klemmen
+     * ist defensively, die invariante gilt eigentlich immer. */
+    size_t cur = (in->cursor > off) ? in->cursor - off : 0;
+    if (cur > len) {
+        cur = len;
+    }
+    row_putn(r, text, (int)cur);
+    row_glyph(r, GLYPH_BLOCK);
+    row_putn(r, text + cur, (int)(len - cur));
 }
 
 static void row_dlg_search(Row *r, const char *title, const char *search)
@@ -688,6 +851,111 @@ static void row_prompt_hint(Row *r)
     row_sgr(r, THEME_ROLE_RESET);
 }
 
+/* unix-ms -> "dd.mm hh:mm" (bzw. mit jahr, wenn es aelter ist).
+ * die liste soll auf einen blick zeigen, wann eine session zuletzt
+ * aktiv war – keine sekunden-genauigkeit noetig. */
+static void fmt_when(long long ms, char *buf, size_t sz)
+{
+    buf[0] = '?';
+    buf[1] = '\0';
+    if (ms <= 0) {
+        return;
+    }
+    time_t t = (time_t)(ms / 1000);
+    struct tm tmv;
+    if (localtime_r(&t, &tmv) == NULL) {
+        return;
+    }
+    time_t now = time(NULL);
+    struct tm nowv;
+    (void)localtime_r(&now, &nowv);
+    if (tmv.tm_year == nowv.tm_year) {
+        (void)strftime(buf, sz, "%d.%m %H:%M", &tmv);
+    } else {
+        (void)strftime(buf, sz, "%d.%m.%Y", &tmv);
+    }
+}
+
+/* eintrag der session-liste (resume-dialog). erste spalte: name,
+ * sonst die gekuerzte erste nachricht, sonst ein hinweis. danach
+ * id, zeitstempel und nachrichten-zahl; die gerade offene session
+ * traegt "(aktiv)". */
+static void row_session(Row *r, const SessionInfo *si, const char *search,
+                        bool selected, bool active, int id_col, int name_col)
+{
+    const Theme *theme = theme_current();
+
+    const char *name = "(ohne nachrichten)";
+    if (si->name != NULL) {
+        name = si->name;
+    } else if (si->preview != NULL) {
+        name = si->preview;
+    }
+
+    if (selected) {
+        row_sgr(r, theme->match);
+        row_puts(r, " > ");
+        row_sgr(r, theme->reset);
+    } else {
+        row_puts(r, "   ");
+    }
+
+    int slen = (int)strlen(search);
+    /* name auf die spaltenbreite kappen: die tabelle bleibt auch
+     * auf schmalen terminals lesbar, id/datum/nachrichten-zahl
+     * rutschen nie vom rand */
+    int show = (int)strlen(name);
+    if (show > name_col) {
+        show = name_col;
+    }
+    int hl = slen; /* getippter anteil: suchfarbe */
+    if (hl > show) {
+        hl = show;
+    }
+    row_sgr(r, theme->match);
+    row_putn(r, name, hl);
+    row_sgr(r, theme->reset);
+    row_putn(r, name + hl, show - hl);
+
+    if (active) {
+        row_sgr(r, theme_role(THEME_ROLE_DIM));
+        row_puts(r, " (aktiv)");
+        row_sgr(r, THEME_ROLE_RESET);
+    }
+
+    /* alignment: name-spalte (+ marker der aktiven session) + 2.
+     * die spaltenbreite einmal berechnen und fuer beide padding-
+     * schleifen benutzen. */
+    int col = 3 + name_col + 2;
+    if (active) {
+        col += 8;
+    }
+    while (r->cells < col) {
+        row_putc(r, ' ');
+    }
+
+    row_sgr(r, theme_role(THEME_ROLE_DIM));
+    row_putn(r, si->id, slen); /* id matcht die suche mit */
+    row_sgr(r, THEME_ROLE_RESET);
+    row_putn(r, si->id + slen, (int)strlen(si->id) - slen);
+    while (r->cells < col + id_col + 2) {
+        row_putc(r, ' ');
+    }
+
+    char when[24];
+    fmt_when(si->updated_at, when, sizeof when);
+    row_sgr(r, theme_role(THEME_ROLE_DIM));
+    row_puts(r, when);
+    row_puts(r, "  \xC2\xB7  ");
+    {
+        char buf[32];
+        (void)snprintf(buf, sizeof buf, "%zu %s", si->messages,
+                       (si->messages == 1) ? "nachricht" : "nachrichten");
+        row_puts(r, buf);
+    }
+    row_sgr(r, THEME_ROLE_RESET);
+}
+
 static void row_command(Row *r, const Command *cmd, const char *prefix)
 {
     const Theme *theme = theme_current();
@@ -711,6 +979,92 @@ static void row_no_match(Row *r, const char *prefix)
     char line[80];
     snprintf(line, sizeof line, "  kein befehl: /%s", prefix);
     row_puts(r, line);
+}
+
+/* token-zahlen kurz halten: 1234 -> "1.2k", 45678 -> "45k".
+ * die statuszeile soll auf einen blick lesbar sein, nicht exakt. */
+static void put_count(Row *r, size_t n)
+{
+    char buf[32];
+    if (n < 1000) {
+        (void)snprintf(buf, sizeof buf, "%zu", n);
+    } else if (n < 100000) {
+        (void)snprintf(buf, sizeof buf, "%zu.%zuk", n / 1000, (n % 1000) / 100);
+    } else {
+        (void)snprintf(buf, sizeof buf, "%zuk", n / 1000);
+    }
+    row_puts(r, buf);
+}
+
+/* label einer statuszeile: gleiche breite wie die chat-labels,
+ * damit die spalten untereinander stehen */
+static void status_label(Row *r, const char *label)
+{
+    row_sgr(r, theme_role(THEME_ROLE_DIM));
+    row_puts(r, " ");
+    row_puts(r, label);
+    row_sgr(r, THEME_ROLE_RESET);
+}
+
+/* statuszeile 1: mit wem wir sprechen und wie gross dessen fenster
+ * ist. ohne gewaehltes modell ein hinweis, wie man eins waehlt. */
+static void row_status_model(Row *r, const Config *cfg)
+{
+    status_label(r, "model   ");
+
+    const Provider *provider = NULL;
+    const Model *m = send_find_model(cfg, cfg->active_model, &provider);
+    if (m == NULL || m->id == NULL) {
+        row_sgr(r, theme_role(THEME_ROLE_DIM));
+        row_puts(r, "keins gewaehlt \xE2\x80\x93 /models");
+        row_sgr(r, THEME_ROLE_RESET);
+        return;
+    }
+
+    row_sgr(r, theme_role(THEME_ROLE_ASSISTANT));
+    row_puts(r, m->id);
+    row_sgr(r, THEME_ROLE_RESET);
+
+    row_sgr(r, theme_role(THEME_ROLE_DIM));
+    if (m->context_window > 0) {
+        row_puts(r, "  \xC2\xB7  "); /* mittelpunkt */
+        put_count(r, m->context_window);
+        row_puts(r, " kontext");
+    }
+    if (provider != NULL && provider->base_url != NULL) {
+        row_puts(r, "  \xC2\xB7  ");
+        row_puts(r, provider->base_url);
+    }
+    row_sgr(r, THEME_ROLE_RESET);
+}
+
+/* statuszeile 2: was die sitzung bisher gekostet hat, rechts
+ * daneben name und id der offenen session (der platz dafuer ist
+ * hier reserviert). ohne aktive session bleibt es bei den
+ * tokens. */
+static void row_status_tokens(Row *r, const AppState *st)
+{
+    status_label(r, "tokens  ");
+
+    row_sgr(r, theme_role(THEME_ROLE_DIM));
+    put_count(r, st->ctx.total_prompt);
+    row_puts(r, " gesendet  \xC2\xB7  ");
+    put_count(r, st->ctx.total_completion);
+    row_puts(r, " empfangen");
+
+    if (st->session.active) {
+        row_puts(r, "  \xC2\xB7  session ");
+        if (st->session.name != NULL) {
+            row_sgr(r, THEME_ROLE_RESET);
+            row_sgr(r, theme_role(THEME_ROLE_ASSISTANT));
+            row_puts(r, st->session.name);
+            row_sgr(r, THEME_ROLE_RESET);
+            row_sgr(r, theme_role(THEME_ROLE_DIM));
+            row_puts(r, "  \xC2\xB7  ");
+        }
+        row_puts(r, st->session.id);
+    }
+    row_sgr(r, THEME_ROLE_RESET);
 }
 
 static void row_quit(Row *r)
@@ -833,6 +1187,8 @@ static const char *dlg_title(UIMode mode)
         return "settings";
     case MODE_THEME:
         return "theme";
+    case MODE_SESSIONS:
+        return "resume";
     default:
         return "";
     }
@@ -850,7 +1206,8 @@ void draw_slot(Frame *f, const Layout *lt, const Slot *s, const AppState *st,
         row_border(&r);
         break;
     case SLOT_INPUT:
-        row_input(&r, &st->input, s->index);
+        row_input(&r, &st->input, lt->input_w,
+                  lt->input_first + (size_t)s->index);
         break;
     case SLOT_CMD_EMPTY:
         row_no_match(&r, lt->prefix);
@@ -924,19 +1281,34 @@ void draw_slot(Frame *f, const Layout *lt, const Slot *s, const AppState *st,
                        active, lt->id_col);
         break;
     }
+    case SLOT_SESSION: {
+        const SessionInfo *si = &st->sessions.items[s->index];
+        bool active = false;
+        if (st->session.active && strcmp(st->session.id, si->id) == 0) {
+            active = true;
+        }
+        row_session(&r, si, lt->search, s->index == lt->selected, active,
+                    lt->id_col, lt->name_col);
+        break;
+    }
     case SLOT_PROMPT_HINT:
         row_prompt_hint(&r);
         break;
     case SLOT_QUIT:
         row_quit(&r);
         break;
+    case SLOT_STATUS_MODEL:
+        row_status_model(&r, cfg);
+        break;
+    case SLOT_STATUS_TOKENS:
+        row_status_tokens(&r, st);
+        break;
     }
 
     row_pad(&r); /* jede zeile endet sauber am rand */
 }
 
-void draw(int rows, int cols, AppState *state, const DebugState *dbg,
-          const Config *cfg)
+void draw(int rows, int cols, AppState *state, const Config *cfg)
 {
     Frame f;
     frame_begin(&f, rows, cols);
@@ -944,20 +1316,9 @@ void draw(int rows, int cols, AppState *state, const DebugState *dbg,
     Layout lt;
     layout_compute(&lt, rows, cols, ui_mode(state), state, cfg);
 
-#ifndef NDEBUG
-    int dw = dbg_width(cols);
-#else
-    (void)dbg; /* release: sidebar ist kompiliert weg */
-#endif
-
     for (int r = 1; r <= rows; r++) {
         Slot s = layout_slot(&lt, r);
         draw_slot(&f, &lt, &s, state, cfg);
-#ifndef NDEBUG
-        if (dw > 0) {
-            f.pos += draw_sidebar(dbg, f.buf, f.pos, r, rows, dw);
-        }
-#endif
         frame_row_end(&f);
     }
 

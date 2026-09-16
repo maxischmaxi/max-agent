@@ -18,6 +18,8 @@ typedef enum {
     MODE_SETTINGS, /* settings-liste am unteren rand */
     MODE_THEME,    /* theme-untermenue des settings-dialogs */
     MODE_PROMPT,   /* system-prompt-untermenue des settings-dialogs */
+    MODE_SESSIONS, /* resume-dialog: session-liste ueber den ganzen */
+                   /* bildschirm */
 } UIMode;
 
 const char *get_home(void);

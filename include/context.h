@@ -45,6 +45,11 @@ typedef struct {
     int prompt_tokens; /* was die api dafuer gezaehlt hat (0 = nie) */
     int scale;         /* promille: echt/geschaetzt, 0 = noch ungeeicht */
     size_t dropped;    /* nachrichten, die zuletzt weggelassen wurden */
+
+    /* verbrauch der ganzen sitzung, fuer die statuszeile. gezaehlt
+     * wird, was die api meldet – nicht unsere schaetzung. */
+    size_t total_prompt;
+    size_t total_completion;
 } CtxUsage;
 
 /* tokens eines strings schaetzen (NULL = 0) */
@@ -90,5 +95,11 @@ size_t ctx_trim_start(const Chat *chat, size_t budget);
  * oder estimated == 0 lassen den faktor unveraendert (die api hat
  * keine zahl geliefert). */
 void ctx_calibrate(CtxUsage *usage, size_t estimated, int prompt_tokens);
+
+/* den verbrauch der sitzung fortschreiben. bewusst getrennt von
+ * ctx_calibrate: das eine eicht die schaetzung, das andere ist
+ * buchhaltung fuer die anzeige. negative werte (api hat nichts
+ * geliefert) werden ignoriert. */
+void ctx_account(CtxUsage *usage, int prompt_tokens, int completion_tokens);
 
 #endif

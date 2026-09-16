@@ -12,9 +12,9 @@ static void test_cursor_utility(void)
     CHECK(input_len(&in) == 0);
 
     /* tippen bewegt den cursor mit (anhaengen am ende) */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
-    input_char(&in, 'c', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
+    input_char(&in, 'c');
     CHECK(input_len(&in) == 3);
     CHECK(in.cursor == 3);
 
@@ -51,12 +51,12 @@ static void test_insert_at_cursor(void)
     input_init(&in);
 
     /* "abc", cursor auf 1 -> 'X' wird MITTEN eingefuegt */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
-    input_char(&in, 'c', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
+    input_char(&in, 'c');
     input_cursor_home(&in);
     CHECK(input_cursor_right(&in));
-    input_char(&in, 'X', 80);
+    input_char(&in, 'X');
     CHECK(strcmp(in.lines[in.count - 1], "aXbc") == 0);
     CHECK(in.cursor == 2);
 
@@ -85,8 +85,8 @@ static void test_newline_and_line_removal(void)
     Input in;
     input_init(&in);
 
-    input_char(&in, 'x', 80);
-    input_char(&in, 'y', 80);
+    input_char(&in, 'x');
+    input_char(&in, 'y');
 
     /* neue zeile: cursor an deren anfang */
     input_newline(&in, 24, 0, false);
@@ -118,11 +118,11 @@ static void test_multiline_movement(void)
     input_init(&in);
 
     /* zwei zeilen: "ab" / "cd" */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
     input_newline(&in, 24, 0, false);
-    input_char(&in, 'c', 80);
-    input_char(&in, 'd', 80);
+    input_char(&in, 'c');
+    input_char(&in, 'd');
     CHECK(in.count == 2);
 
     /* links ueber die zeilengrenze: zeile 1 anfang -> zeile 0 ende */
@@ -153,10 +153,10 @@ static void test_newline_splits_at_cursor(void)
     input_init(&in);
 
     /* "abcd", cursor auf 2 -> split in "ab" / "cd" */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
-    input_char(&in, 'c', 80);
-    input_char(&in, 'd', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
+    input_char(&in, 'c');
+    input_char(&in, 'd');
     input_cursor_set(&in, 2);
     input_newline(&in, 24, 0, false);
     CHECK(in.count == 2);
@@ -174,11 +174,11 @@ static void test_join_and_forward_delete(void)
     input_init(&in);
 
     /* "ab" / "cd", cursor am anfang von zeile 1 */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
     input_newline(&in, 24, 0, false);
-    input_char(&in, 'c', 80);
-    input_char(&in, 'd', 80);
+    input_char(&in, 'c');
+    input_char(&in, 'd');
     input_cursor_home(&in);
 
     /* backspace am zeilenanfang: umbruch loeschen -> "abcd" */
@@ -189,11 +189,11 @@ static void test_join_and_forward_delete(void)
 
     /* forward-delete am zeilenende loescht den umbruch dahinter */
     input_reset(&in);
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
     input_newline(&in, 24, 0, false);
-    input_char(&in, 'c', 80);
-    input_char(&in, 'd', 80);
+    input_char(&in, 'c');
+    input_char(&in, 'd');
     input_cursor_line_set(&in, 0);
     CHECK(in.cursor == 2); /* klemmt am ende von zeile 0 */
     CHECK(input_delete_forward(&in));
@@ -218,10 +218,10 @@ static void test_kill_variants(void)
     input_init(&in);
 
     /* ctrl+u: von anfang bis cursor */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
-    input_char(&in, 'c', 80);
-    input_char(&in, 'd', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
+    input_char(&in, 'c');
+    input_char(&in, 'd');
     input_cursor_set(&in, 2);
     CHECK(input_kill_line(&in));
     CHECK(strcmp(in.lines[0], "cd") == 0);
@@ -232,13 +232,13 @@ static void test_kill_variants(void)
      * dem cursor stirbt, das whitespace DAVOR bleibt stehen – erst
      * der naechste druck killt es mit dem naechsten wort */
     input_reset(&in);
-    input_char(&in, 'f', 80);
-    input_char(&in, 'o', 80);
-    input_char(&in, 'o', 80);
-    input_char(&in, ' ', 80);
-    input_char(&in, 'b', 80);
-    input_char(&in, 'a', 80);
-    input_char(&in, 'r', 80);
+    input_char(&in, 'f');
+    input_char(&in, 'o');
+    input_char(&in, 'o');
+    input_char(&in, ' ');
+    input_char(&in, 'b');
+    input_char(&in, 'a');
+    input_char(&in, 'r');
     CHECK(input_kill_last_word(&in));
     CHECK(strcmp(in.lines[0], "foo ") == 0);
     CHECK(in.cursor == 4);
@@ -249,8 +249,8 @@ static void test_kill_variants(void)
 
     /* ctrl+k: bis zeilenende */
     input_reset(&in);
-    input_char(&in, 'x', 80);
-    input_char(&in, 'y', 80);
+    input_char(&in, 'x');
+    input_char(&in, 'y');
     input_cursor_home(&in);
     input_cursor_right(&in);
     CHECK(input_kill_to_end(&in));
@@ -267,11 +267,11 @@ static void test_kill_across_lines(void)
     input_init(&in);
 
     /* "ab" / "cd"; ctrl+w am anfang von zeile 1 loescht den umbruch */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
     input_newline(&in, 24, 0, false);
-    input_char(&in, 'c', 80);
-    input_char(&in, 'd', 80);
+    input_char(&in, 'c');
+    input_char(&in, 'd');
     input_cursor_home(&in);
     CHECK(input_kill_last_word(&in));
     CHECK(in.count == 1);
@@ -281,8 +281,8 @@ static void test_kill_across_lines(void)
     /* ctrl+k am ende von zeile 0 loescht den umbruch dahinter */
     input_cursor_end(&in); /* ans ende von "abcd" */
     input_newline(&in, 24, 0, false);
-    input_char(&in, 'e', 80);
-    input_char(&in, 'f', 80);
+    input_char(&in, 'e');
+    input_char(&in, 'f');
     CHECK(strcmp(in.lines[1], "ef") == 0);
     input_cursor_line_set(&in, 0);
     input_cursor_end(&in);
@@ -301,7 +301,7 @@ static void test_word_navigation(void)
     /* "foo bar-42 x" – alnum-woerter: foo, bar, 42, x */
     const char *text = "foo bar-42 x";
     for (const char *p = text; *p != '\0'; p++) {
-        input_char(&in, *p, 80);
+        input_char(&in, *p);
     }
 
     /* alt+b: wortweise zurueck. "x" startet bei index 11 */
@@ -335,11 +335,11 @@ static void test_word_movement_across_lines(void)
     input_init(&in);
 
     /* "ab" / "cd" – alt+b von zeile 1 anfang */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
     input_newline(&in, 24, 0, false);
-    input_char(&in, 'c', 80);
-    input_char(&in, 'd', 80);
+    input_char(&in, 'c');
+    input_char(&in, 'd');
     input_cursor_home(&in);
 
     CHECK(input_word_left(&in));
@@ -364,16 +364,16 @@ static void test_word_kills(void)
     input_init(&in);
 
     /* alt+d (kill-word, vorwaerts): "foo bar-42" -> "foo -42" */
-    input_char(&in, 'f', 80);
-    input_char(&in, 'o', 80);
-    input_char(&in, 'o', 80);
-    input_char(&in, ' ', 80);
-    input_char(&in, 'b', 80);
-    input_char(&in, 'a', 80);
-    input_char(&in, 'r', 80);
-    input_char(&in, '-', 80);
-    input_char(&in, '4', 80);
-    input_char(&in, '2', 80);
+    input_char(&in, 'f');
+    input_char(&in, 'o');
+    input_char(&in, 'o');
+    input_char(&in, ' ');
+    input_char(&in, 'b');
+    input_char(&in, 'a');
+    input_char(&in, 'r');
+    input_char(&in, '-');
+    input_char(&in, '4');
+    input_char(&in, '2');
     input_cursor_set(&in, 4);
     CHECK(input_kill_word(&in));
     CHECK(strcmp(in.lines[0], "foo -42") == 0);
@@ -397,10 +397,10 @@ static void test_transpose(void)
     input_init(&in);
 
     /* ctrl+t mitten drin: "abcd", cursor auf 1 -> "bacd" */
-    input_char(&in, 'a', 80);
-    input_char(&in, 'b', 80);
-    input_char(&in, 'c', 80);
-    input_char(&in, 'd', 80);
+    input_char(&in, 'a');
+    input_char(&in, 'b');
+    input_char(&in, 'c');
+    input_char(&in, 'd');
     input_cursor_set(&in, 1);
     CHECK(input_transpose_chars(&in));
     CHECK(strcmp(in.lines[0], "bacd") == 0);
@@ -418,13 +418,13 @@ static void test_transpose(void)
     /* alt+t: woerter tauschen: "one two", cursor nach "one" ->
      * "two one", cursor hinter dem (neu hinten liegenden) wort */
     input_reset(&in);
-    input_char(&in, 'o', 80);
-    input_char(&in, 'n', 80);
-    input_char(&in, 'e', 80);
-    input_char(&in, ' ', 80);
-    input_char(&in, 't', 80);
-    input_char(&in, 'w', 80);
-    input_char(&in, 'o', 80);
+    input_char(&in, 'o');
+    input_char(&in, 'n');
+    input_char(&in, 'e');
+    input_char(&in, ' ');
+    input_char(&in, 't');
+    input_char(&in, 'w');
+    input_char(&in, 'o');
     CHECK(input_transpose_words(&in));
     CHECK(strcmp(in.lines[0], "two one") == 0);
     CHECK(in.cursor == 7);
@@ -439,7 +439,7 @@ static void test_word_case(void)
 
     const char *text = "hello world";
     for (const char *p = text; *p != '\0'; p++) {
-        input_char(&in, *p, 80);
+        input_char(&in, *p);
     }
 
     /* alt+u: ganzes wort GROSS, cursor am wortende */
@@ -529,6 +529,204 @@ static void test_set_text(void)
     input_free(&in);
 }
 
+/* soft-wrap: lange logische zeilen werden beim ZEICHNEN auf
+ * mehrere bildschirmzeilen verteilt. der text bleibt dabei
+ * unveraendert – das ist der ganze punkt der trennung. */
+/* der ausloeser fuer den soft-wrap: frueher hat input_char am
+ * zeilenende einfach aufgehoert, zeichen zu uebernehmen. jetzt
+ * laeuft der text weiter und bricht beim zeichnen um. */
+static void test_typing_past_edge(void)
+{
+    Input in;
+    input_init(&in);
+
+    for (int i = 0; i < 200; i++) {
+        input_char(&in, (char)('a' + (i % 26)));
+    }
+    CHECK(strlen(in.lines[0]) == 200); /* nichts verschluckt */
+    CHECK(in.count == 1);              /* logisch weiter EINE zeile */
+    CHECK(in.cursor == 200);
+
+    /* sichtbar sind es mehrere zeilen, je nach fensterbreite */
+    CHECK(input_screen_rows(&in, 20) == 10);
+    CHECK(input_screen_rows(&in, 50) == 4);
+    CHECK(input_screen_rows(&in, 200) == 1);
+
+    /* die obergrenze je logischer zeile greift trotzdem */
+    input_reset(&in);
+    for (size_t i = 0; i < INPUT_MAX_LINE_BYTES + 100; i++) {
+        input_char(&in, 'z');
+    }
+    CHECK(strlen(in.lines[0]) == INPUT_MAX_LINE_BYTES);
+
+    /* shift+enter bleibt davon unberuehrt: es trennt weiterhin
+     * logische zeilen, egal wie breit das fenster ist */
+    input_reset(&in);
+    for (int i = 0; i < 100; i++) {
+        input_char(&in, 'a');
+    }
+    input_newline(&in, 24, 0, false);
+    for (int i = 0; i < 100; i++) {
+        input_char(&in, 'b');
+    }
+    CHECK(in.count == 2);
+    CHECK(strlen(in.lines[0]) == 100);
+    CHECK(strlen(in.lines[1]) == 100);
+    /* beide zeilen brechen fuer sich um */
+    CHECK(input_screen_rows(&in, 25) == 8);
+
+    input_free(&in);
+}
+
+static void test_screen_wrap(void)
+{
+    Input in;
+    input_init(&in);
+
+    /* --- leeres feld: genau eine (leere) bildschirmzeile --- */
+    CHECK(input_screen_rows(&in, 10) == 1);
+    size_t line = 99;
+    size_t off = 99;
+    size_t len = 99;
+    CHECK(input_screen_row(&in, 10, 0, &line, &off, &len));
+    CHECK(line == 0 && off == 0 && len == 0);
+    CHECK(!input_screen_row(&in, 10, 1, NULL, NULL, NULL));
+
+    /* --- kurzer text passt in eine zeile --- */
+    input_set_text(&in, "hallo");
+    CHECK(input_screen_rows(&in, 10) == 1);
+    CHECK(input_screen_rows(&in, 5) == 1); /* exakt voll */
+    CHECK(input_screen_rows(&in, 4) == 2); /* eins zu breit */
+
+    /* --- umbruch an der kante, abschnitte luecken- und
+     *     ueberlappungsfrei --- */
+    input_set_text(&in, "abcdefghij"); /* 10 zeichen */
+    CHECK(input_screen_rows(&in, 4) == 3);
+    CHECK(input_screen_row(&in, 4, 0, &line, &off, &len));
+    CHECK(line == 0 && off == 0 && len == 4);
+    CHECK(input_screen_row(&in, 4, 1, &line, &off, &len));
+    CHECK(line == 0 && off == 4 && len == 4);
+    CHECK(input_screen_row(&in, 4, 2, &line, &off, &len));
+    CHECK(line == 0 && off == 8 && len == 2);
+    CHECK(!input_screen_row(&in, 4, 3, NULL, NULL, NULL));
+
+    /* --- der text selbst bleibt unangetastet --- */
+    CHECK(in.count == 1);
+    CHECK(strcmp(in.lines[0], "abcdefghij") == 0);
+
+    /* --- resize: andere breite, andere zeilenzahl, gleicher text --- */
+    CHECK(input_screen_rows(&in, 10) == 1);
+    CHECK(input_screen_rows(&in, 3) == 4);
+    CHECK(input_screen_rows(&in, 1) == 10);
+    CHECK(input_screen_rows(&in, 0) == 10); /* breite 0 -> wie 1 */
+    CHECK(strcmp(in.lines[0], "abcdefghij") == 0);
+
+    /* --- mehrere logische zeilen: jede bricht fuer sich um --- */
+    input_set_text(&in, "abcdef\nxy\n");
+    CHECK(in.count == 3);
+    CHECK(input_screen_rows(&in, 4) == 4); /* 2 + 1 + 1 (leere) */
+    CHECK(input_screen_row(&in, 4, 0, &line, &off, &len));
+    CHECK(line == 0 && off == 0 && len == 4);
+    CHECK(input_screen_row(&in, 4, 1, &line, &off, &len));
+    CHECK(line == 0 && off == 4 && len == 2);
+    CHECK(input_screen_row(&in, 4, 2, &line, &off, &len));
+    CHECK(line == 1 && off == 0 && len == 2);
+    CHECK(input_screen_row(&in, 4, 3, &line, &off, &len));
+    CHECK(line == 2 && off == 0 && len == 0); /* die leere zeile */
+
+    /* --- utf-8 wird nie zerschnitten --- */
+    input_set_text(&in, "\xC3\xA4\xC3\xB6\xC3\xBC\xC3\x9F"); /* aeoeuess */
+    CHECK(strlen(in.lines[0]) == 8);       /* 4 zeichen, 8 bytes */
+    CHECK(input_screen_rows(&in, 2) == 2); /* 2 zeichen je zeile */
+    CHECK(input_screen_row(&in, 2, 0, &line, &off, &len));
+    CHECK(off == 0 && len == 4); /* zwei zeichen = vier bytes */
+    CHECK(input_screen_row(&in, 2, 1, &line, &off, &len));
+    CHECK(off == 4 && len == 4);
+
+    input_free(&in);
+}
+
+static void test_screen_cursor(void)
+{
+    Input in;
+    input_init(&in);
+
+    size_t row = 99;
+    size_t col = 99;
+
+    /* leeres feld: oben links */
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 0 && col == 0);
+
+    /* cursor am ende einer umgebrochenen zeile */
+    input_set_text(&in, "abcdefghij"); /* cursor steht am ende */
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 2 && col == 2);
+
+    /* genau an der kante: der cursor bleibt am ENDE der zeile
+     * stehen (spalte w) und rutscht erst mit dem naechsten zeichen
+     * weiter. dafuer ist im feld eine spalte mehr reserviert als
+     * umgebrochen wird – so klebt der block sichtbar am text. */
+    input_cursor_set(&in, 4);
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 0 && col == 4);
+    input_cursor_set(&in, 5); /* ein zeichen weiter: neue zeile */
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 1 && col == 1);
+    input_cursor_set(&in, 3);
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 0 && col == 3);
+
+    /* zweite logische zeile zaehlt die erste mit */
+    input_set_text(&in, "abcdefgh\nxy");
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 2 && col == 2); /* 2 zeilen umbruch + cursor hinter xy */
+
+    /* --- hoch/runter ueber BILDSCHIRMzeilen --- */
+    input_set_text(&in, "abcdefghij"); /* eine logische, drei sichtbare */
+    input_cursor_set(&in, 9);
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 2 && col == 1);
+
+    CHECK(input_screen_up(&in, 4));
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 1 && col == 1);
+    CHECK(in.cursor_line == 0); /* immer noch dieselbe logische zeile */
+    CHECK(in.cursor == 5);
+
+    CHECK(input_screen_up(&in, 4));
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 0 && col == 1);
+
+    CHECK(!input_screen_up(&in, 4)); /* oben angekommen */
+
+    CHECK(input_screen_down(&in, 4));
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 1 && col == 1);
+    CHECK(input_screen_down(&in, 4));
+    CHECK(!input_screen_down(&in, 4)); /* unten angekommen */
+
+    /* kuerzere zielzeile: die spalte wird geklemmt */
+    input_set_text(&in, "abcd\nx");
+    input_cursor_set(&in, 1); /* in zeile 2, spalte 1 */
+    CHECK(input_screen_up(&in, 4));
+    input_cursor_screen(&in, 4, &row, &col);
+    CHECK(row == 0 && col == 1);
+    input_cursor_set(&in, 4); /* ende der ersten zeile */
+    in.cursor_line = 0;
+    CHECK(input_screen_down(&in, 4));
+    CHECK(in.cursor_line == 1);
+    CHECK(in.cursor <= strlen(in.lines[1])); /* geklemmt */
+
+    /* NULL ist ueberall zulaessig */
+    input_cursor_screen(NULL, 4, &row, &col);
+    CHECK(row == 0 && col == 0);
+    CHECK(input_screen_rows(NULL, 4) == 0);
+    CHECK(!input_screen_row(NULL, 4, 0, NULL, NULL, NULL));
+
+    input_free(&in);
+}
+
 int main(void)
 {
     test_cursor_utility();
@@ -545,5 +743,8 @@ int main(void)
     test_transpose();
     test_word_case();
     test_set_text();
+    test_typing_past_edge();
+    test_screen_wrap();
+    test_screen_cursor();
     return test_report();
 }

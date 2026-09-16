@@ -282,6 +282,9 @@ UIMode ui_mode(const AppState *st)
     if (st->models_dialog) {
         return MODE_MODELS;
     }
+    if (st->sessions_dialog) {
+        return MODE_SESSIONS;
+    }
     if (st->settings_dialog) {
         if (st->theme_sub) {
             return MODE_THEME;
@@ -383,8 +386,7 @@ int models_match(const Config *cfg, const char *search, int *out, int out_max)
 
 int main_width(int cols)
 {
-    int dw = dbg_width(cols);
-    return (dw > 0) ? (cols - dw - 1) : cols;
+    return cols; /* seit dem wegfall der debug-sidebar die volle breite */
 }
 
 int names_col(const char *const *names, int total)
