@@ -24,7 +24,9 @@ typedef enum {
     KEY_ESCAPE,
     KEY_UP,
     KEY_DOWN,
-    KEY_TAB, /* tab: chat-modus = befehls-vervollstaendigung */
+    KEY_PGUP, /* chat-verlauf zurueckblaettern (CSI 5~) */
+    KEY_PGDN, /* chat-verlauf vorblaettern, bis unten (CSI 6~) */
+    KEY_TAB,  /* tab: chat-modus = befehls-vervollstaendigung */
 
     /* POSIX/readline-shortcuts (nur im normalen chat-input aktiv,
      * dialoge ignorieren sie). die semantik entspricht bash/readline:

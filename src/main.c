@@ -96,6 +96,7 @@ int main(void)
     config_persist(&cfg, &dbg);
 
     input_free(&state.input);
+    chat_free(&state.chat);
     free_config(&cfg);
     return 0;
 }

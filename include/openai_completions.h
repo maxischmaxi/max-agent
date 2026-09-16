@@ -155,6 +155,33 @@
 /*   };                                                                */
 /*   // danach wie oben; model z.B. "llama3.1"                        */
 /*                                                                     */
+/* beispiel 6: vision (bild + text), tool_choice und token-zaehlung    */
+/*                                                                     */
+/*   OaiContentPart parts[] = {                                        */
+/*       {.type = OAI_CONTENT_TEXT, .text = "was ist auf dem bild?"},   */
+/*       {.type = OAI_CONTENT_IMAGE_URL,                               */
+/*        .image_url = "data:image/png;base64,iVBOR..."},              */
+/*   };                                                                */
+/*   OaiMessage messages[] = {{.role = OAI_ROLE_USER,                  */
+/*                              .content_parts = parts,                */
+/*                              .content_parts_len = 2}};              */
+/*   OaiChatCompletionParams params = {                                */
+/*       .model = "gpt-4o-mini", .messages = messages,                */
+/*       .messages_len = 1,                                           */
+/*       .has_response_format = true,                                 */
+/*       .response_format_type = "json_object",                       */
+/*       .has_seed = true, .seed = 42,                                 */
+/*   };                                                                */
+/*                                                                     */
+/*   // tool_choice erzwingt eine bestimmte funktion statt "auto":     */
+/*   // .has_tool_choice = true, .tool_choice = OAI_TOOL_CHOICE_FUNCTION, */
+/*   // .tool_choice_function = "get_weather",                         */
+/*                                                                     */
+/*   // streaming mit token-zaehlung: .include_usage = true setzen,    */
+/*   // dann ist beim letzten chunk chunk->has_usage gesetzt. streams   */
+/*   // brechen nach 5 min datenstille ab (client-option               */
+/*   // stream_idle_timeout_ms, 0 = default, <0 = aus).               */
+/*                                                                     */
 /* ------------------------------------------------------------------ */
 #ifndef MAX_AGENT_OPENAI_COMPLETIONS
 #define MAX_AGENT_OPENAI_COMPLETIONS
@@ -173,7 +200,13 @@ typedef struct {
                           /* nicht-streaming, streams haben nur einen   */
                           /* connect-timeout (10s)                      */
     int max_retries;      /* <0 => 2 (npm-default; nur bei verbindungs- */
-                          /* fehlern, 408, 429 und 5xx)                 */
+                          /* fehlern, 408, 409, 429 und 5xx)             */
+    long stream_idle_timeout_ms; /* 0 => 300000 (5 min): bricht einen   */
+                                 /* stream ab, wenn so lange kein byte   */
+                                 /* mehr empfangen wurde; <0 => aus      */
+    long max_body_bytes; /* 0 => 32 MiB deckel fuer den antwort-       */
+                         /* koerper (schuetzt vor OOM durch           */
+                         /* fehlleitende server); <0 => unbegrenzt    */
 } OaiClientOptions;
 
 typedef struct {
@@ -181,13 +214,19 @@ typedef struct {
     char *base_url; /* ohne trailing slash */
     long timeout_ms;
     int max_retries;
-    void *curl_handle; /* intern: wiederverwendeter easy-handle
-                        * (keep-alive/tls-reuse). nicht thread-safe! */
+    long stream_idle_timeout_ms; /* <0 => aus */
+    long max_body_bytes;         /* <0 => unbegrenzt */
+    void *curl_handle;           /* intern: wiederverwendeter easy-handle
+                                  * (keep-alive/tls-reuse). nicht thread-safe! */
 } OaiClient;
 
 /* rueckgabe 0 bei erfolg, -1 bei ungueligen argumenten/allocation    */
-/* (nicht thread-safe: ein client gehoert in einen thread. mehrere    */
-/* clients sind ok, auch gleichzeitig in verschiedenen threads.)      */
+/* thread-sicherheit: requests mit verschiedenen clients in verschiedenen */
+/* threads sind ok. aber oai_client_init/oai_client_free duerfen nicht     */
+/* parallel aus mehreren threads laufen (curl_global_init ist laut       */
+/* curl-doku nicht thread-safe) – clients vor thread-start anlegen bzw.   */
+/* extern serialisieren. ein einzelner client gehoert in genau einen      */
+/* thread.                                                                */
 int oai_client_init(OaiClient *client, const OaiClientOptions *options);
 void oai_client_free(OaiClient *client);
 
@@ -211,10 +250,28 @@ typedef struct {
     char *arguments; /* json-argumente als string (vom modell erzeugt) */
 } OaiToolCall;
 
+/* content-part fuer multimodale nachrichten (vision): content kann     */
+/* statt eines strings auch ein array aus text- und bild-parts sein      */
+typedef enum {
+    OAI_CONTENT_TEXT = 0,  /* {"type":"text","text":...}           */
+    OAI_CONTENT_IMAGE_URL, /* {"type":"image_url","image_url":...} */
+} OaiContentPartType;
+
+typedef struct {
+    OaiContentPartType type;
+    const char *text;      /* nur OAI_CONTENT_TEXT: der text            */
+    const char *image_url; /* nur OAI_CONTENT_IMAGE_URL: https-url oder */
+                           /* data:-uri mit base64-bild                 */
+    const char *detail;    /* NULL | "auto" | "low" | "high"           */
+} OaiContentPart;
+
 typedef struct {
     OaiRole role;
     const char *content; /* NULL bei assistant-nachrichten mit tool_calls */
-    const char *name;    /* optional */
+    /* statt content: multimodales array (vision). nicht beides setzen!  */
+    const OaiContentPart *content_parts;
+    size_t content_parts_len;
+    const char *name;         /* optional */
     const char *tool_call_id; /* pflicht bei role == OAI_ROLE_TOOL */
     /* tool-loop: die tool_calls des assistant-antwort (aus            */
     /* OaiResponseMessage) beim naechsten request mit zurueckgeben.    */
@@ -231,6 +288,17 @@ typedef struct {
 typedef struct {
     OaiToolFunction function; /* type ist immer "function" */
 } OaiTool;
+
+/* tool_choice (npm: ChatCompletionToolChoiceOption): "auto" laesst dem */
+/* modell die wahl, "none" verbietet tool-calls, "required" erzwingt    */
+/* einen, FUNCTION erzwingt eine bestimmte funktion (name in            */
+/* tool_choice_function)                                             */
+typedef enum {
+    OAI_TOOL_CHOICE_AUTO = 0,
+    OAI_TOOL_CHOICE_NONE,
+    OAI_TOOL_CHOICE_REQUIRED,
+    OAI_TOOL_CHOICE_FUNCTION,
+} OaiToolChoice;
 
 typedef struct {
     const char *model;
@@ -256,6 +324,22 @@ typedef struct {
     double frequency_penalty;
     const OaiTool *tools;
     size_t tools_len;
+
+    /* weitere npm-optionen: */
+    bool has_tool_choice;
+    OaiToolChoice tool_choice;
+    const char *tool_choice_function; /* nur bei OAI_TOOL_CHOICE_FUNCTION */
+    bool has_parallel_tool_calls;     /* npm: parallel_tool_calls */
+    bool parallel_tool_calls;
+    bool has_seed; /* npm: seed (reproduzierbares sampling) */
+    long long seed;
+    bool has_response_format;         /* npm: response_format */
+    const char *response_format_type; /* "text" | "json_object" |       */
+                                      /* "json_schema"                   */
+    const char *response_format_json_schema; /* json-schema-string, nur */
+                                             /* bei type == json_schema */
+    bool include_usage; /* nur streaming: stream_options.include_usage  */
+                        /* -> letzter chunk enthaelt die token-zaehlung */
 } OaiChatCompletionParams;
 
 /* ------------------------------------------------------------------ */
@@ -313,6 +397,9 @@ typedef struct {
     char *model;
     OaiChunkChoice *choices;
     size_t choices_len;
+    bool has_usage; /* gesetzt, wenn stream mit include_usage: der  */
+                    /* letzte chunk traegt die token-zaehlung      */
+    OaiUsage usage;
 } OaiChatCompletionChunk;
 
 /* ------------------------------------------------------------------ */

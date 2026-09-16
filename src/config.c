@@ -186,6 +186,7 @@ static void load_settings(cJSON *root, Config *config)
     }
     (void)dup_json_str(s, "theme", &config->theme);
     (void)dup_json_str(s, "activeModel", &config->active_model);
+    (void)dup_json_str(s, "systemPrompt", &config->system_prompt);
 
     cJSON *cq = cJSON_GetObjectItem(s, "confirmQuit");
     if (cJSON_IsBool(cq)) {
@@ -208,6 +209,11 @@ int load_config_from(const char *path, Config *config)
         cJSON_Delete(root);
         return -1;
     }
+
+    /* "$schema" an der wurzel: verweis auf die json-schema-
+     * definition, damit der editor die config linten kann. wird
+     * beim speichern erhalten (s. save_config_to) */
+    (void)dup_json_str(root, "$schema", &config->schema_url);
 
     cJSON *providers = cJSON_GetObjectItem(root, "providers");
     if (!cJSON_IsArray(providers)) {
@@ -361,6 +367,21 @@ fail:
     return NULL;
 }
 
+/* "$schema" an der wurzel schreiben (falls gesetzt), damit das
+ * editor-linting die saves der app ueberlebt */
+static int schema_to_root(cJSON *root, const Config *config)
+{
+    if (config->schema_url == NULL) {
+        return 0;
+    }
+    cJSON *s = cJSON_CreateString(config->schema_url);
+    if (s == NULL) {
+        return -1;
+    }
+    cJSON_AddItemToObject(root, "$schema", s);
+    return 0;
+}
+
 static cJSON *settings_to_json(const Config *config)
 {
     cJSON *obj = cJSON_CreateObject();
@@ -389,6 +410,14 @@ static cJSON *settings_to_json(const Config *config)
         cJSON_AddItemToObject(obj, "activeModel", model);
     }
 
+    if (config->system_prompt != NULL) {
+        cJSON *sp = cJSON_CreateString(config->system_prompt);
+        if (!sp) {
+            goto fail;
+        }
+        cJSON_AddItemToObject(obj, "systemPrompt", sp);
+    }
+
     return obj;
 
 fail:
@@ -400,6 +429,11 @@ int save_config_to(const char *path, const Config *config)
 {
     cJSON *root = cJSON_CreateObject();
     if (!root) {
+        return -1;
+    }
+
+    if (schema_to_root(root, config) != 0) {
+        cJSON_Delete(root);
         return -1;
     }
 
@@ -470,6 +504,10 @@ void free_config(Config *config)
     config->theme = NULL;
     free(config->active_model);
     config->active_model = NULL;
+    free(config->system_prompt);
+    config->system_prompt = NULL;
+    free(config->schema_url);
+    config->schema_url = NULL;
 
     if (config->providers == NULL) {
         return;

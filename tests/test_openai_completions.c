@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "openai_completions.h"
@@ -90,6 +91,55 @@ static void send_json(int fd, const char *status, const char *json)
     write(fd, json, strlen(json));
 }
 
+static void send_json_headers(int fd, const char *status, const char *extra,
+                              const char *json)
+{
+    char head[512];
+    int head_len = snprintf(head, sizeof head,
+                            "HTTP/1.1 %s\r\n"
+                            "%s"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: %zu\r\n\r\n",
+                            status, extra, strlen(json));
+    if (head_len < 0) {
+        return;
+    }
+    write(fd, head, (size_t)head_len);
+    write(fd, json, strlen(json));
+}
+
+static void sleep_ms(long ms)
+{
+    struct timespec ts = {
+        .tv_sec = ms / 1000,
+        .tv_nsec = (ms % 1000) * 1000000L,
+    };
+    nanosleep(&ts, NULL);
+}
+
+/* index des ersten fehlenden substrings im request, -1 wenn alle da */
+static int first_missing(const char *body, const char *const *need, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (strstr(body, need[i]) == NULL) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void send_missing(int fd, int idx)
+{
+    char msg[128];
+    int ml = snprintf(msg, sizeof msg,
+                      "{\"error\":{\"message\":\"erwartetes request-"
+                      "feld %d fehlt\"}}",
+                      idx);
+    if (ml > 0) {
+        send_json(fd, "400 Bad Request", msg);
+    }
+}
+
 static void handle_conn(int fd)
 {
     static char req[REQ_MAX];
@@ -118,6 +168,152 @@ static void handle_conn(int fd)
                 send_json(fd, "200 OK", default_json());
             }
             continue;
+        }
+        if (strstr(body, "\"model\":\"conflict\"") != NULL) {
+            /* erster request 409 (npm: retryable), danach ok */
+            static int conflict_calls = 0;
+            conflict_calls++;
+            if (conflict_calls == 1) {
+                send_json(fd, "409 Conflict", "{}");
+            } else {
+                send_json(fd, "200 OK", default_json());
+            }
+            continue;
+        }
+        if (strstr(body, "\"model\":\"rate\"") != NULL) {
+            /* erster request 429 mit retry-after: 0, danach ok -> testet */
+            /* das parsen des retry-after-headers */
+            static int rate_calls = 0;
+            rate_calls++;
+            if (rate_calls == 1) {
+                send_json_headers(fd, "429 Too Many Requests",
+                                  "Retry-After: 0\r\n",
+                                  "{\"error\":{\"message\":\"rate limited\"}}");
+            } else {
+                send_json(fd, "200 OK", default_json());
+            }
+            continue;
+        }
+        if (strstr(body, "\"model\":\"slowstream\"") != NULL) {
+            /* sse in einzelnen tcp-paketen (wie echte server): ein event */
+            /* pro write mit pause dazwischen */
+            const char *head = "HTTP/1.1 200 OK\r\n"
+                               "Content-Type: text/event-stream\r\n"
+                               "Connection: close\r\n\r\n";
+            write(fd, head, strlen(head));
+            const char *e1 = "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":"
+                             "[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+                             "\"content\":\"hal\"}}]}\n\n";
+            const char *e2 =
+                "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":"
+                "[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]"
+                "}\r\n"; /* trenner \"\n\" erst mit dem naechsten write */
+            const char *e3 = "\n"
+                             "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":"
+                             "[{\"index\":0,\"delta\":{},\"finish_reason\":"
+                             "\"stop\"}]}\n\n"
+                             "data: [DONE] \n\n"; /* trailing-space-[DONE] */
+            write(fd, e1, strlen(e1));
+            sleep_ms(30);
+            write(fd, e2, strlen(e2));
+            sleep_ms(30);
+            write(fd, e3, strlen(e3));
+            return;
+        }
+        if (strstr(body, "\"model\":\"full\"") != NULL) {
+            /* alle neuen request-felder muessen korrekt serialisiert sein */
+            static const char *const need[] = {
+                "\"content\":[{\"type\":\"text\",\"text\":\"hi\"},{\"type\":"
+                "\"image_url\",\"image_url\":{\"url\":\"data:image/png;"
+                "base64,QUJD\"}}]",
+                "\"tool_choice\":\"auto\"",
+                "\"parallel_tool_calls\":false",
+                "\"seed\":42",
+                "\"response_format\":{\"type\":\"json_object\"}",
+            };
+            int miss = first_missing(body, need, 5);
+            if (miss >= 0) {
+                send_missing(fd, miss);
+                continue;
+            }
+            send_json(fd, "200 OK", default_json());
+            continue;
+        }
+        if (strstr(body, "\"model\":\"fullstream\"") != NULL) {
+            /* tool_choice named + stream_options.include_usage im request */
+            static const char *const need[] = {
+                "\"tool_choice\":{\"type\":\"function\",\"function\":"
+                "{\"name\":\"get_weather\"}}",
+                "\"stream_options\":{\"include_usage\":true}",
+                "\"tools\":[{\"type\":\"function\",\"function\":"
+                "{\"name\":\"get_weather\"",
+            };
+            int miss = first_missing(body, need, 3);
+            if (miss >= 0) {
+                send_missing(fd, miss);
+                continue;
+            }
+            const char *resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Connection: close\r\n\r\n"
+                "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":[{"
+                "\"index\":0,\"delta\":{\"role\":\"assistant\","
+                "\"content\":\"hal\"}}]}\n\n"
+                "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":[{"
+                "\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}"
+                "\n\n"
+                "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":[],"
+                "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,"
+                "\"total_tokens\":12}}\n\n"
+                "data: [DONE]\n\n";
+            write(fd, resp, strlen(resp));
+            return;
+        }
+        if (strstr(body, "\"model\":\"arrcontent\"") != NULL) {
+            /* antwort mit content als array -> text-parts konkatenieren */
+            send_json(fd, "200 OK",
+                      "{\"id\":\"c3\",\"model\":\"arrcontent\",\"choices\":"
+                      "[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                      "\"content\":[{\"type\":\"text\",\"text\":\"teil\"},"
+                      "{\"type\":\"text\",\"text\":\"eins\"}]},"
+                      "\"finish_reason\":\"stop\"}]}}");
+            continue;
+        }
+        if (strstr(body, "\"model\":\"bigbody\"") != NULL) {
+            /* riesige antwort: client mit body-limit muss abbrechen */
+            char head[128];
+            int hl = snprintf(head, sizeof head,
+                              "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: application/json\r\n"
+                              "Content-Length: 65536\r\n\r\n");
+            if (hl > 0) {
+                write(fd, head, (size_t)hl);
+            }
+            static char xs[4096];
+            memset(xs, 'x', sizeof xs);
+            for (int i = 0; i < 16; i++) {
+                if (write(fd, xs, sizeof xs) != (ssize_t)sizeof xs) {
+                    break;
+                }
+            }
+            return;
+        }
+        if (strstr(body, "\"model\":\"stalledstream\"") != NULL) {
+            /* ein event, dann stille -> client muss idle-abbruch machen */
+            const char *resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Connection: close\r\n\r\n"
+                "data: {\"id\":\"c\",\"model\":\"t\",\"choices\":[{"
+                "\"index\":0,\"delta\":{\"content\":\"hal\"}}]}\n\n";
+            write(fd, resp, strlen(resp));
+            char tmp[64];
+            for (;;) {
+                if (read(fd, tmp, sizeof tmp) <= 0) {
+                    return;
+                }
+            }
         }
         if (strstr(body, "\"model\":\"truncstream\"") != NULL) {
             /* stream ohne [DONE], verbindung wird einfach geschlossen */
@@ -215,6 +411,8 @@ typedef struct {
     char text[512];
     int chunks;
     int finish_seen;
+    int usage_seen;
+    int usage_total;
 } StreamAcc;
 
 typedef struct {
@@ -246,6 +444,10 @@ static int on_chunk(const OaiChatCompletionChunk *chunk, void *user_data)
         if (c->finish_reason != NULL) {
             acc->finish_seen = 1;
         }
+    }
+    if (chunk->has_usage) {
+        acc->usage_seen = 1;
+        acc->usage_total = chunk->usage.total_tokens;
     }
     return 0;
 }
@@ -433,6 +635,109 @@ int main(void)
         oai_client_free(&retry_client);
     }
 
+    /* 9b) 409 wird wie im npm-package wiederholt */
+    {
+        OaiClient conflict_client;
+        OaiClientOptions conflict_opts = {
+            .api_key = "test-key",
+            .base_url = base_url,
+            .max_retries = 2,
+        };
+        CHECK(oai_client_init(&conflict_client, &conflict_opts) == 0);
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "conflict",
+            .messages = messages,
+            .messages_len = 1,
+        };
+        OaiCompletionResult result;
+        CHECK(oai_chat_completions_create(&conflict_client, &params, &result) ==
+              0);
+        CHECK(result.ok);
+        oai_completion_result_free(&result);
+        oai_client_free(&conflict_client);
+    }
+
+    /* 9c) 429 mit retry-after: 0 wird wiederholt (header wird geparst) */
+    {
+        OaiClient rate_client;
+        OaiClientOptions rate_opts = {
+            .api_key = "test-key",
+            .base_url = base_url,
+            .max_retries = 2,
+        };
+        CHECK(oai_client_init(&rate_client, &rate_opts) == 0);
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "rate",
+            .messages = messages,
+            .messages_len = 1,
+        };
+        OaiCompletionResult result;
+        CHECK(oai_chat_completions_create(&rate_client, &params, &result) == 0);
+        CHECK(result.ok);
+        oai_completion_result_free(&result);
+        oai_client_free(&rate_client);
+    }
+
+    /* 9d) deterministischer fehler (invalides tool-schema) wird NICHT */
+    /* wiederholt: keine retries, kein backoff, keine server-anfrage */
+    {
+        OaiClient schema_client;
+        OaiClientOptions schema_opts = {
+            .api_key = "test-key",
+            .base_url = base_url,
+            .max_retries = 5,
+        };
+        CHECK(oai_client_init(&schema_client, &schema_opts) == 0);
+        OaiTool tools[] = {
+            {.function = {.name = "f", .parameters_json = "{kein json"}}};
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "test",
+            .messages = messages,
+            .messages_len = 1,
+            .tools = tools,
+            .tools_len = 1,
+        };
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        OaiCompletionResult result;
+        CHECK(oai_chat_completions_create(&schema_client, &params, &result) ==
+              0);
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double elapsed = (double)(t1.tv_sec - t0.tv_sec) +
+                         ((double)(t1.tv_nsec - t0.tv_nsec) / 1e9);
+        CHECK(!result.ok);
+        CHECK(strstr(result.error, "tool-schema") != NULL);
+        /* mit retries+backoff waeren es > 0.5+1+2+4+8s; ohne < 1s */
+        CHECK(elapsed < 1.0);
+        printf("  no-retry: %.3fs (erwartet < 1s, mit retries > 15s)\n",
+               elapsed);
+        oai_completion_result_free(&result);
+        oai_client_free(&schema_client);
+    }
+
+    /* 9e) fragmentierter sse-stream (echte tcp-pakete) + [DONE] mit */
+    /* trailing-space */
+    {
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "slowstream",
+            .messages = messages,
+            .messages_len = 1,
+        };
+        StreamState state = {0};
+        OaiStreamCallbacks cbs = {
+            .on_chunk = on_chunk, .on_error = on_error, .user_data = &state};
+        CHECK(oai_chat_completions_create_stream(&client, &params, &cbs) == 0);
+        CHECK(strcmp(state.acc.text, "hallo") == 0);
+        CHECK(state.acc.chunks == 3);
+        CHECK(state.acc.finish_seen);
+        CHECK(!state.error_seen);
+    }
+
     /* 10) verbindungsaufbau zu geschlossenem port */
     {
         int dead = socket(AF_INET, SOCK_STREAM, 0);
@@ -471,7 +776,158 @@ int main(void)
         oai_client_free(&dead_client);
     }
 
+    /* 11) neue request-felder: content-parts (vision), tool_choice,     */
+    /* parallel_tool_calls, seed, response_format                          */
+    {
+        OaiContentPart parts[] = {
+            {.type = OAI_CONTENT_TEXT, .text = "hi"},
+            {.type = OAI_CONTENT_IMAGE_URL,
+             .image_url = "data:image/png;base64,QUJD"},
+        };
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER,
+                                  .content_parts = parts,
+                                  .content_parts_len = 2}};
+        OaiChatCompletionParams params = {
+            .model = "full",
+            .messages = messages,
+            .messages_len = 1,
+            .has_tool_choice = true,
+            .tool_choice = OAI_TOOL_CHOICE_AUTO,
+            .has_parallel_tool_calls = true,
+            .parallel_tool_calls = false,
+            .has_seed = true,
+            .seed = 42,
+            .has_response_format = true,
+            .response_format_type = "json_object",
+        };
+        OaiCompletionResult result;
+        CHECK(oai_chat_completions_create(&client, &params, &result) == 0);
+        if (!result.ok) {
+            fprintf(stderr, "  full-params-fehler: %s\n", result.error);
+        }
+        CHECK(result.ok);
+        oai_completion_result_free(&result);
+    }
+
+    /* 12) tool_choice named + stream_options.include_usage (usage im    */
+    /* letzten chunk)                                                       */
+    {
+        OaiToolFunction weather_fn = {
+            .name = "get_weather", .parameters_json = "{\"type\":\"object\"}"};
+        OaiTool tools[] = {{.function = weather_fn}};
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "wetter"}};
+        OaiChatCompletionParams params = {
+            .model = "fullstream",
+            .messages = messages,
+            .messages_len = 1,
+            .tools = tools,
+            .tools_len = 1,
+            .has_tool_choice = true,
+            .tool_choice = OAI_TOOL_CHOICE_FUNCTION,
+            .tool_choice_function = "get_weather",
+            .include_usage = true,
+        };
+        StreamState state = {0};
+        OaiStreamCallbacks cbs = {
+            .on_chunk = on_chunk, .on_error = on_error, .user_data = &state};
+        CHECK(oai_chat_completions_create_stream(&client, &params, &cbs) == 0);
+        if (state.error_seen) {
+            fprintf(stderr, "  fullstream-fehler: %s\n", state.error_msg);
+        }
+        CHECK(!state.error_seen);
+        CHECK(strcmp(state.acc.text, "hal") == 0);
+        CHECK(state.acc.usage_seen);
+        CHECK(state.acc.usage_total == 12);
+        CHECK(state.acc.finish_seen);
+    }
+
+    /* 13) antwort mit content als array: text-parts konkatenieren */
+    {
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "arrcontent",
+            .messages = messages,
+            .messages_len = 1,
+        };
+        OaiCompletionResult result;
+        CHECK(oai_chat_completions_create(&client, &params, &result) == 0);
+        CHECK(result.ok);
+        CHECK(strcmp(result.completion.choices[0].message.content,
+                     "teileins") == 0);
+        oai_completion_result_free(&result);
+    }
+
+    /* 14) stream-idle-timeout: stalleder stream wird nach 1s abgebrochen */
+    /* der mock-server ist single-threaded: die keep-alive-verbindung des   */
+    /* haupt-clients wuerde ihn blockieren -> client vorher freigeben      */
     oai_client_free(&client);
+    {
+        OaiClient stall_client;
+        OaiClientOptions stall_opts = {
+            .api_key = "test-key",
+            .base_url = base_url,
+            .max_retries = 0,
+            .stream_idle_timeout_ms = 1000,
+        };
+        CHECK(oai_client_init(&stall_client, &stall_opts) == 0);
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "stalledstream",
+            .messages = messages,
+            .messages_len = 1,
+        };
+        StreamState state = {0};
+        OaiStreamCallbacks cbs = {
+            .on_chunk = on_chunk, .on_error = on_error, .user_data = &state};
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        CHECK(oai_chat_completions_create_stream(&stall_client, &params,
+                                                 &cbs) == 0);
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double elapsed = (double)(t1.tv_sec - t0.tv_sec) +
+                         ((double)(t1.tv_nsec - t0.tv_nsec) / 1e9);
+        CHECK(state.error_seen);
+        CHECK(strstr(state.error_msg, "idle") != NULL);
+        CHECK(strcmp(state.acc.text, "hal") == 0); /* daten kamen an */
+        CHECK(elapsed < 6.0); /* idle-abbruch, kein ewiges haengen */
+        CHECK(elapsed > 0.5);
+        printf("  idle-timeout: %.3fs\n", elapsed);
+        oai_client_free(&stall_client);
+    }
+
+    /* 15) body-limit: riesige antwort wird abgebrochen statt OOM */
+    {
+        OaiClient big_client;
+        OaiClientOptions big_opts = {
+            .api_key = "test-key",
+            .base_url = base_url,
+            .max_retries = 2,
+            .max_body_bytes = 1024,
+        };
+        CHECK(oai_client_init(&big_client, &big_opts) == 0);
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "bigbody",
+            .messages = messages,
+            .messages_len = 1,
+        };
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        OaiCompletionResult result;
+        CHECK(oai_chat_completions_create(&big_client, &params, &result) == 0);
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double elapsed = (double)(t1.tv_sec - t0.tv_sec) +
+                         ((double)(t1.tv_nsec - t0.tv_nsec) / 1e9);
+        CHECK(!result.ok);
+        CHECK(strstr(result.error, "zu gross") != NULL);
+        CHECK(elapsed < 2.0); /* ohne no_retry waeren es > 15s backoff */
+        printf("  body-limit: %.3fs\n", elapsed);
+        oai_completion_result_free(&result);
+        oai_client_free(&big_client);
+    }
+
     /* free auf zero-initialisiertem client ist safe */
     oai_client_free(&client);
 

@@ -1,6 +1,7 @@
 #ifndef MAX_AGENT_DRAW
 #define MAX_AGENT_DRAW
 
+#include "chat.h"
 #include "config.h"
 #include "state.h"
 #include "utils.h"
@@ -13,6 +14,15 @@ typedef struct {
     /* eingabefeld inkl. rahmen: erste/letzte zeile, 1-basiert */
     int input_top;
     int input_bottom;
+
+    /* chat-verlauf (MODE_INPUT): zeilen ueber der eingabe-box.
+     * chat_lines zeigt in eine modul-statische arena von draw.c
+     * und ist nur bis zum naechsten layout_compute gueltig. */
+    ChatLine *chat_lines;
+    size_t chat_lines_len;
+    int chat_h;     /* sichtbare zeilen des verlaufs */
+    int chat_first; /* index der ersten sichtbaren zeile */
+    int busy_row;   /* zeile des thinking-indikators, 0 = keiner */
 
     /* befehlsliste direkt unter dem eingabefeld */
     int cmd_top;
@@ -40,18 +50,24 @@ typedef struct {
 } Layout;
 
 typedef enum {
-    SLOT_BLANK,      /* leere zeile */
-    SLOT_BORDER,     /* trenn-linie aus em-dashes */
-    SLOT_INPUT,      /* zeile des eingabefeldes */
-    SLOT_CMD_EMPTY,  /* hinweis: kein befehl passt */
-    SLOT_CMD,        /* treffer der befehlsliste */
-    SLOT_DLG_BORDER, /* trenn-linie ueber dem dialog */
-    SLOT_DLG_SEARCH, /* such-zeile mit cursor */
-    SLOT_DLG_EMPTY,  /* hinweis: kein eintrag passt */
-    SLOT_MODEL,      /* eintrag der modell-liste */
-    SLOT_SETTING,    /* eintrag der settings-liste */
-    SLOT_THEME,      /* eintrag der theme-auswahl */
-    SLOT_QUIT,       /* quit-bestaetigung */
+    SLOT_BLANK,         /* leere zeile */
+    SLOT_BORDER,        /* trenn-linie aus em-dashes */
+    SLOT_INPUT,         /* zeile des eingabefeldes */
+    SLOT_CMD_EMPTY,     /* hinweis: kein befehl passt */
+    SLOT_CMD,           /* treffer der befehlsliste */
+    SLOT_MSG_USER,      /* chat-verlauf: benutzer-zeile */
+    SLOT_MSG_ASSISTANT, /* chat-verlauf: modell-zeile */
+    SLOT_MSG_ERROR,     /* chat-verlauf: fehler-meldung */
+    SLOT_MSG_TOOL,      /* chat-verlauf: tool-ergebnis */
+    SLOT_MSG_SYSTEM,    /* chat-verlauf: system-meldung */
+    SLOT_BUSY,          /* thinking-indikator waehrend einer anfrage */
+    SLOT_DLG_BORDER,    /* trenn-linie ueber dem dialog */
+    SLOT_DLG_SEARCH,    /* such-zeile mit cursor */
+    SLOT_DLG_EMPTY,     /* hinweis: kein eintrag passt */
+    SLOT_MODEL,         /* eintrag der modell-liste */
+    SLOT_SETTING,       /* eintrag der settings-liste */
+    SLOT_THEME,         /* eintrag der theme-auswahl */
+    SLOT_QUIT,          /* quit-bestaetigung */
 } SlotKind;
 
 typedef struct {

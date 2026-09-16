@@ -1,9 +1,12 @@
 #include "draw.h"
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "chat.h"
 #include "command.h"
 #include "settings.h"
 #include "state.h"
@@ -12,6 +15,19 @@
 
 static const char GLYPH_EM_DASH[] = "\xE2\x80\x94";
 static const char GLYPH_BLOCK[] = "\xE2\x96\x88";
+
+/* breite des zeilen-labels ("you  ", "max  ", ...) bzw. der
+ * einrueckung von folgezeilen */
+#define MSG_PREFIX_W 5
+
+/* ------------------------------------------------------------------ */
+/* zeilen-arena fuer den chat: layout_compute fuellt sie jeden frame  */
+/* neu (breite kann sich geaendert haben), der speicher bleibt ueber  */
+/* frames erhalten. waechst nur, schrumpft nie – chat-verlauf lebt */
+/* eh solange die app laeuft. */
+/* ------------------------------------------------------------------ */
+static ChatLine *g_chat_lines = NULL;
+static size_t g_chat_lines_cap = 0;
 
 static size_t setup_pos(char *buf)
 {
@@ -116,6 +132,72 @@ void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
             lt->input_top = 1;
         }
         lt->cmd_top = lt->input_bottom + 1;
+
+        /* chat-viewport: alles ueber der input-box. die zeilen-tabelle
+         * wird jeden frame neu berechnet (resize veraendert die
+         * breite und damit die umbrueche), die arena behalten wir.
+         * waehrend einer anfrage reserviert der indikator die letzte
+         * viewport-zeile fuer sich. */
+        lt->chat_h = lt->input_top - 1;
+        lt->chat_lines = NULL;
+        lt->chat_lines_len = 0;
+        lt->chat_first = 0;
+        lt->busy_row = 0;
+        if (lt->chat_h > 0 && st->busy) {
+            lt->busy_row = lt->input_top - 1;
+        }
+        int view_h = lt->chat_h - ((lt->busy_row > 0) ? 1 : 0);
+        if (view_h < 0) {
+            view_h = 0;
+        }
+        if (view_h > 0 && st->chat.len > 0) {
+            int text_w = lt->main_w - MSG_PREFIX_W;
+            if (text_w < 1) {
+                text_w = 1;
+            }
+            size_t need =
+                chat_wrap(&st->chat, text_w, g_chat_lines, g_chat_lines_cap);
+            if (need > g_chat_lines_cap) {
+                size_t cap = (g_chat_lines_cap > 0) ? g_chat_lines_cap : 64;
+                while (cap < need) {
+                    if (cap > SIZE_MAX / 2) {
+                        die("out of memory");
+                    }
+                    cap *= 2;
+                }
+                ChatLine *grown = realloc(g_chat_lines, cap * sizeof *grown);
+                if (grown == NULL) {
+                    die("out of memory");
+                }
+                g_chat_lines = grown;
+                g_chat_lines_cap = cap;
+                (void)chat_wrap(&st->chat, text_w, g_chat_lines,
+                                g_chat_lines_cap);
+            }
+            if (need > (size_t)INT_MAX) {
+                need = (size_t)INT_MAX; /* int-arithmetik unten */
+            }
+            lt->chat_lines = g_chat_lines;
+            lt->chat_lines_len = need;
+
+            /* scroll normalisieren und zurueckschreiben, wie es
+             * layout_dialog_box mit DialogState macht: chat_scroll
+             * zaehlt die zeilen, die UNTEN abgeschnitten sind, 0
+             * heisst: dem ende folgen */
+            int hidden = st->chat_scroll;
+            int max_hidden = (int)need - view_h;
+            if (hidden > max_hidden) {
+                hidden = max_hidden;
+            }
+            if (hidden < 0) {
+                hidden = 0;
+            }
+            st->chat_scroll = hidden;
+            lt->chat_first = (int)need - hidden - view_h;
+            if (lt->chat_first < 0) {
+                lt->chat_first = 0; /* verlauf kuerzer als viewport: */
+            } /* oben anfangen, rest bleibt leer */
+        }
         break;
 
     case MODE_MODELS: {
@@ -176,6 +258,37 @@ Slot layout_slot(const Layout *lt, int row)
 
     switch (lt->mode) {
     case MODE_INPUT:
+        if (lt->busy_row > 0 && row == lt->busy_row) {
+            s.kind = SLOT_BUSY;
+            return s;
+        }
+        if (lt->chat_h > 0 && row < lt->input_top) {
+            /* chat-verlauf ueber der input-box: jede viewport-zeile
+             * ist eine render-zeile aus der tabelle */
+            int line = lt->chat_first + (row - 1);
+            if (line >= 0 && (size_t)line < lt->chat_lines_len) {
+                s.index = line;
+                switch (lt->chat_lines[line].role) {
+                case CHAT_ROLE_USER:
+                    s.kind = SLOT_MSG_USER;
+                    break;
+                case CHAT_ROLE_ASSISTANT:
+                    s.kind = SLOT_MSG_ASSISTANT;
+                    break;
+                case CHAT_ROLE_ERROR:
+                    s.kind = SLOT_MSG_ERROR;
+                    break;
+                case CHAT_ROLE_SYSTEM:
+                case CHAT_ROLE_NOTICE:
+                    s.kind = SLOT_MSG_SYSTEM;
+                    break;
+                case CHAT_ROLE_TOOL:
+                    s.kind = SLOT_MSG_TOOL;
+                    break;
+                }
+            }
+            return s;
+        }
         if (row == lt->input_top || row == lt->input_bottom) {
             s.kind = SLOT_BORDER;
         } else if (row > lt->input_top && row < lt->input_bottom) {
@@ -470,6 +583,82 @@ static void row_quit(Row *r)
     row_puts(r, "quit? ctrl+c again to confirm");
 }
 
+/* ------------------------------------------------------------------ */
+/* chat-verlauf: label-zeile + eingerueckte folgezeilen. die farben  */
+/* sind absichtlich feste SGRs (bold/rot) bzw. das theme-highlight   */
+/* – eigene theme-felder dafuer kommen spaeter, wenn sich zeigt,   */
+/* was gut aussieht.                                                */
+/* ------------------------------------------------------------------ */
+static void row_msg(Row *r, const ChatLine *ln, const char *text)
+{
+    const Theme *theme = theme_current();
+
+    if (ln->first) {
+        switch (ln->role) {
+        case CHAT_ROLE_USER:
+            row_sgr(r, "\x1b[1m"); /* bold */
+            row_puts(r, "you  ");
+            row_sgr(r, "\x1b[22m");
+            break;
+        case CHAT_ROLE_ASSISTANT:
+            row_sgr(r, theme->match);
+            row_puts(r, "max  ");
+            row_sgr(r, theme->reset);
+            break;
+        case CHAT_ROLE_ERROR:
+            row_sgr(r, "\x1b[31m"); /* rot */
+            row_puts(r, "err  ");
+            row_sgr(r, theme->reset);
+            break;
+        case CHAT_ROLE_TOOL:
+            row_sgr(r, "\x1b[2m"); /* faint: maschinen-output */
+            row_puts(r, "tool ");
+            row_sgr(r, "\x1b[22m");
+            break;
+        case CHAT_ROLE_SYSTEM:
+            row_puts(r, "sys  ");
+            break;
+        case CHAT_ROLE_NOTICE:
+            row_sgr(r, "\x1b[2m"); /* faint: meldung der app, kein inhalt */
+            row_puts(r, "ctx  ");
+            row_sgr(r, "\x1b[22m");
+            break;
+        }
+    } else {
+        row_puts(r, "     "); /* unter MSG_PREFIX_W breit */
+    }
+    row_putn(r, text + ln->off, (int)ln->len);
+}
+
+/* darstellungs-zeile eines tool-calls: einrueckung, pfeil, name und
+ * (abgeschnittene) argumente. laengere argumente (z.B. write_file-
+ * inhalt) verschwinden am rand – der volle text steht in der api-
+ * anfrage, nicht hier. */
+static void row_tool_call(Row *r, const ChatToolCall *call)
+{
+    row_puts(r, "     ");
+    row_puts(r, "\xE2\x86\x92 "); /* utf-8: rechts-pfeil */
+    row_puts(r, (call->name != NULL) ? call->name : "?");
+    row_puts(r, "(");
+    row_puts(r, (call->arguments != NULL) ? call->arguments : "");
+    row_puts(r, ")");
+}
+
+/* thinking-indikator waehrend einer laufenden anfrage: assistant-
+ * label + abgedunkelter hinweis. die UI blockiert, bis die antwort
+ * da ist – das hier ist die einzige sichtbare rueckmeldung. */
+static void row_busy(Row *r)
+{
+    const Theme *theme = theme_current();
+    row_sgr(r, theme->match);
+    row_puts(r, "max  ");
+    row_sgr(r, theme->reset);
+    row_sgr(r, "\x1b[2m"); /* faint */
+    row_puts(r, "thinking...");
+    row_sgr(r, "\x1b[22m");
+    row_glyph(r, GLYPH_BLOCK); /* cursor-block dahinter */
+}
+
 static const char *dlg_title(UIMode mode)
 {
     switch (mode) {
@@ -503,6 +692,23 @@ void draw_slot(Frame *f, const Layout *lt, const Slot *s, const AppState *st,
         break;
     case SLOT_CMD:
         row_command(&r, &COMMANDS[s->index], lt->prefix);
+        break;
+    case SLOT_MSG_USER:
+    case SLOT_MSG_ASSISTANT:
+    case SLOT_MSG_ERROR:
+    case SLOT_MSG_SYSTEM:
+    case SLOT_MSG_TOOL: {
+        const ChatLine *ln = &lt->chat_lines[s->index];
+        if (ln->tool >= 0) {
+            /* darstellungs-zeile eines tool-calls */
+            row_tool_call(&r, &st->chat.msgs[ln->msg].tool_calls[ln->tool]);
+            break;
+        }
+        row_msg(&r, ln, st->chat.msgs[ln->msg].text);
+        break;
+    }
+    case SLOT_BUSY:
+        row_busy(&r);
         break;
     case SLOT_DLG_BORDER:
         row_border(&r);

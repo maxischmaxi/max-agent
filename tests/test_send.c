@@ -1,0 +1,858 @@
+#define _POSIX_C_SOURCE 200809L // NOLINT(bugprone-reserved-identifier)
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "chat.h"
+#include "send.h"
+#include "state.h"
+#include "test.h"
+#include "utils.h"
+
+/* test-config im stil von tests/test_config.c: ein provider mit
+ * zwei modellen (zweiter ohne api-key, um auch den abzufragen) */
+static void build_cfg(Config *cfg)
+{
+    memset(cfg, 0, sizeof *cfg);
+    cfg->providers = calloc(2, sizeof(Provider));
+    if (!cfg->providers) {
+        die("out of memory");
+    }
+    cfg->providers_len = 2;
+
+    Provider *p0 = &cfg->providers[0];
+    p0->api_key = dup_str("sk-test-123");
+    p0->base_url = dup_str("https://api.example.com/v1");
+    p0->models = calloc(2, sizeof(Model));
+    p0->models_len = 2;
+    p0->models[0].id = dup_str("gpt-test");
+    p0->models[1].id = dup_str("mini-test");
+
+    Provider *p1 = &cfg->providers[1];
+    p1->api_key = NULL; /* ohne key: send_message muss das melden */
+    p1->base_url = dup_str("http://localhost:11434/v1");
+    p1->models = calloc(1, sizeof(Model));
+    p1->models_len = 1;
+    p1->models[0].id = dup_str("local-model");
+}
+
+/* ------------------------------------------------------------------ */
+/* send_stream: gegen einen minimalen sse-mock im child-prozess      */
+/* (vorbild: tests/test_openai_completions.c). der server nimmt eine  */
+/* verbindung an, antwortet mit drei chunks + usage + [DONE].         */
+/* ------------------------------------------------------------------ */
+
+/* einen request komplett lesen (header + body per content-length),
+ * damit der server erst antwortet, wenn alles angekommen ist – die
+ * requests sind seit den tool-definitionen gross genug, dass ein
+ * fruehes close die verbindung zerreisst */
+static int read_request(int cfd, char *buf, size_t cap)
+{
+    size_t got = 0;
+    while (got < cap - 1 && strstr(buf, "\r\n\r\n") == NULL) {
+        ssize_t n = read(cfd, buf + got, cap - 1 - got);
+        if (n <= 0) {
+            return -1;
+        }
+        got += (size_t)n;
+        buf[got] = '\0'; // NOLINT(clang-analyzer-security.ArrayBound)
+    }
+    const char *cl = strstr(buf, "Content-Length:");
+    if (cl == NULL) {
+        return 0; /* ohne body: gut genug */
+    }
+    size_t body = (size_t)strtol(cl + 15, NULL, 10);
+    if (body > cap - 1) {
+        body = cap - 1; /* groessere bodies kuerzen, reicht zum routen */
+    }
+    size_t header_end = (size_t)(strstr(buf, "\r\n\r\n") + 4 - buf);
+    while (got < header_end + body) {
+        ssize_t n = read(cfd, buf + got, cap - 1 - got);
+        if (n <= 0) {
+            break;
+        }
+        got += (size_t)n;
+        buf[got] = '\0'; // NOLINT(clang-analyzer-security.ArrayBound)
+    }
+    return 0;
+}
+
+static pid_t start_sse_server(int *port)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid; /* parent: weiter im test */
+    }
+
+    /* child: eine verbindung, request komplett lesen, sse
+     * zurueckschreiben, fertig */
+    int cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        _exit(1);
+    }
+    char buf[16384];
+    buf[0] = '\0';
+    (void)read_request(cfd, buf, sizeof buf);
+    static const char resp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hal\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n"
+        "data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,"
+        "\"total_tokens\":7},\"choices\":[]}\n\n"
+        "data: [DONE]\n\n";
+    (void)write(cfd, resp, sizeof resp - 1);
+    close(cfd);
+    _exit(0);
+}
+
+/* wie start_sse_server, aber mit frei waehlbarer antwort: fuer
+ * tests, die eine einzelne, gezielt kaputte sse-antwort brauchen */
+static pid_t start_once_server(int *port, const char *resp)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    int cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        _exit(1);
+    }
+    char buf[16384];
+    buf[0] = '\0';
+    (void)read_request(cfd, buf, sizeof buf);
+    (void)write(cfd, resp, strlen(resp));
+    close(cfd);
+    _exit(0);
+}
+
+/* server, der im request-body nach einem marker sucht und das
+ * ergebnis als antwort zurueckgibt ("JA"/"NEIN") – damit laesst
+ * sich pruefen, WAS tatsaechlich rausgegangen ist. der usage-chunk
+ * am ende eicht nebenbei die token-schaetzung. */
+static pid_t start_probe_server(int *port, const char *marker)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    int cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        _exit(1);
+    }
+    /* der body traegt den ganzen verlauf: gross genug lesen */
+    char *req = malloc(1 << 20);
+    if (req == NULL) {
+        _exit(1);
+    }
+    req[0] = '\0';
+    (void)read_request(cfd, req, 1 << 20);
+    const char *found = (strstr(req, marker) != NULL) ? "JA" : "NEIN";
+    free(req);
+
+    char resp[512];
+    (void)snprintf(resp, sizeof resp,
+                   "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/event-stream\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "data: {\"choices\":[{\"delta\":{\"content\":\"%s\"}}]}\n\n"
+                   "data: {\"usage\":{\"prompt_tokens\":1234,"
+                   "\"completion_tokens\":2,\"total_tokens\":1236},"
+                   "\"choices\":[]}\n\n"
+                   "data: [DONE]\n\n",
+                   found);
+    (void)write(cfd, resp, strlen(resp));
+    close(cfd);
+    _exit(0);
+}
+
+/* redraw-zaehler statt echtem draw() */
+static int g_redraws = 0;
+
+static void count_redraw(void *ud)
+{
+    (void)ud;
+    g_redraws++;
+}
+
+/* ------------------------------------------------------------------ */
+/* agent-loop: zwei runden gegen einen routing-mock. runde 1 (request */
+/* enthaelt noch kein tool_call_id) antwortet mit einem tool-call,    */
+/* runde 2 bekommt die finale antwort. das tool laeuft dazwischen     */
+/* WIRKLICH (echo ueber popen).                                        */
+/* ------------------------------------------------------------------ */
+
+static pid_t start_tool_server(int *port)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    /* child: zwei verbindungen, routing nach request-inhalt */
+    for (int round = 0; round < 2; round++) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+            _exit(1);
+        }
+        char req[16384];
+        req[0] = '\0';
+        (void)read_request(cfd, req, sizeof req);
+
+        const char *resp = NULL;
+        if (strstr(req, "tool_call_id") != NULL) {
+            /* runde 2: finale antwort (das tool-ergebnis ist im
+             * request angekommen) */
+            resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fertig: "
+                "\"}}]}\n\n"
+                "data: "
+                "{\"choices\":[{\"delta\":{\"content\":\"agent-test\"}}]}\n\n"
+                "data: [DONE]\n\n";
+        } else {
+            /* runde 1: ein tool-call (bash echo agent-test) */
+            resp = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/event-stream\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
+                   "{\"index\":0,\"id\":\"call_1\",\"function\":{"
+                   "\"name\":\"bash\",\"arguments\":"
+                   "\"{\\\"command\\\":\\\"echo agent-test\\\"}\"}}]}}]}\n\n"
+                   "data: [DONE]\n\n";
+        }
+        (void)write(cfd, resp, strlen(resp));
+        close(cfd);
+    }
+    _exit(0);
+}
+
+/* ein provider, ein modell, base-url auf den mock-port */
+static void build_mock_cfg(Config *cfg, int port)
+{
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1", port);
+
+    memset(cfg, 0, sizeof *cfg);
+    cfg->providers = calloc(1, sizeof(Provider));
+    if (cfg->providers == NULL) {
+        die("out of memory");
+    }
+    cfg->providers_len = 1;
+    cfg->providers[0].api_key = dup_str("x");
+    cfg->providers[0].base_url = dup_str(url);
+    cfg->providers[0].models = calloc(1, sizeof(Model));
+    if (cfg->providers[0].models == NULL) {
+        die("out of memory");
+    }
+    cfg->providers[0].models_len = 1;
+    cfg->providers[0].models[0].id = dup_str("mock");
+    cfg->active_model = dup_str("mock");
+    CHECK(cfg->providers[0].api_key != NULL);
+    CHECK(cfg->providers[0].base_url != NULL);
+    CHECK(cfg->providers[0].models[0].id != NULL);
+    CHECK(cfg->active_model != NULL);
+}
+
+static void free_mock_cfg(Config *cfg)
+{
+    free(cfg->providers[0].api_key);
+    free(cfg->providers[0].base_url);
+    free(cfg->providers[0].models[0].id);
+    free(cfg->providers[0].models);
+    free(cfg->active_model);
+    free(cfg->providers);
+}
+
+static void test_agent(void)
+{
+    int port = 0;
+    pid_t server = start_tool_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
+
+    g_redraws = 0;
+    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    CHECK(rc == 0);
+
+    /* verlauf: user -> assistant mit tool-call -> tool-ergebnis
+     * -> finale antwort */
+    CHECK(st.chat.len == 4);
+    CHECK(st.chat.msgs[1].role == CHAT_ROLE_ASSISTANT);
+    CHECK(st.chat.msgs[1].tool_calls_len == 1);
+    CHECK(st.chat.msgs[1].tool_calls[0].name != NULL &&
+          strcmp(st.chat.msgs[1].tool_calls[0].name, "bash") == 0);
+    CHECK(st.chat.msgs[1].tool_calls[0].arguments != NULL &&
+          strcmp(st.chat.msgs[1].tool_calls[0].arguments,
+                 "{\"command\":\"echo agent-test\"}") == 0);
+    CHECK(st.chat.msgs[2].role == CHAT_ROLE_TOOL);
+    CHECK(st.chat.msgs[2].text != NULL &&
+          strstr(st.chat.msgs[2].text, "agent-test") != NULL);
+    CHECK(st.chat.msgs[2].tool_call_id != NULL &&
+          strcmp(st.chat.msgs[2].tool_call_id, "call_1") == 0);
+    CHECK(st.chat.msgs[3].role == CHAT_ROLE_ASSISTANT);
+    CHECK(st.chat.msgs[3].text != NULL);
+    CHECK(strcmp(st.chat.msgs[3].text, "fertig: agent-test") == 0);
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* kaputte modell-antwort: ein tool-call-delta traegt eine id, aber   */
+/* keinen funktionsnamen. der akku muss den slot verwerfen und darf   */
+/* die id danach nicht ein zweites mal freigeben (asan faengt das).   */
+/* ------------------------------------------------------------------ */
+
+static void test_agent_broken_call(void)
+{
+    static const char resp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
+        "{\"index\":0,\"id\":\"call_ohne_namen\","
+        "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+
+    int port = 0;
+    pid_t server = start_once_server(&port, resp);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
+
+    g_redraws = 0;
+    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    CHECK(rc == 0);
+
+    /* namenloser call verworfen -> keine tool-runde, loop endet */
+    CHECK(st.chat.len == 2);
+    CHECK(st.chat.msgs[1].role == CHAT_ROLE_ASSISTANT);
+    CHECK(st.chat.msgs[1].tool_calls_len == 0);
+    CHECK(st.chat.msgs[1].tool_calls == NULL);
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* context-management: passt der verlauf nicht mehr ins fenster des   */
+/* modells, geht der aelteste teil NICHT mehr raus – und der benutzer */
+/* sieht im verlauf, dass gekuerzt wurde.                             */
+/* ------------------------------------------------------------------ */
+
+static void test_context_trim(void)
+{
+    int port = 0;
+    pid_t server = start_probe_server(&port, "URALTE-NACHRICHT");
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+    /* kleines fenster: der alte block passt garantiert nicht mehr */
+    cfg.providers[0].models[0].context_window = 2000;
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+
+    /* ~8 kb alter verlauf (~2000 tokens) + eine kurze neue frage */
+    char *old = malloc(8193);
+    if (old == NULL) {
+        die("out of memory");
+    }
+    memset(old, 'x', 8192);
+    old[8192] = '\0';
+    memcpy(old, "URALTE-NACHRICHT ", strlen("URALTE-NACHRICHT "));
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, old) == 0);
+    free(old);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neue frage") == 0);
+
+    g_redraws = 0;
+    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    CHECK(rc == 0);
+
+    /* der server hat den alten block NICHT gesehen */
+    ChatMessage *answer = &st.chat.msgs[st.chat.len - 1];
+    CHECK(answer->role == CHAT_ROLE_ASSISTANT);
+    CHECK(answer->text != NULL && strcmp(answer->text, "NEIN") == 0);
+
+    /* die kuerzung ist im verlauf vermerkt und im state gezaehlt */
+    CHECK(st.ctx.dropped == 1);
+    bool has_notice = false;
+    for (size_t i = 0; i < st.chat.len; i++) {
+        if (st.chat.msgs[i].role == CHAT_ROLE_NOTICE) {
+            has_notice = true;
+            /* genau eine nachricht faellt weg: singular */
+            CHECK(strstr(st.chat.msgs[i].text,
+                         "1 nachricht am anfang weggelassen") != NULL);
+        }
+    }
+    CHECK(has_notice);
+
+    /* usage aus dem stream hat die schaetzung geeicht */
+    CHECK(st.ctx.prompt_tokens == 1234);
+    CHECK(st.ctx.scale > 0);
+    CHECK(st.ctx.estimated > 0);
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+/* gegenprobe: grosses fenster -> nichts wird weggelassen */
+static void test_context_fits(void)
+{
+    int port = 0;
+    pid_t server = start_probe_server(&port, "URALTE-NACHRICHT");
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+    cfg.providers[0].models[0].context_window = 200000;
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "URALTE-NACHRICHT hallo") == 0);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neue frage") == 0);
+
+    CHECK(send_stream(&st, &cfg, &dbg, NULL, count_redraw) == 0);
+    ChatMessage *answer = &st.chat.msgs[st.chat.len - 1];
+    CHECK(answer->text != NULL && strcmp(answer->text, "JA") == 0);
+    CHECK(st.ctx.dropped == 0);
+    for (size_t i = 0; i < st.chat.len; i++) {
+        CHECK(st.chat.msgs[i].role != CHAT_ROLE_NOTICE);
+    }
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+static void test_stream(void)
+{
+    /* mock-server starten und eine streaming-config bauen */
+    int port = 0;
+    pid_t server = start_sse_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1", port);
+
+    Config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.providers = calloc(1, sizeof(Provider));
+    if (cfg.providers == NULL) {
+        die("out of memory");
+    }
+    cfg.providers_len = 1;
+    cfg.providers[0].api_key = dup_str("x");
+    cfg.providers[0].base_url = dup_str(url);
+    cfg.providers[0].models = calloc(1, sizeof(Model));
+    if (cfg.providers[0].models == NULL) {
+        die("out of memory");
+    }
+    cfg.providers[0].models_len = 1;
+    cfg.providers[0].models[0].id = dup_str("mock");
+    cfg.active_model = dup_str("mock");
+    CHECK(cfg.providers[0].api_key != NULL);
+    CHECK(cfg.providers[0].base_url != NULL);
+    CHECK(cfg.providers[0].models[0].id != NULL);
+    CHECK(cfg.active_model != NULL);
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "hi") == 0);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "moin") == 0);
+
+    g_redraws = 0;
+    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    CHECK(rc == 0);
+
+    /* verlauf: user, alte antwort, NEUE antwort aus den deltas */
+    CHECK(st.chat.len == 3);
+    CHECK(st.chat.msgs[2].role == CHAT_ROLE_ASSISTANT);
+    CHECK(st.chat.msgs[2].text != NULL &&
+          strcmp(st.chat.msgs[2].text, "hallo") == 0);
+    /* alte nachrichten unangetastet (borrow-zeiger blieben gueltig) */
+    CHECK(strcmp(st.chat.msgs[0].text, "hi") == 0);
+    CHECK(strcmp(st.chat.msgs[1].text, "moin") == 0);
+    /* der stream hat mindestens einmal neu gezeichnet */
+    CHECK(g_redraws >= 1);
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+
+    free(cfg.providers[0].api_key);
+    free(cfg.providers[0].base_url);
+    free(cfg.providers[0].models[0].id);
+    free(cfg.providers[0].models);
+    free(cfg.active_model);
+    free(cfg.providers);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+
+    /* --- stream-fehler: tote adresse -> platzhalter weg, fehler hin */
+    Config bad = {0};
+    bad.providers = calloc(1, sizeof(Provider));
+    if (bad.providers == NULL) {
+        die("out of memory");
+    }
+    bad.providers_len = 1;
+    bad.providers[0].api_key = dup_str("x");
+    bad.providers[0].base_url =
+        dup_str("http://127.0.0.1:1/v1"); /* port 1: refused */
+    bad.providers[0].models = calloc(1, sizeof(Model));
+    if (bad.providers[0].models == NULL) {
+        die("out of memory");
+    }
+    bad.providers[0].models_len = 1;
+    bad.providers[0].models[0].id = dup_str("mock");
+    bad.active_model = dup_str("mock");
+    CHECK(bad.providers[0].api_key != NULL);
+    CHECK(bad.providers[0].base_url != NULL);
+    CHECK(bad.active_model != NULL);
+
+    AppState st2 = {0};
+    input_init(&st2.input);
+    CHECK(chat_append(&st2.chat, CHAT_ROLE_USER, "hi") == 0);
+
+    rc = send_stream(&st2, &bad, &dbg, NULL, count_redraw);
+    CHECK(rc == -1);
+    /* platzhalter ist weg: nur user + fehlermeldung */
+    CHECK(st2.chat.len == 2);
+    CHECK(st2.chat.msgs[1].role == CHAT_ROLE_ERROR);
+    CHECK(st2.chat.msgs[1].text != NULL &&
+          strstr(st2.chat.msgs[1].text, "verbindung") != NULL);
+
+    chat_free(&st2.chat);
+    input_free(&st2.input);
+
+    free(bad.providers[0].api_key);
+    free(bad.providers[0].base_url);
+    free(bad.providers[0].models[0].id);
+    free(bad.providers[0].models);
+    free(bad.active_model);
+    free(bad.providers);
+}
+
+int main(void)
+{
+    /* --- send_role: mapping, ERROR ist keine api-rolle --- */
+    CHECK(send_role(CHAT_ROLE_SYSTEM) == OAI_ROLE_SYSTEM);
+    CHECK(send_role(CHAT_ROLE_USER) == OAI_ROLE_USER);
+    CHECK(send_role(CHAT_ROLE_ASSISTANT) == OAI_ROLE_ASSISTANT);
+    CHECK(send_role(CHAT_ROLE_ERROR) == -1);
+
+    /* --- send_build_messages --- */
+    Chat chat = {0};
+
+    /* leeres chat: 0 nachrichten, *out bleibt NULL */
+    OaiMessage *msgs = (void *)1;
+    CHECK(send_build_messages(&chat, NULL, &msgs) == 0);
+    CHECK(msgs == NULL);
+    CHECK(send_build_messages(NULL, NULL, &msgs) == -1);
+    CHECK(send_build_messages(&chat, NULL, NULL) == -1);
+
+    /* leeres chat MIT system-prompt: genau die system-nachricht */
+    CHECK(send_build_messages(&chat, "sys", &msgs) == 1);
+    CHECK(msgs != NULL && msgs[0].role == OAI_ROLE_SYSTEM);
+    CHECK(msgs != NULL && strcmp(msgs[0].content, "sys") == 0);
+    free(msgs);
+    msgs = NULL;
+
+    /* nur fehler-nachrichten: ebenfalls nichts zu senden */
+    CHECK(chat_append(&chat, CHAT_ROLE_ERROR, "http 500: kaputt") == 0);
+    CHECK(send_build_messages(&chat, NULL, &msgs) == 0);
+    CHECK(msgs == NULL);
+
+    /* gemischtes transcript: ERROR fehlt, rest in reihenfolge */
+    chat_clear(&chat);
+    CHECK(chat_append(&chat, CHAT_ROLE_SYSTEM, "du bist max agent.") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_USER, "frage 1") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_ERROR, "verbindung: toter host") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_ASSISTANT, "antwort 1") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_USER, "frage 2") == 0);
+
+    int n = send_build_messages(&chat, NULL, &msgs);
+    CHECK(n == 4);
+    CHECK(msgs != NULL && msgs[0].role == OAI_ROLE_SYSTEM);
+    CHECK(msgs != NULL && strcmp(msgs[0].content, "du bist max agent.") == 0);
+    CHECK(msgs != NULL && msgs[1].role == OAI_ROLE_USER);
+    CHECK(msgs != NULL && strcmp(msgs[1].content, "frage 1") == 0);
+    CHECK(msgs != NULL && msgs[2].role == OAI_ROLE_ASSISTANT); /* ERROR fehlt */
+    CHECK(msgs != NULL &&
+          strcmp(msgs[2].content, "antwort 1") == 0); /* rueckt nach */
+    CHECK(msgs != NULL && msgs[3].role == OAI_ROLE_USER);
+    CHECK(msgs != NULL && strcmp(msgs[3].content, "frage 2") == 0);
+
+    /* content wird geborgt, nicht kopiert: pointer-gleichheit */
+    CHECK(msgs != NULL && msgs[1].content == chat.msgs[1].text);
+    free(msgs);
+    msgs = NULL;
+
+    /* --- tool-calls und tool-ergebnisse im request --- */
+    chat_clear(&chat);
+    {
+        /* heap-array: chat_set_tool_calls uebernimmt den besitz */
+        ChatToolCall *calls = calloc(1, sizeof *calls);
+        if (calls == NULL) {
+            die("out of memory");
+        }
+        calls[0].id = dup_str("call_1");
+        calls[0].name = dup_str("bash");
+        calls[0].arguments = dup_str("{\"command\":\"ls\"}");
+        CHECK(calls[0].id != NULL && calls[0].name != NULL);
+        CHECK(chat_append(&chat, CHAT_ROLE_ASSISTANT, "") == 0);
+        CHECK(chat_set_tool_calls(&chat, calls, 1) == 0);
+        CHECK(chat_append_tool(&chat, "call_1", "ergebnis") == 0);
+
+        n = send_build_messages(&chat, NULL, &msgs);
+        CHECK(n == 2);
+        /* assistant mit calls: content NULL, calls geborgt */
+        CHECK(msgs != NULL && msgs[0].role == OAI_ROLE_ASSISTANT);
+        CHECK(msgs != NULL && msgs[0].content == NULL);
+        CHECK(msgs != NULL && msgs[0].tool_calls_len == 1);
+        CHECK(msgs != NULL && msgs[0].tool_calls[0].name != NULL);
+        CHECK(msgs != NULL && strcmp(msgs[0].tool_calls[0].name, "bash") == 0);
+        /* tool-ergebnis: rolle + tool_call_id */
+        CHECK(msgs != NULL && msgs[1].role == OAI_ROLE_TOOL);
+        CHECK(msgs != NULL && strcmp(msgs[1].content, "ergebnis") == 0);
+        CHECK(msgs != NULL && msgs[1].tool_call_id != NULL &&
+              strcmp(msgs[1].tool_call_id, "call_1") == 0);
+        free(msgs);
+        msgs = NULL;
+    }
+
+    /* system-prompt wird VORANGESTELLT (request-kontext, nicht im
+     * transcript: hier nur der sende-seite sichtbar). das transcript
+     * enthaelt eine eigene SYSTEM-nachricht -> beide im request */
+    chat_clear(&chat);
+    CHECK(chat_append(&chat, CHAT_ROLE_SYSTEM, "du bist max agent.") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_USER, "frage 1") == 0);
+    n = send_build_messages(&chat, "angehangener request-kontext", &msgs);
+    CHECK(n == 3);
+    CHECK(msgs != NULL && msgs[0].role == OAI_ROLE_SYSTEM);
+    CHECK(msgs != NULL &&
+          strcmp(msgs[0].content, "angehangener request-kontext") == 0);
+    CHECK(msgs != NULL && msgs[1].role == OAI_ROLE_SYSTEM);
+    CHECK(msgs != NULL && strcmp(msgs[1].content, "du bist max agent.") == 0);
+    CHECK(msgs != NULL && msgs[2].role == OAI_ROLE_USER);
+    CHECK(msgs != NULL && strcmp(msgs[2].content, "frage 1") == 0);
+    free(msgs);
+    msgs = NULL;
+
+    /* --- send_find_model --- */
+    Config cfg;
+    build_cfg(&cfg);
+
+    const Provider *pr = NULL;
+    const Model *m = send_find_model(&cfg, "gpt-test", &pr);
+    CHECK(m != NULL);
+    CHECK(pr != NULL && pr == &cfg.providers[0]);
+    CHECK(pr != NULL && pr->api_key != NULL &&
+          strcmp(pr->api_key, "sk-test-123") == 0);
+
+    /* modell im zweiten provider */
+    pr = NULL;
+    m = send_find_model(&cfg, "local-model", &pr);
+    CHECK(m != NULL);
+    CHECK(pr == &cfg.providers[1]);
+
+    /* unbekannt/leer/NULL */
+    CHECK(send_find_model(&cfg, "gibts-nicht", &pr) == NULL);
+    CHECK(send_find_model(&cfg, "", &pr) == NULL);
+    CHECK(send_find_model(&cfg, NULL, &pr) == NULL);
+    CHECK(send_find_model(NULL, "gpt-test", &pr) == NULL);
+    CHECK(send_find_model(&cfg, "gpt-test", NULL) != NULL);
+
+    /* --- send_message: benutzungsfehler ohne netzwerk --- */
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+
+    /* keine config: fehler landet im verlauf, nicht im crash */
+    Config empty = {0};
+    CHECK(send_message(&st, &empty, &dbg) == -1);
+    CHECK(st.chat.len == 1);
+    CHECK(st.chat.msgs[0].role == CHAT_ROLE_ERROR);
+    CHECK(st.chat.msgs[0].text != NULL);
+    CHECK(st.chat.msgs[0].text != NULL &&
+          strstr(st.chat.msgs[0].text, "kein modell") != NULL);
+
+    /* modell in provider ohne api-key: eigener fehler */
+    chat_clear(&st.chat);
+    Config nokey = {0};
+    nokey.providers = cfg.providers + 1; /* provider[1]: ohne key */
+    nokey.providers_len = 1;
+    nokey.active_model = dup_str("local-model");
+    CHECK(nokey.active_model != NULL);
+    CHECK(send_message(&st, &nokey, &dbg) == -1);
+    CHECK(st.chat.len == 1);
+    CHECK(st.chat.msgs[0].role == CHAT_ROLE_ERROR);
+    CHECK(st.chat.msgs[0].text != NULL &&
+          strstr(st.chat.msgs[0].text, "api-key") != NULL);
+    free(nokey.active_model);
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+
+    /* config aufraeumen (dup_str-pointer) */
+    for (size_t p = 0; p < cfg.providers_len; p++) {
+        Provider *pp = &cfg.providers[p];
+        free(pp->api_key);
+        free(pp->base_url);
+        for (size_t i = 0; i < pp->models_len; i++) {
+            free(pp->models[i].id);
+        }
+        free(pp->models);
+    }
+    free(cfg.providers);
+
+    test_stream();
+    test_agent();
+    test_agent_broken_call();
+    test_context_trim();
+    test_context_fits();
+
+    chat_free(&chat);
+    return test_report();
+}

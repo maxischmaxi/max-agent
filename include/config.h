@@ -38,9 +38,14 @@ typedef struct {
     size_t providers_len;
 
     /* settings (settings-dialog, in der config unter "settings") */
-    char *theme;        /* theme-name oder NULL (= "auto") */
-    bool confirm_quit;  /* ctrl+c doppelt bestaetigen? (default: an) */
-    char *active_model; /* id des im models-dialog gewaehlten modells */
+    char *theme;         /* theme-name oder NULL (= "auto") */
+    bool confirm_quit;   /* ctrl+c doppelt bestaetigen? (default: an) */
+    char *active_model;  /* id des im models-dialog gewaehlten modells */
+    char *system_prompt; /* settings.systemPrompt: NULL = default- */
+                         /* vorlage (prompt.c), "" = aus, sonst text */
+    char *schema_url;    /* wurzel-"$schema": verweis auf die json-   */
+                         /* schema-definition (editor-linting). wird  */
+                         /* beim speichern mitgeschrieben             */
 } Config;
 
 int load_config(Config *config);

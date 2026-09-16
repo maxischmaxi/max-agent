@@ -9,9 +9,12 @@
 #include <sys/select.h>
 #include <unistd.h>
 
+#include "chat.h"
 #include "command.h"
 #include "config.h"
 #include "debug.h"
+#include "draw.h"
+#include "send.h"
 #include "settings.h"
 #include "theme.h"
 #include "utils.h"
@@ -256,6 +259,18 @@ Key key_from_escape(const char *seq, ssize_t len)
     }
     if (final == 'B' && len == 3) {
         k.kind = KEY_DOWN;
+        return k;
+    }
+
+    /* page up/down: CSI 5~ / CSI 6~ (legacy-encoding; die app
+     * aktiviert das kitty-protokoll nie, daher kommt hier immer
+     * die klassische form an). mit modifikatoren: uninteressant. */
+    if (final == '~' && p[0] == 5 && p[1] < 0) {
+        k.kind = KEY_PGUP;
+        return k;
+    }
+    if (final == '~' && p[0] == 6 && p[1] < 0) {
+        k.kind = KEY_PGDN;
         return k;
     }
 
@@ -623,6 +638,26 @@ static void autocomplete_command(Input *input, int id, int max_len)
     input_cursor_end(input);
 }
 
+/* ------------------------------------------------------------------ */
+/* stream-redraw: send_stream ruft nach chunks zurueck, damit die   */
+/* antwort live waechst. der callback braucht rows/cols/cfg – die   */
+/* passen in einen struct, weil OaiStreamCallbacks nur einen void*   */
+/* als user_data hat.                                              */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    AppState *state;
+    Config *cfg;
+    DebugState *dbg;
+    int rows;
+    int cols;
+} StreamRedrawCtx;
+
+static void stream_redraw(void *ud)
+{
+    StreamRedrawCtx *rc = ud;
+    draw(rc->rows, rc->cols, rc->state, rc->dbg, rc->cfg);
+}
+
 static int cmd_list_height(const AppState *st)
 {
     if (!st->cmd_active) {
@@ -665,11 +700,9 @@ static void cmd_parse(const AppState *st, char *word, size_t word_sz,
     }
 }
 
-static void handle_all(AppState *state, DebugState *dbg, int rows, int cols,
-                       Key k)
+static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
+                       int cols, Key k)
 {
-    (void)dbg; /* im handle_all derzeit unbenutzt */
-
     /* kurzform: die chat-eingabe liegt als member im state */
     Input *input = &state->input;
 
@@ -728,9 +761,34 @@ static void handle_all(AppState *state, DebugState *dbg, int rows, int cols,
             state->cmd_active = false;
             state->dirty = true;
         } else {
-            /* normale nachricht: bestehendes verhalten */
+            /* normale nachricht: eingabe wandert ins transcript und
+             * wird als STREAM an die api geschickt – die antwort
+             * waechst live im verlauf (redraw kommt aus send_stream
+             * zurueck, gedrosselt). die UI blockiert bis zum ende:
+             * vorher noch einen frame mit thinking-indikator, sonst
+             * wirkt die app tot. leere eingabe: nichts senden. */
+            char *text = chat_flatten_input(input);
             input_reset(input);
             state->cmd_active = false;
+            if (text != NULL) {
+                if (chat_append(&state->chat, CHAT_ROLE_USER, text) != 0) {
+                    die("out of memory");
+                }
+                free(text);
+                state->chat_scroll = 0; /* neue nachricht: folgen */
+
+                state->busy = true;
+                draw(rows, cols, state, dbg, cfg);
+                StreamRedrawCtx rc = {
+                    .state = state,
+                    .cfg = cfg,
+                    .dbg = dbg,
+                    .rows = rows,
+                    .cols = cols,
+                };
+                (void)send_stream(state, cfg, dbg, &rc, stream_redraw);
+                state->busy = false;
+            }
             state->dirty = true;
         }
         break;
@@ -765,6 +823,27 @@ static void handle_all(AppState *state, DebugState *dbg, int rows, int cols,
             true; /* egal ob vervollstaendigt: redraw zeigt den log */
         break;
     }
+    /* chat-viewport blaettern: die hoehe des verlaufs entspricht
+     * den zeilen ueber der input-box (rows - input-zeilen - rahmen);
+     * layout_compute klemmt alles weitere und schreibt zurueck */
+    case KEY_PGUP:
+    case KEY_PGDN: {
+        int page = rows - (int)input->count - 3;
+        if (page < 1) {
+            page = 1;
+        }
+        if (k.kind == KEY_PGUP) {
+            state->chat_scroll += page;
+        } else if (state->chat_scroll > 0) {
+            state->chat_scroll -= page;
+            if (state->chat_scroll < 0) {
+                state->chat_scroll = 0;
+            }
+        }
+        state->dirty = true;
+        break;
+    }
+
     /* POSIX/readline-shortcuts: nur im normalen chat-input aktiv
      * (die dialog-handler ignorieren sie). alles laeuft ueber die
      * multiline-faehige cursor-utility aus input.c. */
@@ -902,6 +981,6 @@ void handle_key(AppState *state, Config *cfg, DebugState *dbg, int rows,
     } else if (ui_mode(state) == MODE_MODELS) {
         handle_models(state, cfg, dbg, k);
     } else {
-        handle_all(state, dbg, rows, cols, k);
+        handle_all(state, cfg, dbg, rows, cols, k);
     }
 }

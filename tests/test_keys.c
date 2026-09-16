@@ -45,6 +45,10 @@ static void test_key_from_escape(void)
     /* pfeiltasten (CSI A/B) */
     CHECK(key_from_escape("\x1b[A", 3).kind == KEY_UP);
     CHECK(key_from_escape("\x1b[B", 3).kind == KEY_DOWN);
+    /* page up/down (CSI 5~/6~): chat-verlauf blaettern */
+    CHECK(key_from_escape("\x1b[5~", 4).kind == KEY_PGUP);
+    CHECK(key_from_escape("\x1b[6~", 4).kind == KEY_PGDN);
+    CHECK(key_from_escape("\x1b[5;5~", 6).kind == KEY_NONE); /* mit modi */
     /* kitty-protokoll: tab als CSI 9u */
     CHECK(key_from_escape("\x1b[9u", 4).kind == KEY_TAB);
     /* kitty: ctrl+X als CSI <codepoint>;5u */

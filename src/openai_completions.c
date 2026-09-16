@@ -11,11 +11,13 @@
 #include "openai_completions.h"
 
 #include <curl/curl.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include "cJSON.h"
@@ -25,6 +27,8 @@
 #define OAI_DEFAULT_MAX_RETRIES       2
 #define OAI_USER_AGENT                "openai-completions-c/0.1.0"
 #define OAI_STREAM_CONNECT_TIMEOUT_MS 10000L
+#define OAI_DEFAULT_STREAM_IDLE_MS    300000L /* 5 min ohne daten = tot */
+#define OAI_DEFAULT_MAX_BODY_BYTES    (32L * 1024L * 1024L) /* 32 MiB */
 
 /* ------------------------------------------------------------------ */
 /* hilfsfunktionen                                                     */
@@ -62,15 +66,46 @@ static int get_int(const cJSON *obj, const char *key, int def)
     return item->valueint;
 }
 
-static void backoff_sleep(int attempt)
+/* 0.5s * 2^attempt, deckel bei 8s (npm: exponential backoff). wenn der   */
+/* server einen gueltigen retry-after (0..60s) schickt, gehorchen wir      */
+/* ihm wie das npm-package. http-datum-format wird nicht unterstuetzt,     */
+/* dann gilt das default-backoff (openai schickt nur sekunden).           */
+/* monotoner uhrzeitstempel in sekunden (fuer den idle-watchdog) */
+static double mono_now(void)
 {
-    /* 0.5s * 2^attempt, deckel bei 8s (npm: exponential backoff) */
-    long ms = 500L << (attempt > 4 ? 4 : attempt);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ((double)ts.tv_nsec / 1e9);
+}
+
+static void backoff_sleep(int attempt, const char *retry_after)
+{
+    long ms = -1;
+    if (retry_after != NULL && retry_after[0] != '\0') {
+        char *end = NULL;
+        errno = 0;
+        double seconds = strtod(retry_after, &end);
+        if (errno == 0 && end != NULL && *end == '\0' && seconds >= 0.0 &&
+            seconds < 60.0) {
+            ms = (long)(seconds * 1000.0);
+        }
+    }
+    if (ms < 0) {
+        long base = 500L << (attempt > 4 ? 4 : attempt);
+        /* npm-paritaet: jitter, bis zu 25% abziehen. entropie aus der   */
+        /* uhr, damit parallele clients nicht synchron warten           */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double jitter = 1.0 - ((double)(now.tv_nsec % 250) / 1000.0);
+        ms = (long)((double)base * jitter);
+    }
     struct timespec ts = {
         .tv_sec = (time_t)(ms / 1000L),
         .tv_nsec = (ms % 1000L) * 1000000L,
     };
-    nanosleep(&ts, NULL);
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+        /* signalunterbrechung: restzeit weiter schlafen */
+    }
 }
 
 /* curl_global_init/cleanup referenzzaehlen, damit mehrere clients      */
@@ -150,10 +185,15 @@ typedef struct {
     OaiStreamCallbacks cb;
     OaiCompletionResult *result;
 
-    Buf *body;      /* gesamter antwort-koerper */
-    size_t sse_pos; /* konsumierter offset im body (fuer sse) */
-    bool sse_done;  /* [DONE] gesehen */
-    bool aborted;   /* on_chunk hat abbruch verlangt */
+    Buf *body;            /* gesamter antwort-koerper */
+    size_t sse_pos;       /* konsumierter offset im body (fuer sse) */
+    bool sse_done;        /* [DONE] gesehen */
+    bool aborted;         /* on_chunk hat abbruch verlangt */
+    bool overflow;        /* body-limit ueberschritten */
+    bool no_retry;        /* deterministischer fehler, retry unnoetig */
+    bool idle_hit;        /* stream-idle-timeout ausgeloest */
+    double last_activity; /* letzter datenempfang (mono_now) */
+    char retry_after[32]; /* wert aus retry-after(-ms)-header */
     size_t chunks_delivered;
 } RequestState;
 
@@ -171,8 +211,29 @@ static int params_validate(const OaiChatCompletionParams *p)
     }
     for (size_t i = 0; i < p->messages_len; i++) {
         const OaiMessage *msg = &p->messages[i];
-        if (msg->content == NULL && msg->tool_calls_len == 0) {
+        if (msg->content == NULL && msg->tool_calls_len == 0 &&
+            msg->content_parts_len == 0) {
             return -1; /* nachricht ohne inhalt */
+        }
+        if (msg->content != NULL && msg->content_parts_len > 0) {
+            return -1; /* content und content_parts gleichzeitig */
+        }
+        if (msg->content_parts_len > 0 && msg->content_parts == NULL) {
+            return -1;
+        }
+        for (size_t j = 0; j < msg->content_parts_len; j++) {
+            const OaiContentPart *part = &msg->content_parts[j];
+            if (part->type == OAI_CONTENT_TEXT) {
+                if (part->text == NULL) {
+                    return -1;
+                }
+            } else if (part->type == OAI_CONTENT_IMAGE_URL) {
+                if (part->image_url == NULL) {
+                    return -1;
+                }
+            } else {
+                return -1; /* ungueltiger part-type */
+            }
         }
         if (msg->tool_calls_len > 0 && msg->tool_calls == NULL) {
             return -1;
@@ -200,6 +261,18 @@ static int params_validate(const OaiChatCompletionParams *p)
         if (p->tools[i].function.name == NULL) {
             return -1;
         }
+    }
+    if (p->has_tool_choice) {
+        if (p->tool_choice == OAI_TOOL_CHOICE_FUNCTION) {
+            if (p->tool_choice_function == NULL) {
+                return -1;
+            }
+        } else if (p->tool_choice_function != NULL) {
+            return -1; /* name nur bei FUNCTION sinnvoll */
+        }
+    }
+    if (p->has_response_format && p->response_format_type == NULL) {
+        return -1;
     }
     return 0;
 }
@@ -230,8 +303,53 @@ static cJSON *message_to_json(const OaiMessage *msg)
     if (cJSON_AddStringToObject(m, "role", role_str(msg->role)) == NULL) {
         goto fail;
     }
-    if (msg->content != NULL &&
-        cJSON_AddStringToObject(m, "content", msg->content) == NULL) {
+    if (msg->content_parts_len > 0) {
+        /* multimodaler content: array aus text- und image-parts (vision) */
+        cJSON *parts = cJSON_AddArrayToObject(m, "content");
+        if (parts == NULL) {
+            goto fail;
+        }
+        for (size_t i = 0; i < msg->content_parts_len; i++) {
+            const OaiContentPart *part = &msg->content_parts[i];
+            cJSON *obj = cJSON_CreateObject();
+            if (obj == NULL) {
+                goto fail;
+            }
+            if (part->type == OAI_CONTENT_IMAGE_URL) {
+                bool ok =
+                    cJSON_AddStringToObject(obj, "type", "image_url") != NULL;
+                cJSON *img = NULL;
+                if (ok) {
+                    img = cJSON_AddObjectToObject(obj, "image_url");
+                    ok = img != NULL;
+                }
+                if (ok && cJSON_AddStringToObject(img, "url",
+                                                  part->image_url) == NULL) {
+                    ok = false;
+                }
+                if (ok && part->detail != NULL &&
+                    cJSON_AddStringToObject(img, "detail", part->detail) ==
+                        NULL) {
+                    ok = false;
+                }
+                if (!ok) {
+                    cJSON_Delete(obj);
+                    goto fail;
+                }
+            } else {
+                if (cJSON_AddStringToObject(obj, "type", "text") == NULL ||
+                    cJSON_AddStringToObject(obj, "text", part->text) == NULL) {
+                    cJSON_Delete(obj);
+                    goto fail;
+                }
+            }
+            if (cJSON_AddItemToArray(parts, obj) == 0) {
+                cJSON_Delete(obj);
+                goto fail;
+            }
+        }
+    } else if (msg->content != NULL &&
+               cJSON_AddStringToObject(m, "content", msg->content) == NULL) {
         goto fail;
     }
     if (msg->name != NULL &&
@@ -251,11 +369,15 @@ static cJSON *message_to_json(const OaiMessage *msg)
         for (size_t i = 0; i < msg->tool_calls_len; i++) {
             const OaiToolCall *src = &msg->tool_calls[i];
             cJSON *call = cJSON_CreateObject();
-            cJSON *function =
-                call != NULL ? cJSON_AddObjectToObject(call, "function") : NULL;
-            if (call == NULL || function == NULL ||
+            cJSON *function = NULL;
+            if (call == NULL ||
                 cJSON_AddStringToObject(call, "id", src->id) == NULL ||
-                cJSON_AddStringToObject(call, "type", "function") == NULL ||
+                cJSON_AddStringToObject(call, "type", "function") == NULL) {
+                cJSON_Delete(call);
+                goto fail;
+            }
+            function = cJSON_AddObjectToObject(call, "function");
+            if (function == NULL ||
                 cJSON_AddStringToObject(function, "name", src->name) == NULL ||
                 cJSON_AddStringToObject(function, "arguments",
                                         src->arguments) == NULL) {
@@ -347,6 +469,72 @@ static cJSON *params_to_json(const OaiChatCompletionParams *p, bool stream)
         goto out;
     }
 
+    if (p->has_tool_choice) {
+        switch (p->tool_choice) {
+        case OAI_TOOL_CHOICE_AUTO:
+        case OAI_TOOL_CHOICE_NONE:
+        case OAI_TOOL_CHOICE_REQUIRED: {
+            const char *choice = "auto";
+            if (p->tool_choice == OAI_TOOL_CHOICE_NONE) {
+                choice = "none";
+            } else if (p->tool_choice == OAI_TOOL_CHOICE_REQUIRED) {
+                choice = "required";
+            }
+            if (cJSON_AddStringToObject(root, "tool_choice", choice) == NULL) {
+                goto out;
+            }
+            break;
+        }
+        case OAI_TOOL_CHOICE_FUNCTION: {
+            cJSON *tc = cJSON_AddObjectToObject(root, "tool_choice");
+            cJSON *fn = NULL;
+            if (tc != NULL &&
+                cJSON_AddStringToObject(tc, "type", "function") != NULL) {
+                fn = cJSON_AddObjectToObject(tc, "function");
+            }
+            if (fn == NULL ||
+                cJSON_AddStringToObject(fn, "name", p->tool_choice_function) ==
+                    NULL) {
+                goto out;
+            }
+            break;
+        }
+        }
+    }
+    if (p->has_parallel_tool_calls &&
+        cJSON_AddBoolToObject(root, "parallel_tool_calls",
+                              (cJSON_bool)p->parallel_tool_calls) == NULL) {
+        goto out;
+    }
+    if (p->has_seed &&
+        cJSON_AddNumberToObject(root, "seed", (double)p->seed) == NULL) {
+        goto out;
+    }
+    if (p->has_response_format) {
+        cJSON *rf = cJSON_AddObjectToObject(root, "response_format");
+        if (rf == NULL || cJSON_AddStringToObject(
+                              rf, "type", p->response_format_type) == NULL) {
+            goto out;
+        }
+        if (p->response_format_json_schema != NULL) {
+            cJSON *schema = cJSON_Parse(p->response_format_json_schema);
+            if (schema == NULL) {
+                goto out;
+            }
+            if (cJSON_AddItemToObject(rf, "json_schema", schema) == 0) {
+                cJSON_Delete(schema);
+                goto out;
+            }
+        }
+    }
+    if (stream && p->include_usage) {
+        cJSON *so = cJSON_AddObjectToObject(root, "stream_options");
+        if (so == NULL ||
+            cJSON_AddBoolToObject(so, "include_usage", true) == NULL) {
+            goto out;
+        }
+    }
+
     if (p->tools_len > 0) {
         tools = cJSON_AddArrayToObject(root, "tools");
         if (tools == NULL) {
@@ -355,10 +543,12 @@ static cJSON *params_to_json(const OaiChatCompletionParams *p, bool stream)
         for (size_t i = 0; i < p->tools_len; i++) {
             const OaiToolFunction *fn = &p->tools[i].function;
             cJSON *tool = cJSON_CreateObject();
-            cJSON *function =
-                tool != NULL ? cJSON_AddObjectToObject(tool, "function") : NULL;
-            if (tool == NULL || function == NULL ||
-                cJSON_AddStringToObject(tool, "type", "function") == NULL ||
+            cJSON *function = NULL;
+            if (tool != NULL &&
+                cJSON_AddStringToObject(tool, "type", "function") != NULL) {
+                function = cJSON_AddObjectToObject(tool, "function");
+            }
+            if (function == NULL ||
                 cJSON_AddStringToObject(function, "name", fn->name) == NULL) {
                 cJSON_Delete(tool);
                 goto out;
@@ -451,6 +641,42 @@ static int parse_tool_calls(const cJSON *arr, OaiToolCall **out,
     return 0;
 }
 
+/* content einer nachricht/delta: string ODER (neuere api) array aus    */
+/* content-parts. bei arrays werden text-parts konkateniert, so dass     */
+/* content am ende immer ein string (oder NULL) ist.                   */
+static char *get_content_dup(const cJSON *obj)
+{
+    const cJSON *content = cJSON_GetObjectItemCaseSensitive(obj, "content");
+    if (cJSON_IsString(content) && content->valuestring != NULL) {
+        return dup_cstr(content->valuestring);
+    }
+    if (cJSON_IsArray(content)) {
+        Buf b = {0};
+        const cJSON *item;
+        cJSON_ArrayForEach(item, content)
+        {
+            if (cJSON_IsString(item) && item->valuestring != NULL) {
+                if (buf_append(&b, item->valuestring,
+                               strlen(item->valuestring)) != 0) {
+                    free(b.buf);
+                    return NULL;
+                }
+            } else {
+                const cJSON *text =
+                    cJSON_GetObjectItemCaseSensitive(item, "text");
+                if (cJSON_IsString(text) && text->valuestring != NULL &&
+                    buf_append(&b, text->valuestring,
+                               strlen(text->valuestring)) != 0) {
+                    free(b.buf);
+                    return NULL;
+                }
+            }
+        }
+        return b.buf; /* NULL bei leerem array (content: []) */
+    }
+    return NULL;
+}
+
 /* tool-call-deltas (stream): {index, id, function: {name, arguments}} */
 static int parse_chunk_tool_calls(const cJSON *arr, OaiChunkToolCall **out,
                                   size_t *out_len)
@@ -496,6 +722,16 @@ static int parse_chunk(const cJSON *root, OaiChatCompletionChunk *out)
     out->id = get_string_dup(root, "id");
     out->model = get_string_dup(root, "model");
 
+    /* usage-chunk (stream_options.include_usage): letzter chunk mit     */
+    /* token-zaehlung und leerem choices-array                            */
+    const cJSON *usage = cJSON_GetObjectItemCaseSensitive(root, "usage");
+    if (cJSON_IsObject(usage)) {
+        out->has_usage = true;
+        out->usage.prompt_tokens = get_int(usage, "prompt_tokens", 0);
+        out->usage.completion_tokens = get_int(usage, "completion_tokens", 0);
+        out->usage.total_tokens = get_int(usage, "total_tokens", 0);
+    }
+
     const cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
     if (!cJSON_IsArray(choices)) {
         return 0; /* tolerieren: manche chunks haben keine choices */
@@ -525,7 +761,7 @@ static int parse_chunk(const cJSON *root, OaiChatCompletionChunk *out)
         const cJSON *delta = cJSON_GetObjectItemCaseSensitive(item, "delta");
         if (cJSON_IsObject(delta)) {
             choice->role = get_string_dup(delta, "role");
-            choice->content_delta = get_string_dup(delta, "content");
+            choice->content_delta = get_content_dup(delta);
             if (parse_chunk_tool_calls(
                     cJSON_GetObjectItemCaseSensitive(delta, "tool_calls"),
                     &choice->tool_call_deltas,
@@ -572,7 +808,7 @@ static int parse_completion(const cJSON *root, OaiChatCompletion *out)
         const cJSON *msg = cJSON_GetObjectItemCaseSensitive(item, "message");
         if (cJSON_IsObject(msg)) {
             choice->message.role = get_string_dup(msg, "role");
-            choice->message.content = get_string_dup(msg, "content");
+            choice->message.content = get_content_dup(msg);
             if (parse_tool_calls(
                     cJSON_GetObjectItemCaseSensitive(msg, "tool_calls"),
                     &choice->message.tool_calls,
@@ -698,6 +934,11 @@ static void sse_handle_event(RequestState *st, const char *event)
                 payload++;
                 payload_len--;
             }
+            /* trailing \r ist schon entfernt; spaces am zeilenende sind    */
+            /* fuer [DONE]-erkennung und json-payloads bedeutungslos         */
+            while (payload_len > 0 && payload[payload_len - 1] == ' ') {
+                payload_len--;
+            }
             if (payload_len == 6 && strncmp(payload, "[DONE]", 6) == 0) {
                 done = true;
             } else if (payload_len > 0) {
@@ -797,9 +1038,17 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *ud)
 {
     RequestState *st = ud;
     size_t total = size * nmemb;
+
+    /* body-deckel: schuetzt vor OOM durch fehlleitende/robuste server */
+    long cap = st->client->max_body_bytes;
+    if (cap > 0 && st->body->len + total > (size_t)cap) {
+        st->overflow = true;
+        return 0;
+    }
     if (buf_append(st->body, ptr, total) != 0) {
         return 0; /* speicherfehler -> curl bricht die uebertragung ab */
     }
+    st->last_activity = mono_now();
     if (st->stream) {
         sse_process(st);
     }
@@ -807,6 +1056,63 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *ud)
         return 0; /* callback wollte abbrechen */
     }
     return total;
+}
+
+/* response-header nach retry-after / retry-after-ms durchsuchen, damit */
+/* das backoff dem server-wunsch folgt (wie im npm-package). letzte      */
+/* zeile gewinnt (bei mehrfacher uebermittlung, z.B. 1xx + final).        */
+static size_t header_cb(char *ptr, size_t size, size_t nmemb, void *ud)
+{
+    RequestState *st = ud;
+    size_t total = size * nmemb;
+
+    const char *val = NULL;
+    size_t vlen = 0;
+    if (total >= 16 && strncasecmp(ptr, "retry-after-ms:", 16) == 0) {
+        val = ptr + 16;
+        vlen = total - 16;
+    } else if (total >= 12 && strncasecmp(ptr, "retry-after:", 12) == 0) {
+        val = ptr + 12;
+        vlen = total - 12;
+    }
+    if (val == NULL) {
+        return total;
+    }
+    while (vlen > 0 && (*val == ' ' || *val == '\t')) {
+        val++;
+        vlen--;
+    }
+    while (vlen > 0 && (val[vlen - 1] == '\r' || val[vlen - 1] == '\n' ||
+                        val[vlen - 1] == ' ' || val[vlen - 1] == '\t')) {
+        vlen--;
+    }
+    if (vlen == 0 || vlen >= sizeof st->retry_after) {
+        return total;
+    }
+    memcpy(st->retry_after, val, vlen);
+    st->retry_after[vlen] = '\0';
+    st->last_activity = mono_now();
+    return total;
+}
+
+/* idle-watchdog: ruft curl regelmaessig auf (~100ms), auch wenn der  */
+/* socket stille ist. rueckgabe != 0 bricht die uebertragung ab      */
+/* (CURLE_ABORTED_BY_CALLBACK). genauer als CURLOPT_LOW_SPEED_*     */
+/* (das erst nach ~6s zusaetzlich reagiert).                        */
+static int xferinfo_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+                       curl_off_t ultotal, curl_off_t ulnow)
+{
+    (void)dltotal;
+    (void)dlnow;
+    (void)ultotal;
+    (void)ulnow;
+    RequestState *st = ud;
+    if (mono_now() - st->last_activity >
+        (double)st->client->stream_idle_timeout_ms / 1000.0) {
+        st->idle_hit = true;
+        return 1;
+    }
+    return 0;
 }
 
 /* eine einzelne http-anfrage. alle ergebnisse (erfolg und fehler)     */
@@ -823,6 +1129,11 @@ static void perform_once( // NOLINT(readability-function-size)
     st->sse_pos = 0;
     st->sse_done = false;
     st->aborted = false;
+    st->no_retry = false;
+    st->overflow = false;
+    st->idle_hit = false;
+    st->last_activity = mono_now();
+    st->retry_after[0] = '\0';
 
     char *json = NULL;
     char *url = NULL;
@@ -837,14 +1148,18 @@ static void perform_once( // NOLINT(readability-function-size)
 
     cJSON *payload = params_to_json(st->params, st->stream);
     if (payload == NULL) {
+        /* deterministisch (invalides schema oder oom): retry unnoetig */
+        st->no_retry = true;
         result_set_error(result, 0,
                          "anfrage konnte nicht aufgebaut werden "
-                         "(out of memory oder ungueltiges tool-schema)");
+                         "(out of memory, ungueltiges tool-schema oder "
+                         "response-format)");
         goto out;
     }
     json = cJSON_PrintUnformatted(payload);
     cJSON_Delete(payload);
     if (json == NULL) {
+        st->no_retry = true;
         result_set_error(result, 0, "out of memory beim json-aufbau");
         goto out;
     }
@@ -890,16 +1205,24 @@ static void perform_once( // NOLINT(readability-function-size)
         snprintf(auth, auth_len, "Authorization: Bearer %s",
                  st->client->api_key);
     }
-    headers = curl_slist_append(NULL, "Content-Type: application/json");
-    if (headers != NULL) {
-        headers = curl_slist_append(headers, "Accept: application/json");
-    }
-    if (headers != NULL) {
-        headers = curl_slist_append(headers, auth);
-    }
-    if (headers == NULL) {
-        result_set_error(result, 0, "out of memory bei headers");
-        goto out;
+    /* append-chain ohne leck und ohne stummen verlust einzelner header: */
+    /* `headers` bleibt immer auf der letzten gueltigen liste (wird bei  */
+    /* out: gefreet), `tmp` rollt voran; schlaegt ein append fehl, wird */
+    /* die ganze anfrage abgebrochen.                                   */
+    {
+        struct curl_slist *tmp = NULL;
+        headers = curl_slist_append(NULL, "Content-Type: application/json");
+        if (headers != NULL) {
+            tmp = curl_slist_append(headers, "Accept: application/json");
+        }
+        if (tmp != NULL) {
+            tmp = curl_slist_append(tmp, auth);
+        }
+        if (tmp == NULL) {
+            result_set_error(result, 0, "out of memory bei headers");
+            goto out;
+        }
+        headers = tmp;
     }
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -910,13 +1233,22 @@ static void perform_once( // NOLINT(readability-function-size)
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); /* gzip/deflate */
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, st);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, st);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
     if (st->stream) {
         /* gesamt-timeout wuerde lange streams abwuergen; deshalb nur  */
-        /* ein connect-timeout                                         */
+        /* ein connect-timeout. gegen haengende streams gibt es einen   */
+        /* idle-watchdog: xferinfo_cb wird auch bei stillem socket      */
+        /* regelmaessig gerufen und bricht bei datenstillstand ab      */
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
                          OAI_STREAM_CONNECT_TIMEOUT_MS);
+        if (st->client->stream_idle_timeout_ms > 0) {
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
+            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, st);
+        }
     } else {
         curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, st->client->timeout_ms);
     }
@@ -932,7 +1264,24 @@ static void perform_once( // NOLINT(readability-function-size)
         goto out;
     }
 
+    if (st->overflow) {
+        st->no_retry = true; /* gleiches ergebnis beim retry */
+        result_set_error(result, 0,
+                         "antwort zu gross: limit von %ld bytes "
+                         "ueberschritten",
+                         st->client->max_body_bytes);
+        goto out;
+    }
+
     if (cret != CURLE_OK) {
+        if (st->idle_hit) {
+            result_set_error(
+                result, 0,
+                "stream-idle-timeout: seit %ld ms keine daten mehr "
+                "empfangen",
+                st->client->stream_idle_timeout_ms);
+            goto out;
+        }
         const char *detail =
             errbuf[0] != '\0' ? errbuf : curl_easy_strerror(cret);
         result_set_error(result, 0, "verbindungsfehler: %s", detail);
@@ -995,7 +1344,9 @@ out:
 
 static bool http_retryable(long status)
 {
-    if (status == 408 || status == 429 || status >= 500) {
+    /* npm shouldRetry: 408 (request timeout), 409 (lock timeout),      */
+    /* 429 (rate limit), >= 500 (internal errors)                        */
+    if (status == 408 || status == 409 || status == 429 || status >= 500) {
         return true;
     }
     return false;
@@ -1018,14 +1369,14 @@ static void perform_with_retries(RequestState *st)
         if (!retryable) {
             retryable = http_retryable(status);
         }
-        if (!retryable || attempt >= st->client->max_retries ||
+        if (!retryable || st->no_retry || attempt >= st->client->max_retries ||
             (st->stream && st->chunks_delivered > 0)) {
             return;
         }
 
         oai_completion_result_free(st->result);
         memset(st->result, 0, sizeof *st->result);
-        backoff_sleep(attempt);
+        backoff_sleep(attempt, st->retry_after);
     }
 }
 
@@ -1073,6 +1424,14 @@ int oai_client_init(OaiClient *client, const OaiClientOptions *options)
         options->timeout_ms > 0 ? options->timeout_ms : OAI_DEFAULT_TIMEOUT_MS;
     client->max_retries = options->max_retries >= 0 ? options->max_retries
                                                     : OAI_DEFAULT_MAX_RETRIES;
+    client->stream_idle_timeout_ms = options->stream_idle_timeout_ms;
+    if (client->stream_idle_timeout_ms == 0) {
+        client->stream_idle_timeout_ms = OAI_DEFAULT_STREAM_IDLE_MS;
+    }
+    client->max_body_bytes = options->max_body_bytes;
+    if (client->max_body_bytes == 0) {
+        client->max_body_bytes = OAI_DEFAULT_MAX_BODY_BYTES;
+    }
     return 0;
 }
 
@@ -1138,6 +1497,21 @@ int oai_chat_completions_create_stream(const OaiClient *client,
             }
             cJSON_Delete(test);
         }
+    }
+
+    /* gleiches fruehwarnsystem fuer das response-format-schema        */
+    if (params->has_response_format &&
+        params->response_format_json_schema != NULL) {
+        cJSON *test = cJSON_Parse(params->response_format_json_schema);
+        if (test == NULL) {
+            if (callbacks->on_error != NULL) {
+                callbacks->on_error(0,
+                                    "ungueltiges response_format_json_schema",
+                                    callbacks->user_data);
+            }
+            return -1;
+        }
+        cJSON_Delete(test);
     }
 
     OaiCompletionResult result;

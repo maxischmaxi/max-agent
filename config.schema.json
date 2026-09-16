@@ -1,0 +1,102 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://raw.githubusercontent.com/maxischmaxi/max-agent/main/config.schema.json",
+    "title": "max agent config",
+    "description": "Konfiguration von max agent (~/.config/.maxagent/config.json)",
+    "type": "object",
+    "properties": {
+        "$schema": {
+            "type": "string",
+            "description": "Verweis auf diese Schema-Definition (wird von der App beim Speichern erhalten)"
+        },
+        "providers": {
+            "type": "array",
+            "description": "API-Anbieter und ihre Modelle",
+            "items": {
+                "type": "object",
+                "required": ["models"],
+                "properties": {
+                    "api": {
+                        "type": "string",
+                        "description": "API-Protokoll",
+                        "enum": ["openai-completions"],
+                        "default": "openai-completions"
+                    },
+                    "apiKey": {
+                        "type": "string",
+                        "description": "API-Key (OpenAI, OpenRouter, ...). Ollama/vLLM ignorieren das Feld meist ('ollama')"
+                    },
+                    "baseUrl": {
+                        "type": "string",
+                        "description": "Basis-URL der API. Ohne trailing slash. Standard: https://api.openai.com/v1. Ollama: http://localhost:11434/v1",
+                        "pattern": "^https?://.*"
+                    },
+                    "models": {
+                        "type": "array",
+                        "description": "Modelle, die der models-Dialog anbietet",
+                        "items": {
+                            "type": "object",
+                            "required": ["id"],
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Modell-ID, wie sie die API erwartet (z.B. gpt-4o-mini, llama3.1:8b)"
+                                },
+                                "contextWindow": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "Kontextfenster in Tokens"
+                                },
+                                "reasoning": {
+                                    "type": "boolean",
+                                    "description": "Modell kann explizit denken (Anzeige im models-Dialog)",
+                                    "default": false
+                                },
+                                "input": {
+                                    "type": "array",
+                                    "description": "Unterstützte Eingabetypen",
+                                    "items": {
+                                        "type": "string",
+                                        "enum": ["text", "image", "video"]
+                                    },
+                                    "default": []
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "settings": {
+            "type": "object",
+            "properties": {
+                "theme": {
+                    "type": "string",
+                    "description": "Farbschema: 'auto' leitet vom Terminal ab, sonst ein benanntes Theme",
+                    "enum": [
+                        "auto",
+                        "catppuccin",
+                        "tokyo-night",
+                        "github-dark",
+                        "dracula",
+                        "gruvbox"
+                    ],
+                    "default": "auto"
+                },
+                "confirmQuit": {
+                    "type": "boolean",
+                    "description": "Ctrl+C muss doppelt bestätigt werden",
+                    "default": true
+                },
+                "activeModel": {
+                    "type": "string",
+                    "description": "ID des aktuell gewählten Modells (wird vom models-Dialog gesetzt)"
+                },
+                "systemPrompt": {
+                    "type": "string",
+                    "description": "Eigener System-Prompt. NULL/fehlt = eingebaute Vorlage, leerer String = deaktiviert"
+                }
+            }
+        }
+    }
+}

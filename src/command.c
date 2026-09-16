@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "chat.h"
 #include "state.h"
 
 int cmd_name_col(void)
@@ -46,6 +47,9 @@ void cmd_clear(AppState *state)
 {
     input_reset(&state->input); /* draw() schreibt eh jeden frame
                                  * komplett, "clear" = input leeren */
+    chat_clear(&state->chat);   /* "start a new session": verlauf weg */
+    state->chat_scroll = 0;
+    state->ctx.dropped = 0; /* neuer verlauf, nichts mehr gekuerzt */
 }
 
 void cmd_models(AppState *state)

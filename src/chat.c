@@ -1,0 +1,386 @@
+#include "chat.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "utils.h"
+
+/* ------------------------------------------------------------------ */
+/* wachstum: kapazitaet verdoppeln, startwert 8. wie ueblich bleibt  */
+/* chat->msgs NULL, solange nichts angehaengt wurde (zero-init ok).  */
+/* ------------------------------------------------------------------ */
+bool chat_role_sent(ChatRole role)
+{
+    switch (role) {
+    case CHAT_ROLE_SYSTEM:
+    case CHAT_ROLE_USER:
+    case CHAT_ROLE_ASSISTANT:
+    case CHAT_ROLE_TOOL:
+        return true;
+    case CHAT_ROLE_ERROR:
+    case CHAT_ROLE_NOTICE:
+        return false;
+    }
+    return false;
+}
+
+static int chat_reserve(Chat *chat, size_t need)
+{
+    if (chat->cap >= need) {
+        return 0;
+    }
+    size_t cap = (chat->cap > 0) ? chat->cap : 8;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            return -1;
+        }
+        cap *= 2;
+    }
+    /* sizeof *msgs kann 0 theoretisch nicht sein, aber die pruefung
+     * schuetzt gegen kapazitaets-overflow beim realloc */
+    if (cap > SIZE_MAX / sizeof *chat->msgs) {
+        return -1;
+    }
+    ChatMessage *msgs = realloc(chat->msgs, cap * sizeof *msgs);
+    if (msgs == NULL) {
+        return -1;
+    }
+    chat->msgs = msgs;
+    chat->cap = cap;
+    return 0;
+}
+
+int chat_append(Chat *chat, ChatRole role, const char *text)
+{
+    if (text == NULL || chat_reserve(chat, chat->len + 1) != 0) {
+        return -1;
+    }
+    /* CR hat im frame-buffer nichts verloren (es wuerde den zeilen-
+     * cursor des terminals in spalte 0 zurueckwerfen): beim anhaengen
+     * rausfiltern. n ist nur die obere grenze, der rest passt immer. */
+    size_t n = strlen(text) + 1;
+    char *copy = malloc(n);
+    if (copy == NULL) {
+        return -1;
+    }
+    char *p = copy;
+    for (const char *s = text; *s != '\0'; s++) {
+        if (*s != '\r') {
+            *p++ = *s;
+        }
+    }
+    *p = '\0';
+    ChatMessage *m = &chat->msgs[chat->len];
+    m->role = role;
+    m->text = copy;
+    m->tool_calls = NULL;
+    m->tool_calls_len = 0;
+    m->tool_call_id = NULL;
+    chat->len++;
+    return 0;
+}
+
+int chat_append_tool(Chat *chat, const char *tool_call_id, const char *result)
+{
+    if (tool_call_id == NULL || result == NULL) {
+        return -1;
+    }
+    if (chat_append(chat, CHAT_ROLE_TOOL, result) != 0) {
+        return -1;
+    }
+    ChatMessage *m = &chat->msgs[chat->len - 1];
+    m->tool_call_id = dup_str(tool_call_id);
+    if (m->tool_call_id == NULL) {
+        chat_pop(chat);
+        return -1;
+    }
+    return 0;
+}
+
+/* alle heap-felder einer nachricht freigeben und auf NULL setzen */
+static void msg_free_fields(ChatMessage *m)
+{
+    for (size_t i = 0; i < m->tool_calls_len; i++) {
+        free(m->tool_calls[i].id);
+        free(m->tool_calls[i].name);
+        free(m->tool_calls[i].arguments);
+    }
+    free(m->tool_calls);
+    m->tool_calls = NULL;
+    m->tool_calls_len = 0;
+    free(m->tool_call_id);
+    m->tool_call_id = NULL;
+    free(m->text);
+    m->text = NULL;
+}
+
+bool chat_pop(Chat *chat)
+{
+    if (chat->len == 0) {
+        return false;
+    }
+    chat->len--;
+    msg_free_fields(&chat->msgs[chat->len]);
+    return true;
+}
+
+bool chat_append_text(Chat *chat, const char *text)
+{
+    if (chat == NULL || chat->len == 0) {
+        return false; /* nichts zum anhaengen */
+    }
+    if (text == NULL) {
+        return false;
+    }
+    ChatMessage *m = &chat->msgs[chat->len - 1];
+    if (m->text == NULL) {
+        return false; /* darf laut invariant nicht passieren */
+    }
+    size_t old_len = strlen(m->text);
+    size_t add = strlen(text);
+    if (add == 0) {
+        return true; /* no-op, aber kein fehler */
+    }
+    if (add > SIZE_MAX - old_len - 1) {
+        return false; /* laenge ueberlaeuft size_t */
+    }
+    /* realloc: die nachricht bleibt die letzte, das msgs-array
+     * (und damit alle anderen text-pointer) bewegt sich nicht –
+     * die vom sende-modul geborgten pointer bleiben gueltig */
+    char *grown = realloc(m->text, old_len + add + 1);
+    if (grown == NULL) {
+        return false;
+    }
+    memcpy(grown + old_len, text, add + 1);
+    m->text = grown;
+    return true;
+}
+
+void chat_clear(Chat *chat)
+{
+    for (size_t i = 0; i < chat->len; i++) {
+        msg_free_fields(&chat->msgs[i]);
+    }
+    chat->len = 0;
+}
+
+void chat_free(Chat *chat)
+{
+    chat_clear(chat);
+    free(chat->msgs);
+    chat->msgs = NULL;
+    chat->cap = 0;
+}
+
+int chat_set_tool_calls(Chat *chat, ChatToolCall *calls, size_t len)
+{
+    if (chat == NULL || chat->len == 0) {
+        return -1;
+    }
+    ChatMessage *m = &chat->msgs[chat->len - 1];
+    if (m->role != CHAT_ROLE_ASSISTANT) {
+        return -1; /* nur die antwort des modells traegt calls */
+    }
+    /* vorhandene calls (sollte keine geben) freigeben */
+    for (size_t i = 0; i < m->tool_calls_len; i++) {
+        free(m->tool_calls[i].id);
+        free(m->tool_calls[i].name);
+        free(m->tool_calls[i].arguments);
+    }
+    free(m->tool_calls);
+    m->tool_calls = calls;
+    m->tool_calls_len = len;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* input -> text: die zeilen des eingabefelds (input.c) mit '\n'     */
+/* joinen. eine eingabe, in der jede zeile leer ist, gilt als leer. */
+/* NULL-zeilen duerfen laut input-invariante nicht vorkommen, wir   */
+/* gehen trotzdem defensiv damit um (zaehlen als leer).             */
+/* ------------------------------------------------------------------ */
+char *chat_flatten_input(const Input *in)
+{
+    /* total = summe der laengen + (count - 1) trenner */
+    size_t total = 0;
+    bool any_text = false;
+    for (size_t i = 0; i < in->count; i++) {
+        size_t n = (in->lines[i] != NULL) ? strlen(in->lines[i]) : 0;
+        total += n;
+        if (n > 0) {
+            any_text = true;
+        }
+    }
+    if (!any_text) {
+        return NULL;
+    }
+    if (in->count > SIZE_MAX - total) {
+        return NULL; /* overflow: mehr zeilen als speicheradresse */
+    }
+    total += in->count; /* trenner + terminierung */
+
+    char *buf = malloc(total);
+    if (buf == NULL) {
+        return NULL;
+    }
+    char *p = buf;
+    for (size_t i = 0; i < in->count; i++) {
+        if (i > 0) {
+            *p++ = '\n';
+        }
+        if (in->lines[i] != NULL) {
+            size_t n = strlen(in->lines[i]);
+            memcpy(p, in->lines[i], n);
+            p += n;
+        }
+    }
+    *p = '\0';
+    return buf;
+}
+/* ------------------------------------------------------------------ */
+/* word-wrap                                                          */
+/*                                                                    */
+/* ein codepoint zaehlt als 1 sichtbare zelle. eine wcwidth-tabelle   */
+/* (CJK = 2 zellen, zero-width-combining) gibt es absichtlich nicht: */
+/* chat-text ist fast immer latein/emoji-mix und der fehler betraegt */
+/* nur die umbruchposition um ein paar zellen.                      */
+/* ------------------------------------------------------------------ */
+
+/* ein codepoint ab s: byte-laenge nach *bytes. defekte sequences
+ * (lead-byte ohne folge-bytes) zaehlen als einzelbyte, gelesen wird
+ * nie ueber den string-terminator hinaus. */
+static size_t utf8_step(const char *s, size_t *bytes)
+{
+    unsigned char c = (unsigned char)s[0];
+    size_t n = 1;
+    if ((c & 0xE0U) == 0xC0U) {
+        n = 2;
+    } else if ((c & 0xF0U) == 0xE0U) {
+        n = 3;
+    } else if ((c & 0xF8U) == 0xF0U) {
+        n = 4;
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (((unsigned char)s[i] & 0xC0U) != 0x80U) {
+            n = 1; /* abgebrochene sequenz: als einzelbyte zaehlen */
+            break;
+        }
+    }
+    *bytes = n;
+    return n;
+}
+
+/* eine zeile in die tabelle schreiben (bzw. nur mitzaehlen, wenn
+ * out NULL ist oder die arena voll) */
+static void wrap_emit(ChatRole role, size_t msg, size_t off, size_t len,
+                      bool first, int tool, ChatLine *out, size_t out_max,
+                      size_t *count)
+{
+    if (out != NULL && *count < out_max) {
+        out[*count].role = role;
+        out[*count].msg = msg;
+        out[*count].off = off;
+        out[*count].len = len;
+        out[*count].first = first;
+        out[*count].tool = tool;
+    }
+    (*count)++;
+}
+
+size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
+{
+    if (chat == NULL || width < 1) {
+        return 0;
+    }
+    size_t w = (size_t)width;
+    size_t count = 0;
+
+    for (size_t mi = 0; mi < chat->len; mi++) {
+        const char *text = chat->msgs[mi].text;
+        if (text == NULL) {
+            continue;
+        }
+        ChatRole role = chat->msgs[mi].role;
+        bool first = true;     /* erste zeile dieser nachricht */
+        size_t off = 0;        /* byte-offset des zeilenanfangs */
+        size_t cells = 0;      /* zellen seit dem zeilenanfang */
+        size_t brk = SIZE_MAX; /* offset des letzten passenden leerzeichens */
+        size_t i = 0;
+
+        while (text[i] != '\0') {
+            if (text[i] == '\r') {
+                /* CR sollte nie hier ankommen (chat_append filtert);
+                 * defensiv als zeilenumbruch werten statt es im text
+                 * zu belassen */
+                wrap_emit(role, mi, off, i - off, first, -1, out, out_max,
+                          &count);
+                first = false;
+                i++;
+                off = i;
+                cells = 0;
+                brk = SIZE_MAX;
+                continue;
+            }
+            if (text[i] == '\n') { /* erzwungener umbruch */
+                wrap_emit(role, mi, off, i - off, first, -1, out, out_max,
+                          &count);
+                first = false;
+                i++;
+                off = i;
+                cells = 0;
+                brk = SIZE_MAX;
+                continue;
+            }
+            if (text[i] == ' ') {
+                brk = i;
+            }
+            size_t blen;
+            (void)utf8_step(text + i, &blen);
+            if (cells + 1 > w) {
+                if (brk != SIZE_MAX && brk > off) {
+                    /* am letzten leerzeichen umbrechen; ein space-
+                     * run dahinter faellt ganz weg */
+                    wrap_emit(role, mi, off, brk - off, first, -1, out, out_max,
+                              &count);
+                    first = false;
+                    size_t next = brk + 1;
+                    while (text[next] == ' ') {
+                        next++;
+                    }
+                    i = next;
+                    off = next;
+                } else {
+                    /* kein umbruchpunkt in der zeile (ueberlanges
+                     * wort): hart an der breite brechen */
+                    wrap_emit(role, mi, off, i - off, first, -1, out, out_max,
+                              &count);
+                    first = false;
+                    off = i; /* i bleibt: das ueberlaufende zeichen */
+                             /* startet die naechste zeile         */
+                }
+                cells = 0;
+                brk = SIZE_MAX;
+                continue;
+            }
+            cells++;
+            i += blen;
+        }
+
+        /* rest der nachricht. endet der text auf '\n', entsteht dahinter
+         * KEINE leere zeile (off == i); eine nachricht ohne jede zeile
+         * (leerer text, z.B. streaming-platzhalter) bekommt genau eine
+         * leere erste zeile, damit der label alleine steht. */
+        if (off < i || first) {
+            wrap_emit(role, mi, off, i - off, first, -1, out, out_max, &count);
+        }
+
+        /* tool-calls der nachricht: je eine darstellungs-zeile nach
+         * dem text (die renderer in draw.c schneidet sie am rand ab) */
+        for (size_t t = 0; t < chat->msgs[mi].tool_calls_len; t++) {
+            wrap_emit(role, mi, 0, 0, first, (int)t, out, out_max, &count);
+        }
+    }
+    return count;
+}

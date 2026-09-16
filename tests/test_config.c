@@ -31,7 +31,8 @@ static int build_test_config(Config *cfg)
     cfg->theme = dup_str("tokyo-night");
     cfg->confirm_quit = false;
     cfg->active_model = dup_str("gpt-test");
-    if (!cfg->theme || !cfg->active_model) {
+    cfg->system_prompt = dup_str("du bist ein test-agent.");
+    if (!cfg->theme || !cfg->active_model || !cfg->system_prompt) {
         return -1;
     }
 
@@ -102,6 +103,23 @@ int main(void)
     CHECK(!loaded.confirm_quit);
     CHECK(loaded.active_model != NULL &&
           strcmp(loaded.active_model, "gpt-test") == 0);
+    CHECK(loaded.system_prompt != NULL &&
+          strcmp(loaded.system_prompt, "du bist ein test-agent.") == 0);
+
+    /* "$schema" an der wurzel ueberlebt das speichern (editor-
+     * linting der config muss die app-rewrites ueberdauern) */
+    cfg.schema_url =
+        dup_str("https://raw.githubusercontent.com/maxischmaxi/max-agent/main/"
+                "config.schema.json");
+    CHECK(cfg.schema_url != NULL);
+    CHECK(save_config_to(TEST_PATH, &cfg) == 0);
+    Config reloaded;
+    CHECK(load_config_from(TEST_PATH, &reloaded) == 0);
+    CHECK(reloaded.schema_url != NULL && cfg.schema_url != NULL &&
+          strcmp(reloaded.schema_url, cfg.schema_url) == 0);
+    CHECK(cfg.schema_url != NULL &&
+          strstr(cfg.schema_url, "config.schema.json") != NULL);
+    free_config(&reloaded);
 
     free_config(&cfg);
     free_config(&loaded);
