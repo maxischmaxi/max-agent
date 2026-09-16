@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "config.h"
+#include "debug.h"
 #include "draw.h"
 #include "input.h"
 #include "keys.h"
@@ -27,8 +28,24 @@ static void on_winch(int sig)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* --debug: trace nach /tmp (umbenannt auf die session-id,
+     * sobald die erste nachricht eine session oeffnet) */
+    bool debug = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) {
+            debug = true;
+        }
+    }
+    if (debug) {
+        char path[128];
+        (void)snprintf(path, sizeof path, "/tmp/max-agent-debug-%ld.log",
+                       (long)getpid());
+        dbg_init(path);
+    }
+    dbg("app start (argv[0]=%s)", (argc > 0) ? argv[0] : "?");
+
     /* der komplette app-zustand in einem objekt: flags, dialog-
      * cursor und die chat-eingabe (input_init setzt die erste
      * leere zeile) */
@@ -77,6 +94,7 @@ int main(void)
         if (state.resized) {
             state.resized = 0;
             term_size(&rows, &cols);
+            dbg("resize: %dx%d", rows, cols);
             /* KEIN \x1b[2J – der verlauf lebt im terminal-
              * scrollback. nur den renderer neu verankern */
             draw_reset(rows);

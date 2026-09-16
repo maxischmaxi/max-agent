@@ -11,6 +11,7 @@
 
 #include "chat.h"
 #include "command.h"
+#include "debug.h"
 #include "input.h"
 #include "send.h"
 #include "session.h"
@@ -26,8 +27,9 @@ static const char GLYPH_BLOCK[] = "\xE2\x96\x88";
  * nachrichtentexte starten damit in derselben spalte */
 #define MSG_PREFIX_W 5
 
-/* " > " bzw. "   " vor jeder eingabezeile */
-#define INPUT_PREFIX_W 3
+/* kein eingabe-praefix mehr: der text beginnt bei spalte 0 –
+ * diese spalte bleibt fuer den cursor-block am zeilenende frei */
+#define INPUT_PREFIX_W 0
 
 /* die zwei statuszeilen am unteren rand des docks */
 #define STATUS_H 2
@@ -117,6 +119,13 @@ static void flush_up(int n)
     flush_puts(buf);
 }
 
+static void flush_down(int n)
+{
+    char buf[16];
+    (void)snprintf(buf, sizeof buf, "\x1b[%dB", n);
+    flush_puts(buf);
+}
+
 /* den gesammelten frame als EIN write rauslassen */
 static void flush_out(void)
 {
@@ -158,6 +167,8 @@ static void row_quit(Row *r);
 static void row_msg(Row *r, const ChatLine *ln, const char *text);
 static void row_tool_call(Row *r, const ChatToolCall *call, const ChatLine *ln);
 static void row_busy_border(Row *r, long long busy_ms);
+static void row_tool_spinner(Row *r, long long busy_ms);
+static int exit_marker_of(const char *text, const ChatLine *ln);
 static void fmt_dur(long long ms, char *buf, size_t sz);
 static void fmt_when(long long ms, char *buf, size_t sz);
 
@@ -228,10 +239,8 @@ static void row_input(Row *r, const Input *in, int width, size_t idx)
     if (!input_screen_row(in, width, idx, &line, &off, &len)) {
         return; /* feld groesser als der text: leerzeile */
     }
-    /* das prompt-zeichen gehoert an den textanfang, nicht an jede
-     * umgebrochene zeile */
-    row_puts(r, (idx == 0) ? " > " : "   ");
-
+    /* KEIN prompt-zeichen: der benutzer tippt direkt am linken
+     * rand, der cursor-block steht hinter dem text */
     const char *text = in->lines[line] + off;
 
     size_t crow = 0;
@@ -684,9 +693,8 @@ static void row_msg(Row *r, const ChatLine *ln, const char *text)
 static void row_tool_call(Row *r, const ChatToolCall *call, const ChatLine *ln)
 {
     row_sgr(r, theme_role(THEME_ROLE_TOOL));
-    for (int i = 0; i < MSG_PREFIX_W; i++) {
-        row_putc(r, ' '); /* unter den labels, wie alle rollen-texte */
-    }
+    /* das label/indent liefert der aufrufer: bei "ai"-gelabelten
+     * calls steht der pfeil direkt dahinter */
     if (ln->off > 0) {
         for (int i = 0; i < TOOL_INDENT_W; i++) {
             row_putc(r, ' ');
@@ -714,6 +722,56 @@ static void fmt_dur(long long ms, char *buf, size_t sz)
     }
 }
 
+/* braille-lade-animation (10 frames): die rahmen-zeile des docks
+ * waehrend des turns und der live-spinner im chat laufen damit */
+static const char *const SPIN[] = {
+    "\xE2\xA0\x8B", "\xE2\xA0\x99", "\xE2\xA0\xB9", "\xE2\xA0\xB8",
+    "\xE2\xA0\xBC", "\xE2\xA0\xB4", "\xE2\xA0\xA6", "\xE2\xA0\xA7",
+    "\xE2\xA0\x87", "\xE2\xA0\x88",
+};
+
+static int spin_frame(long long busy_ms)
+{
+    return (int)((busy_ms / 100) % 10);
+}
+
+/* live-spinner im chat, waehrend die ki an einem tool arbeitet */
+static void row_tool_spinner(Row *r, long long busy_ms)
+{
+    row_puts(r, "     "); /* auf spalte MSG_PREFIX_W, wie der output */
+    row_sgr(r, theme_role(THEME_ROLE_DIM));
+    row_glyph(r, SPIN[spin_frame(busy_ms)]);
+    row_sgr(r, THEME_ROLE_RESET);
+}
+
+/* "[exit: N]": der bash-anhang. rueckgabe: N, oder -1 wenn dieser
+ * zeilenabschnitt KEIN exit-marker ist. die faerbung geschieht im
+ * renderer (gruen/rot); das model und das session-log sehen den
+ * text weiterhin unfaerbt. */
+static int exit_marker_of(const char *text, const ChatLine *ln)
+{
+    const char *s = text + ln->off;
+    size_t len = ln->len;
+    /* "[exit: N]": 7 zeichen rahmen + 1..3 ziffern */
+    if (len < 8 || len > 10) {
+        return -1;
+    }
+    if (s[0] != '[' || s[6] != ' ' || s[len - 1] != ']') {
+        return -1;
+    }
+    if (strncmp(s, "[exit", 5) != 0) {
+        return -1;
+    }
+    int code = 0;
+    for (size_t i = 7; i + 1 < len; i++) {
+        if (s[i] < '0' || s[i] > '9') {
+            return -1;
+        }
+        code = (code * 10) + (s[i] - '0');
+    }
+    return code;
+}
+
 /* obere rahmenzeile des eingabefelds, solange die ki arbeitet:
  * braille-spinner + laufende sekunden, dahinter der rest der
  * trennlinie. die animation tritt im watchdog-takt (~100ms, siehe
@@ -721,12 +779,7 @@ static void fmt_dur(long long ms, char *buf, size_t sz)
  * und kein chunk fliesst. */
 static void row_busy_border(Row *r, long long busy_ms)
 {
-    static const char *const SPIN[] = {
-        "\xE2\xA0\x8B", "\xE2\xA0\x99", "\xE2\xA0\xB9", "\xE2\xA0\xB8",
-        "\xE2\xA0\xBC", "\xE2\xA0\xB4", "\xE2\xA0\xA6", "\xE2\xA0\xA7",
-        "\xE2\xA0\x87", "\xE2\xA0\x88",
-    };
-    int frame = (int)((busy_ms / 100) % 10);
+    int frame = spin_frame(busy_ms);
     char dur[24];
     fmt_dur(busy_ms, dur, sizeof dur);
 
@@ -788,6 +841,8 @@ static size_t g_live_msg = 0; /* index der live-nachricht (nur mit
 static bool g_live_msg_valid = false;
 static size_t g_live_lines = 0;    /* davon bereits committete zeilen */
 static int g_prev_rows = 0;        /* live+dock-zeilen des letzten frames */
+static int g_busy_up = 0;          /* spinner-rahmen: zeilen ueber dem cursor */
+static int g_tool_spin_up = 0;     /* tool-spinner im chat: ueber dem cursor */
 static bool g_tail_only = false;   /* content ersetzt: schwanz drucken */
 static bool g_printed_any = false; /* es wurde schon content gedruckt:
                                     * die erste nachricht einer sitzung
@@ -819,6 +874,7 @@ void draw_content_reset(void)
 
 void draw_reset(int rows)
 {
+    dbg("draw: reset (%d zeilen scrollen)", rows);
     /* nach einem resize hat das terminal umgebrochen – der
      * relative cursor-zustand ist unbrauchbar. bis zum boden
      * scrollen (der cursor sitzt danach garantiert unten) und den
@@ -828,6 +884,8 @@ void draw_reset(int rows)
     }
     flush_out();
     g_prev_rows = 0;
+    g_busy_up = 0; /* layout ungueltig: nur volle frames */
+    g_tool_spin_up = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -881,6 +939,8 @@ typedef struct {
     int name_col;
     int sel_idx;       /* flacher index des angewaehlten eintrags */
     long long busy_ms; /* laufende arbeitszeit des turns (spinner) */
+    int busy_row_up;   /* spinner-rahmen: zeilen ueber dem geparkten
+                        * cursor (anker fuer den leichten tick) */
 } DockCtx;
 
 static const char *dlg_title(UIMode mode)
@@ -903,8 +963,8 @@ static const char *dlg_title(UIMode mode)
 
 int input_field_width(int cols)
 {
-    /* eine spalte mehr als umgebrochen wird: dort sitzt der
-     * cursor-block, wenn er am zeilenende steht */
+    /* INPUT_PREFIX_W ist 0: der text nutzt die volle breite minus
+     * die spalte, in der der cursor-block am zeilenende sitzt */
     int w = main_width(cols) - INPUT_PREFIX_W - 1;
     return (w > 0) ? w : 1;
 }
@@ -1098,6 +1158,7 @@ static int dock_build(int rows, int cols, AppState *st, const Config *cfg,
 
         if (n + in_h + 2 <= out_max) {
             if (st->busy) {
+                d->busy_row_up = n; /* index, am ende in 'up' umrechnen */
                 out_rows[n++] = (DockRow){DROW_BUSY_BORDER, 0, false};
             } else {
                 out_rows[n++] = (DockRow){DROW_BORDER, 0, false};
@@ -1160,6 +1221,11 @@ static int dock_build(int rows, int cols, AppState *st, const Config *cfg,
     }
     if (n < out_max) {
         out_rows[n++] = (DockRow){DROW_STATUS_TOKENS, 0, false};
+    }
+    /* spinner-rahmen in "zeilen ueber dem geparkten cursor" um-
+     * rechnen (anker fuer draw_busy_tick) */
+    if (d->busy_row_up > 0) {
+        d->busy_row_up = n - 1 - d->busy_row_up;
     }
     return n;
 }
@@ -1366,7 +1432,8 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
      *      die anfrage laeuft (streaming-platzhalter) ---- */
     size_t live_idx = SIZE_MAX;
     if (state->busy && chat->len > 0 &&
-        chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT) {
+        chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT &&
+        chat->msgs[chat->len - 1].tool_calls_len == 0) {
         live_idx = chat->len - 1;
     }
 
@@ -1428,28 +1495,82 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
         if (is_live && total > 0) {
             stop = total - 1;
         }
+        /* die erste VORHANDENE zeile der nachricht (separator-
+         *anker). eine leere assistant-nachricht mit tool-calls
+         * rendert ihre text-zeile nicht – das "ai"-label wandert
+         * auf die zeile des ersten calls */
+        const ChatMessage *m = &chat->msgs[mi];
+        size_t msg_first = s;
+        if (m->role == CHAT_ROLE_ASSISTANT && m->text[0] == '\0' &&
+            m->tool_calls_len > 0 && total > 0) {
+            msg_first = s + 1;
+        }
+
         for (size_t li = s + start; li < s + stop; li++) {
             /* leerzeile zwischen den nachrichten: sie gehoert zum
              * FERTIGEN content (druckt einmal, scrollt dann mit).
-             * `li == s` feuert nur bei der ersten zeile einer
-             * nachricht, nicht vor jeder umbruch-zeile; bei der
-             * live-nachricht mit start > 0 ist li > s – der abstand
-             * kam frueher, beim commit der ersten zeile. die erste
-             * nachricht einer sitzung beginnt ohne abstand. */
-            if (li == s && g_printed_any) {
+             * `li == msg_first` feuert nur bei der ersten GEDRUCK-
+             * TEN zeile einer nachricht; bei der live-nachricht
+             * mit start > 0 ist li > msg_first – der abstand kam
+             * frueher, beim commit der ersten zeile. */
+            if (li == msg_first && g_printed_any) {
                 row_start(main_w);
                 row_finish(true);
             }
-            row_start(main_w);
             const ChatLine *ln = &g_lines[li];
+            const ChatMessage *lm = &chat->msgs[ln->msg + from];
+
             if (ln->tool >= 0) {
-                row_tool_call(&g_row,
-                              &chat->msgs[ln->msg + from].tool_calls[ln->tool],
-                              ln);
+                /* tool-call-zeile: bei einer nachricht OHNE text
+                 * (die ki hat nur tools aufgerufen) steht das "ai"-
+                 * label direkt am ersten call – eine eigene zeile
+                 * nur fuer das label gibt es nicht */
+                row_start(main_w);
+                if (lm->role == CHAT_ROLE_ASSISTANT && lm->text[0] == '\0' &&
+                    ln->tool == 0 && ln->off == 0) {
+                    row_sgr(&g_row, theme_role(THEME_ROLE_ASSISTANT));
+                    row_puts(&g_row, "ai   ");
+                    row_sgr(&g_row, THEME_ROLE_RESET);
+                } else {
+                    for (int i = 0; i < MSG_PREFIX_W; i++) {
+                        row_putc(&g_row, ' ');
+                    }
+                }
+                row_tool_call(&g_row, &lm->tool_calls[ln->tool], ln);
+                row_finish(true);
+            } else if (lm->role == CHAT_ROLE_TOOL) {
+                /* tool-ergebnis: "output:" vor der ersten zeile,
+                 * dahinter der echte output, am ende der (von
+                 * bash angehaengte) exit-code gruen/rot */
+                if (ln->first) {
+                    row_start(main_w);
+                    row_sgr(&g_row, theme_role(THEME_ROLE_DIM));
+                    row_puts(&g_row, "     output:");
+                    row_sgr(&g_row, THEME_ROLE_RESET);
+                    row_finish(true);
+                }
+                row_start(main_w);
+                int code = exit_marker_of(lm->text, ln);
+                if (code >= 0) {
+                    row_puts(&g_row, "     ");
+                    row_sgr(&g_row, (code == 0) ? "\x1b[32m" : "\x1b[31m");
+                    row_putn(&g_row, lm->text + ln->off, (int)ln->len);
+                    row_sgr(&g_row, THEME_ROLE_RESET);
+                } else {
+                    row_puts(&g_row, "     ");
+                    row_putn(&g_row, lm->text + ln->off, (int)ln->len);
+                }
+                row_finish(true);
+            } else if (m->role == CHAT_ROLE_ASSISTANT && m->text[0] == '\0' &&
+                       m->tool_calls_len > 0 && ln->first) {
+                /* leere text-zeile einer call-nachricht: uebersprun-
+                 * gen, das label sitzt am ersten call */
+                continue;
             } else {
-                row_msg(&g_row, ln, chat->msgs[ln->msg + from].text);
+                row_start(main_w);
+                row_msg(&g_row, ln, lm->text);
+                row_finish(true);
             }
-            row_finish(true);
             g_printed_any = true;
         }
         if (is_live) {
@@ -1485,6 +1606,15 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
             }
         }
     }
+    bool tool_spin = false;
+    if (state->busy && state->tool_running) {
+        long long busy_ms =
+            (state->busy_start_ms > 0) ? mono_ms() - state->busy_start_ms : 0;
+        row_start(main_w);
+        row_tool_spinner(&g_row, busy_ms);
+        row_finish(true);
+        tool_spin = true;
+    }
 
     /* ---- dock (immer die letzten zeilen des frames) ---- */
     for (int i = 0; i < dock_n; i++) {
@@ -1496,15 +1626,66 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
     /* der naechste frame raeumt genau diesen bereich: live-zeile
      * (falls eine gedruckt wurde) plus dock */
     int live_rows = 0;
-    if (live_text) {
+    if (live_text || tool_spin) {
         live_rows = 1;
     }
     g_prev_rows = dock_n + live_rows;
+    /* anker fuer den leichten tick (draw_busy_tick): nur der tool-
+     * spinner im chat ist zeitgetrieben; das stream-ende aendert
+     * sich nur mit chunks (voller frame). der cursor parkt AUF der
+     * letzten dock-zeile: die live-zeile liegt g_prev_rows-1
+     * darueber (wie im erase-block) */
+    g_tool_spin_up = 0;
+    if (tool_spin) {
+        g_tool_spin_up = g_prev_rows - 1;
+    }
+    g_busy_up = 0;
+    if (state->busy) {
+        g_busy_up = d.busy_row_up;
+    }
+
+    dbg("frame: content+live=%d dock=%d printed=%zu", live_rows, dock_n,
+        g_printed);
 
     /* der ganze frame als EIN write: stdout am terminal ist
      * zeilen-gepuffert, ohne den sammler flackerte das geraeumte
      * dock bei jedem tastendruck zwischen erase und neuzeichnen.
      * der flush garantiert zusaetzlich, dass auch die letzte
      * dock-zeile (ohne umbruch) wirklich draussen ist. */
+    flush_out();
+}
+
+/* leichter frame, solange die ki arbeitet: nur die zeitgetriebenen
+ * zeilen (spinner-rahmen, tool-spinner im chat) werden an ort und
+ * stelle ueberschrieben – der rest des docks bleibt unberuehrt.
+ * der watchdog feuert ~10 ticks/s; ein VOLLER frame je tick
+ * liesse die ganze input-leiste flackern. bezugspunkt ist die
+ * geparkte cursor-position aus dem letzten vollen frame; nach
+ * resize sind die anker 0 und es wird doch voll gezeichnet. */
+void draw_busy_tick(int rows, int cols, AppState *state, const Config *cfg)
+{
+    if (!state->busy || g_busy_up <= 0) {
+        draw(rows, cols, state, cfg);
+        return;
+    }
+    int main_w = main_width(cols);
+    long long busy_ms =
+        (state->busy_start_ms > 0) ? mono_ms() - state->busy_start_ms : 0;
+
+    if (g_tool_spin_up > 0) {
+        /* chat-spinner unter dem call: direkt ueber dem dock */
+        flush_up(g_tool_spin_up);
+        row_start(main_w);
+        row_tool_spinner(&g_row, busy_ms);
+        row_finish(false);
+        flush_down(g_tool_spin_up - g_busy_up);
+    } else {
+        flush_up(g_busy_up);
+    }
+
+    row_start(main_w);
+    row_busy_border(&g_row, busy_ms);
+    row_finish(false);
+    flush_down(g_busy_up);
     flush_out();
 }

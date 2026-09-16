@@ -55,6 +55,8 @@ typedef struct {
                /* wort da ist                                          */
     long long busy_start_ms; /* mono-ms des turn-beginns; 0 = kein     */
                              /* laufender turn (spinner/sekunden)      */
+    bool tool_running;       /* die ki arbeitet an einem tool-call: die */
+                             /* live-zeile im chat zeigt einen spinner */
     long long worked_ms;     /* kumulierte zeit, die die ki in dieser  */
                              /* session gearbeitet hat (alle turns:   */
                              /* thinking, tool calls, antworten)      */

@@ -12,6 +12,7 @@
 #include "chat.h"
 #include "command.h"
 #include "config.h"
+#include "debug.h"
 #include "draw.h"
 #include "history.h"
 #include "send.h"
@@ -993,14 +994,14 @@ typedef struct {
 static void stream_redraw(void *ud)
 {
     StreamRedrawCtx *rc = ud;
-    /* der anker bleibt WAHREND der ganzen antwort aktiv: die
-     * wachsende antwort darf die gesendete nachricht nicht aus
-     * dem viewport druecken – auch nicht, wenn sie laenger wird
-     * als der viewport fasst (dann schneidet der hinten unten
-     * ab und der benutzer blaettert selbst hin). gehoben wird
-     * er erst durch blaettern, eine neue nachricht, /new oder
-     * resume. */
     draw(rc->rows, rc->cols, rc->state, rc->cfg);
+}
+
+/* leichter watchdog-frame: nur die spinner aktualisieren */
+static void stream_tick(void *ud)
+{
+    StreamRedrawCtx *rc = ud;
+    draw_busy_tick(rc->rows, rc->cols, rc->state, rc->cfg);
 }
 
 static void cmd_parse(const AppState *st, char *word, size_t word_sz,
@@ -1082,6 +1083,7 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
         free(entry);
 
         if (word[0] == '/') {
+            dbg("cmd: %s", word);
             switch (cmd_lookup(word)) {
             case CMD_CLEAR:
             case CMD_NEW:
@@ -1147,6 +1149,7 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
             input_reset(input);
             state->cmd_active = false;
             if (text != NULL) {
+                dbg("sende: %.80s", text);
                 if (chat_append(&state->chat, CHAT_ROLE_USER, text) != 0) {
                     die("out of memory");
                 }
@@ -1178,6 +1181,7 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
                 SendHooks hooks = {
                     .ctx = &rc,
                     .redraw = stream_redraw,
+                    .tick = stream_tick,
                 };
                 (void)send_stream(state, cfg, &hooks);
                 state->busy = false;
@@ -1381,6 +1385,11 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
 void handle_key(AppState *state, Config *cfg, int rows, int cols)
 {
     Key k = key_read();
+
+    /* jede taste ins debug-log: bei einem haenger sieht man hier,
+     * ob die tastatur noch ankommt und was die app als letztes
+     * bekommen hat */
+    dbg("key: kind=%d ch=%s", (int)k.kind, (k.kind == KEY_CHAR) ? k.ch : "");
 
     if (k.kind == KEY_CTRL_C) {
         handle_ctrl_c(state, cfg);

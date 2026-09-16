@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "debug.h"
 #include "utils.h"
 
 /* ------------------------------------------------------------------ */
@@ -320,6 +321,8 @@ int session_start(Session *s, const Config *cfg)
         session_reset_fields(s);
         return -1;
     }
+    dbg("session: start %s", s->id);
+    dbg_rename(s->id);
     return 0;
 }
 
@@ -388,6 +391,7 @@ static bool valid_id(const char *id)
 
 int session_open(Session *s, const char *id)
 {
+    dbg("session: open %s", (id != NULL) ? id : "(null)");
     if (id == NULL || id[0] == '\0' || strlen(id) >= sizeof s->id) {
         return -1;
     }
@@ -430,6 +434,9 @@ int session_open(Session *s, const char *id)
 
 void session_end(Session *s)
 {
+    if (s->active) {
+        dbg("session: end %s (%zu ereignisse)", s->id, s->messages);
+    }
     if (s->log != NULL) {
         (void)fflush(s->log);
         (void)fclose(s->log);
@@ -458,6 +465,7 @@ int session_rename(Session *s, const char *name)
     if (s->name == NULL) {
         return -1;
     }
+    dbg("session: rename -> %s", name);
     return meta_write(s);
 }
 

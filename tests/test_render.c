@@ -69,16 +69,20 @@ static void cap_strip(const char *raw, char *out_buf)
             }
             continue;
         }
-        if (raw[i] == '\r' || (unsigned char)raw[i] == 0xE2) {
-            /* \r und der utf-8-cursor-block (E2 96 88) */
-            if ((unsigned char)raw[i] == 0xE2 && raw[i + 1] == '\0') {
-                break;
-            }
-            if ((unsigned char)raw[i] == 0xE2) {
-                i += 3;
-                continue;
-            }
+        if (raw[i] == '\r') {
             i++;
+            continue;
+        }
+        /* der utf-8-cursor-block (E2 96 88) bleibt als zeichen
+         * stehen: die eingabezeile besteht ohne praefix NUR aus
+         * ihm – so zaehlt sie nicht als leerzeile */
+        if ((unsigned char)raw[i] == 0xE2 &&
+            (unsigned char)raw[i + 1] == 0x96 &&
+            (unsigned char)raw[i + 2] == 0x88) {
+            out_buf[o++] = raw[i];
+            out_buf[o++] = raw[i + 1];
+            out_buf[o++] = raw[i + 2];
+            i += 3;
             continue;
         }
         out_buf[o++] = raw[i++];
@@ -171,7 +175,7 @@ static void test_print_once(void)
     cap_close(&c);
     CHECK(strstr(c.text, "model") != NULL); /* statuszeilen */
     CHECK(strstr(c.text, "tokens") != NULL);
-    CHECK(strstr(c.text, "> ") != NULL); /* eingabefeld */
+    CHECK(strstr(c.text, "\xE2\x96\x88") != NULL); /* eingabefeld */
 
     /* user-nachricht: erscheint genau EINMAL */
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "hallo welt") == 0);
@@ -346,8 +350,35 @@ static void test_tool_rows(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(strstr(c.text, "bash({") != NULL);  /* tool-call-zeile */
-    CHECK(strstr(c.text, "tool hi") != NULL); /* ergebnis mit label */
+    /* "ai"-label und call in EINER zeile, der pfeil direkt dahinter
+     * – KEINE eigene ai-zeile fuer den leeren text */
+    CHECK(strstr(c.text, "ai   \xE2\x86\x92 bash({") != NULL);
+    /* "ai" genau zweimal: am call und an der antwort "fertig" */
+    CHECK(count_str(c.text, "ai   ") == 2);
+    /* ergebnis: "output:" vor dem inhalt, exit-code am ende */
+    CHECK(strstr(c.text, "output:") != NULL);
+    CHECK(strstr(c.text, "hi") != NULL);
+    CHECK(strstr(c.raw, "\x1b[32m[exit: 0]") != NULL); /* gruen bei 0 */
+
+    /* exit-code != 0: rot */
+    chat_clear(&st.chat);
+    draw_content_reset();
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "mach") == 0);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "") == 0);
+    ChatToolCall *call2 = calloc(1, sizeof *call2);
+    CHECK(call2 != NULL);
+    if (call2 == NULL) {
+        return;
+    }
+    call2->id = dup_str("c2");
+    call2->name = dup_str("bash");
+    call2->arguments = dup_str("{}");
+    CHECK(chat_set_tool_calls(&st.chat, call2, 1) == 0);
+    CHECK(chat_append_tool(&st.chat, "c2", "boese\n[exit: 3]") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.raw, "\x1b[31m[exit: 3]") != NULL); /* rot bei != 0 */
 
     cap_free(&c);
     input_free(&st.input);
@@ -602,6 +633,66 @@ static void test_tool_call_multiline(void)
     chat_free(&st.chat);
 }
 
+/* tool-spinner: laeuft die ki an einem tool, zeigt der chat (direkt
+ * unter dem call) einen live-spinner; der leichte tick aktualisiert
+ * nur ihn und die rahmen-zeile */
+static void test_tool_spinner(void)
+{
+    AppState st;
+    state_setup(&st);
+    Config cfg = {0};
+    Capture c;
+
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "mach") == 0);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "") == 0);
+    ChatToolCall *call = calloc(1, sizeof *call);
+    CHECK(call != NULL);
+    if (call == NULL) {
+        return;
+    }
+    call->id = dup_str("c");
+    call->name = dup_str("bash");
+    call->arguments = dup_str("{}");
+    CHECK(chat_set_tool_calls(&st.chat, call, 1) == 0);
+
+    st.busy = true;
+    st.tool_running = true;
+    st.busy_start_ms = 0; /* 0s: deterministischer spinner-frame */
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    /* der call ist committet (mit ai-label), darunter der live-
+     * spinner (5er-einrueckung; der rahmen-spinner der input-zeile
+     * sieht aehnlich aus, deshalb pruefen wir die einrueckung) */
+    CHECK(strstr(c.text, "ai   \xE2\x86\x92 bash({}") != NULL);
+    CHECK(strstr(c.text, "     \xE2\xA0\x8B") != NULL); /* spinner */
+
+    /* der leichte tick: KEIN voller frame (kein cursor-up um die
+     * ganze dock-hoehe + kein erase des docks), nur die spinner-
+     * zeilen an ort und stelle */
+    cap_open(&c);
+    draw_busy_tick(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.text, "     \xE2\xA0\x8B") != NULL); /* spinner dabei */
+    /* KEIN voller erase (up + alle zeilen loeschen + up, zwei
+     * positioning-ups): nur EIN up auf die live-zeile und genau
+     * zwei zeilen-rewrites (spinner + rahmen) */
+    CHECK(count_str(c.raw, "\x1b[6A") == 1);
+    CHECK(count_str(c.raw, "\x1b[K") == 2);
+
+    /* tool fertig: live-spinner weg (der rahmen-spinner des docks
+     * bleibt – busy ist noch an) */
+    st.tool_running = false;
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.text, "     \xE2\xA0\x8B") == NULL);
+
+    cap_free(&c);
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
 /* ctrl+c-warnung: solange confirm_quit ansteht, zeigt die abstands-
  * zeile ueber dem eingabefeld die warnung; jede andere taste hebt
  * sie auf und die zeile ist wieder leer */
@@ -645,6 +736,7 @@ int main(void)
     test_dock_lists();
     test_separator();
     test_tool_call_multiline();
+    test_tool_spinner();
     test_quit_warning();
     return test_report();
 }

@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "debug.h"
 #include "utils.h"
 
 /* ------------------------------------------------------------------ */
@@ -196,6 +197,7 @@ void tool_kill_current(void)
 {
     pid_t child = (pid_t)g_bash_child;
     if (child > 0) {
+        dbg("bash: kill prozessgruppe %ld", (long)child);
         (void)kill(-child, SIGKILL);
     }
 }
@@ -256,6 +258,7 @@ static char *tool_bash(const cJSON *args)
     free(cmd_buf);
     close(outfd[1]);
     g_bash_child = (sig_atomic_t)pid;
+    dbg("bash: fork pid=%ld", (long)pid);
 
     /* output einsammeln, bis datei-ende oder tool-budget. rohes
      * read auf dem pipe-fd (kein stdio): der leser ist der worker-

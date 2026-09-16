@@ -14,6 +14,7 @@
 
 #include "chat.h"
 #include "context.h"
+#include "debug.h"
 #include "keys.h"
 #include "prompt.h"
 #include "session.h"
@@ -477,6 +478,7 @@ typedef struct {
                            * alle runden und tools hinweg */
     void *redraw_ctx;
     void (*redraw)(void *);
+    void (*tick)(void *);  /* leichter frame (spinner), fallback redraw */
     long long last_ms;     /* zeit des letzten gedrosselten redraw */
     bool drew;             /* mindestens einmal gezeichnet */
     bool error;            /* on_error kam */
@@ -499,8 +501,12 @@ static int stream_should_abort(void *ud)
     /* der watchdog laeuft ~alle 100ms – auch waehrend das modell
      * nur denkt und kein chunk fliesst. jede poll ist der frame-
      * tick, ohne den der spinner und die sekunden in der input-
-     * rahmenzeile einfrieren wuerden */
-    if (sc->redraw != NULL) {
+     * rahmenzeile einfrieren wuerden. der leichte tick ueber-
+     * schreibt nur die spinner-zeilen: ein voller frame in diesem
+     * takt liesse die ganze input-leiste flackern */
+    if (sc->tick != NULL) {
+        sc->tick(sc->redraw_ctx);
+    } else if (sc->redraw != NULL) {
         sc->redraw(sc->redraw_ctx);
     }
     if (keys_abort_pressed()) {
@@ -556,6 +562,8 @@ static void stream_on_error(long http_status, const char *message, void *ud)
 {
     StreamCtx *sc = ud;
     sc->error = true;
+    dbg("stream: fehler http=%ld msg=%s", http_status,
+        (message != NULL) ? message : "?");
 
     /* platzhalter ohne inhalt wegwerfen; eine teil-antwort bleibt
      * im verlauf (der text verschwinden zu lassen waere schlimmer),
@@ -603,23 +611,33 @@ typedef struct {
     char *result;
     long long dur_ms; /* ausfuehrungsdauer, vom worker gemessen */
     atomic_bool done; /* worker fertig, result ist gueltig */
+    atomic_int refs;  /* besitzer: worker + aufrufer (join) oder nur
+                       * worker (abgekoppelt beim timeout) – wer die
+                       * letzte referenz abgibt, raeumt auf */
 } ToolJob;
 
-static void tool_job_free(ToolJob *job)
+/* die letzte referenz gibt alles frei. result ist NULL, sobald
+ * der aufrufer es uebernommen hat (join-erfolg). */
+static void tool_job_unref(ToolJob *job)
 {
-    free(job->name);
-    free(job->args);
-    free(job->result);
-    free(job);
+    if (atomic_fetch_sub(&job->refs, 1) == 1) {
+        free(job->result);
+        free(job->name);
+        free(job->args);
+        free(job);
+    }
 }
 
 static void *tool_thread(void *ud)
 {
     ToolJob *job = ud;
+    dbg("tool: thread start (%s)", job->name);
     long long t0 = mono_ms();
     job->result = tool_execute(job->name, job->args);
     job->dur_ms = mono_ms() - t0;
+    dbg("tool: thread fertig (%s, %lldms)", job->name, job->dur_ms);
     atomic_store(&job->done, true);
+    tool_job_unref(job);
     return NULL;
 }
 
@@ -640,21 +658,28 @@ static bool tool_run_async(const ChatToolCall *call, const SendHooks *hooks,
         die("out of memory");
     }
     atomic_init(&job->done, false);
+    atomic_init(&job->refs, 2); /* worker + aufrufer */
 
     pthread_t th;
     if (pthread_create(&th, NULL, tool_thread, job) != 0) {
         die("thread create failed"); /* ressourcen alle: ehrlich scheitern */
     }
+    dbg("tool: thread erzeugt (%s)", job->name);
 
     while (!atomic_load(&job->done)) {
-        /* ui-tick: spinner und sekundenzaehler leben weiter, solange
-         * das tool arbeitet */
-        hooks->redraw(hooks->ctx);
+        /* ui-tick: spinner (chat + rahmen) und sekundenzaehler
+         * leben weiter, solange das tool arbeitet */
+        if (hooks->tick != NULL) {
+            hooks->tick(hooks->ctx);
+        } else {
+            hooks->redraw(hooks->ctx);
+        }
         if (keys_abort_pressed()) {
             /* bash-kind killen (ganze prozessgruppe inkl. enkel-
              * kinder) – der worker kehrt danach sofort aus dem
              * read zurueck. DANN erst joinen: ein join vorher
              * wuerde auf das haengende kommando warten */
+            dbg("tool: abbruch – kill prozessgruppe");
             tool_kill_current();
 
             /* gnadenfrist: killbare tools (bash) enden sofort.
@@ -664,9 +689,12 @@ static bool tool_run_async(const ChatToolCall *call, const SendHooks *hooks,
              * selbst ab (heap, strings sind kopiert). */
             struct timespec grace = {2, 0};
             if (pthread_timedjoin_np(th, NULL, &grace) == 0) {
-                tool_job_free(job);
+                tool_job_unref(job); /* wir waren als letztes dran */
             } else {
+                dbg("tool: worker nach 2s nicht beendet – abgekoppelt");
                 (void)pthread_detach(th);
+                tool_job_unref(job); /* der worker raeumt, wenn er
+                                      * irgendwann endet (refs 2 -> 1) */
             }
             return false;
         }
@@ -679,9 +707,7 @@ static bool tool_run_async(const ChatToolCall *call, const SendHooks *hooks,
     *dur_ms = job->dur_ms;
     *out_result = job->result;
     job->result = NULL; /* eigentum an den aufrufer */
-    free(job->name);
-    free(job->args);
-    free(job);
+    tool_job_unref(job);
     return true;
 }
 
@@ -708,6 +734,7 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
      * ab hier */
     long long turn_start =
         (state->busy_start_ms > 0) ? state->busy_start_ms : mono_ms();
+    dbg("turn: beginn (busy_start=%lld)", turn_start);
 
     for (int round = 0;; round++) {
         if (send_round_build(state, cfg, &req) != 0) {
@@ -755,6 +782,7 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
             .turn_start = turn_start,
             .redraw_ctx = hooks->ctx,
             .redraw = hooks->redraw,
+            .tick = hooks->tick,
         };
         OaiStreamCallbacks cbs = {
             .on_chunk = stream_on_chunk,
@@ -867,7 +895,16 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
              * haengen in der regel voneinander ab */
             long long dur = -1;
             char *result = NULL;
-            if (!tool_run_async(call, hooks, &result, &dur)) {
+            dbg("tool-loop: call %zu/%zu (%s)", i + 1, calls_len,
+                (call->name != NULL) ? call->name : "?");
+            state->tool_running = true; /* spinner im chat (unter dem call) */
+            /* voller frame: die call-zeile committen, damit der
+             * spinner sichtbar UNTER ihr laufen kann (der letzte
+             * frame war noch streaming – die calls haengen erst an) */
+            hooks->redraw(hooks->ctx);
+            bool ok = tool_run_async(call, hooks, &result, &dur);
+            state->tool_running = false;
+            if (!ok) {
                 /* abbruch: angefangene calls bleiben ohne antwort
                  * (wie beim stream-abbruch), die runde endet hier */
                 notice(state, "abgebrochen");
@@ -882,6 +919,9 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
                 die("out of memory");
             }
             free(result);
+            /* voller frame: das ergebnis drucken, der chat-spinner
+             * weicht dem output */
+            hooks->redraw(hooks->ctx);
         }
     }
 }

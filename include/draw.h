@@ -40,6 +40,13 @@ void draw(int rows, int cols, AppState *state, const Config *cfg);
  * dock frisch aufsetzen. */
 void draw_reset(int rows);
 
+/* leichter frame waehrend die ki arbeitet: nur die spinner-zeile(n)
+ * werden in ort und stelle ueberschrieben, der rest des docks
+ * bleibt unberuehrt. der watchdog feuert ~10 ticks/s – ein voller
+ * frame je tick liesse die input-leiste flackern. ohne gueltiges
+ * layout (resize) oder ohne laufenden turn: voller draw(). */
+void draw_busy_tick(int rows, int cols, AppState *state, const Config *cfg);
+
 /* der chat-inhalt wurde komplett ersetzt (/new, resume): alles
  * bisher gedruckte bleibt im scrollback, gedruckt wird danach nur
  * noch der schwanz, der auf einen bildschirm passt. */

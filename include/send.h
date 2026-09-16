@@ -57,6 +57,10 @@ typedef struct {
     /* nach chunks aufrufen, damit der aufrufer neu zeichnet.
      * pflicht: ohne redraw sieht man vom stream nichts. */
     void (*redraw)(void *ctx);
+    /* leichter frame ~10x/s (watchdog): nur spinner aktualisieren,
+     * der rest des docks bleibt unberuehrt. NULL = der watchdog
+     * faellt auf einen vollen redraw zurueck (tests). */
+    void (*tick)(void *ctx);
 } SendHooks;
 
 /* wie send_message, aber als stream: vor dem request entsteht eine
