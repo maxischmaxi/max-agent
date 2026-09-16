@@ -1,121 +1,89 @@
-# c-template
+# max-agent
 
-A small, batteries-included starting point for C projects. Clone it, run `make`,
-start writing code. No build system to configure, no editor setup to fiddle with.
+A minimal terminal AI coding agent in C17. Streams responses, runs tools
+(bash, read_file, write_file), keeps sessions resumable, and renders to the
+standard terminal buffer — your tmux scrollback is the chat history.
 
-[![ci](https://github.com/maxischmaxi/c-template/actions/workflows/ci.yml/badge.svg)](https://github.com/maxischmaxi/c-template/actions/workflows/ci.yml)
+[![ci](https://github.com/maxischmaxi/max-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/maxischmaxi/max-agent/actions/workflows/ci.yml)
 
-- **One Makefile** with debug and release builds and automatic header dependency tracking
-- **Strict warnings** (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion` and friends), C17 by default
-- **Sanitizers on by default** in debug builds (AddressSanitizer + UndefinedBehaviorSanitizer)
-- **Tests**: drop a `.c` file into `tests/`, run `make test`
-- **clangd ready**: `compile_commands.json` is generated on every build, no extra tools needed
-- **Formatting and linting** via `.clang-format`, `.clang-tidy` and `.editorconfig`
-- **CI** on GitHub Actions: gcc and clang, debug and release, plus a format check
-
-## Quick start
+## Build
 
 ```sh
-gh repo create my-app --template maxischmaxi/c-template --clone
-cd my-app
-
-make                    # debug build -> build/debug/my-app
-make run ARGS="a b"     # build and run with arguments
-make test               # build and run everything in tests/
-make BUILD=release      # optimized build -> build/release/my-app
+make                    # debug build -> build/debug/max-agent
+make BUILD=release      # optimized  -> build/release/max-agent
+make test               # build and run all tests in tests/
 ```
 
-Without `gh`: clone the repo, delete `.git`, run `git init`.
-
-The binary is named after the project directory. Set `BIN` at the top of the
-`Makefile` if you want something else.
-
-## Layout
-
-```
-.
-├── Makefile
-├── include/                 # public headers, added to the include path
-├── src/                     # sources, picked up recursively
-│   └── main.c
-├── tests/                   # every tests/*.c becomes its own test binary
-│   ├── test.h               # tiny CHECK() / test_report() helpers
-│   └── test_example.c
-├── build/                   # created by make, ignored by git
-│   ├── debug/
-│   └── release/
-├── .clang-format
-├── .clang-tidy
-├── .editorconfig
-└── .github/workflows/ci.yml
-```
-
-## Targets
-
-| Target              | What it does                                              |
-| ------------------- | --------------------------------------------------------- |
-| `make`              | debug build (default)                                     |
-| `make release`      | release build, same as `make BUILD=release`               |
-| `make run`          | build and run, arguments via `ARGS="..."`                 |
-| `make test`         | build and run all tests, stops at the first failing one   |
-| `make format`       | format all sources with clang-format                      |
-| `make format-check` | fail if anything is not formatted (used in CI)            |
-| `make lint`         | run clang-tidy                                            |
-| `make clean`        | remove `build/` and `compile_commands.json`               |
-| `make help`         | list all targets                                          |
+Debug builds include AddressSanitizer and UndefinedBehaviorSanitizer.
+Requires GNU make, gcc or clang, and libcurl.
 
 ## Configuration
 
-Pass variables on the command line for one-off changes, or edit the top of the
-`Makefile` for permanent ones.
+The config lives at `~/.config/.maxagent/config.json`. The full schema is in
+[`config.schema.json`](config.schema.json) — add it as `$schema` for editor
+completion and validation:
 
-| Variable   | Default        | Description                                          |
-| ---------- | -------------- | ---------------------------------------------------- |
-| `BUILD`    | `debug`        | `debug` or `release`, output goes to `build/<BUILD>/` |
-| `CC`       | `cc`           | compiler, e.g. `make CC=clang`                       |
-| `STD`      | `c17`          | language standard                                    |
-| `BIN`      | directory name | name of the binary                                   |
-| `SANITIZE` | `1`            | `0` disables ASan/UBSan in debug builds              |
-| `ARGS`     |                | arguments for `make run`                             |
-| `V`        | `0`            | `1` prints the full compiler commands                |
-
-Debug builds use `-O0 -g3` with sanitizers, release builds use `-O2 -DNDEBUG`.
-Both live side by side in `build/debug/` and `build/release/`. After switching
-compilers or changing flags run `make clean`.
-
-## Adding code
-
-New sources anywhere below `src/` and headers in `include/` are picked up
-automatically. To link a library, append it to `LDLIBS` in the `Makefile`:
-
-```make
-LDLIBS += -lm
-```
-
-Every `tests/*.c` is compiled into its own binary and linked against all
-objects except `main.o`, so tests can call anything in `src/`:
-
-```c
-#include "test.h"
-#include "mymodule.h"
-
-int main(void)
+```json
 {
-    CHECK(my_add(1, 2) == 3);
-    return test_report();
+  "$schema": "https://raw.githubusercontent.com/maxischmaxi/max-agent/main/config.schema.json",
+  "providers": [
+    {
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "baseUrl": "http://localhost:11434/v1",
+      "models": [
+        { "id": "qwen3-coder:30b", "contextWindow": 262144, "reasoning": false }
+      ]
+    }
+  ],
+  "settings": {
+    "activeModel": "qwen3-coder:30b"
+  }
 }
 ```
 
-`CHECK()` records failures instead of aborting, so one run shows every failing
-assertion. Memory errors and undefined behaviour are caught by the sanitizers.
+Any OpenAI-compatible endpoint works (Ollama, LM Studio, OpenRouter, ...).
+Settings changed inside the app (`/models`, `/settings`) are persisted back
+to this file.
 
-## Editor
+## Usage
 
-`make` writes `compile_commands.json` to the project root. Any clangd based
-setup (neovim, helix, vscode, ...) picks it up and gets completion, diagnostics
-and go-to-definition without further configuration.
+```sh
+./build/debug/max-agent            # start the agent
+./build/debug/max-agent --debug    # write a trace to /tmp/max-agent-<session>.log
+```
 
-## Requirements
+| Command     | What it does                                |
+| ----------- | ------------------------------------------- |
+| `/models`   | pick a model from the config                |
+| `/resume`   | list and resume past sessions               |
+| `/rename`   | name the current session                    |
+| `/new`      | start a fresh session (old one is kept)    |
+| `/clear`    | same as `/new`                              |
+| `/settings` | theme, system prompt, confirm-quit behavior |
+| `/quit`     | exit                                        |
 
-GNU make and gcc or clang. `clang-format` and `clang-tidy` are only needed for
-`make format` and `make lint`.
+The agent has `bash`, `read_file` and `write_file` tools and runs them
+asynchronously — `ctrl+c` cancels a running turn, kills the tool's process
+group, and returns you to the prompt.
+
+With `--debug`, every keypress, frame, thread, tool call and API error is
+logged to `/tmp/max-agent-<session-id>.log` — sanitizer reports (use-after-free,
+leaks) land in the same file.
+
+## Development
+
+| Command              | What it does                               |
+| -------------------- | ------------------------------------------ |
+| `make test`          | run all tests (each `tests/*.c` = one binary) |
+| `make format`        | format sources with clang-format           |
+| `make format-check`  | fail if anything is unformatted            |
+| `make lint`          | run clang-tidy                             |
+| `make clean`         | remove `build/` and `compile_commands.json` |
+
+`tools/termemu.py` is a small pty-based terminal emulator for end-to-end
+testing without a real terminal:
+
+```sh
+python3 tools/termemu.py "hello" --sleep 2
+```
