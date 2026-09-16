@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L // NOLINT(bugprone-reserved-identifier)
+
 #include "utils.h"
 
 #include <errno.h>
@@ -24,6 +26,13 @@
 static int g_raw = 0;
 static int g_alt = 0;
 static struct termios g_orig;
+
+long long mono_ms(void)
+{
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((long long)ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+}
 
 const char *get_home(void)
 {
@@ -220,8 +229,10 @@ void screen_leave(void)
     if (g_alt) {
         fputs("\x1b[>4;0m", stdout);
         fputs("\x1b[<u", stdout);
-        fputs("\x1b[?25h", stdout);
-        fputs("\x1b[?1049l", stdout);
+        fputs("\x1b[?25h", stdout); /* cursor wieder sichtbar */
+        /* eine zeile runter: der shell-prompt soll unter dem dock
+         * landen, nicht in den statuszeilen */
+        fputs("\r\n", stdout);
     }
     g_alt = 0;
 }
@@ -258,8 +269,11 @@ void raw_enable(void)
 
 void screen_enter(void)
 {
-    fputs("\x1b[?1049h", stdout);
-    fputs("\x1b[2J", stdout);
+    /* BEWUSST kein alternativ-bildschirm (\x1b[?1049h): der chat
+     * soll ins normale terminal-scrollback scrollen – tmux-history,
+     * mausrad und kopieren muessen funktionieren, so arbeitet auch
+     * pi. nur der cursor verschwindet (die app zeichnet ihren
+     * eigenen) und das kitty-tastatur-protokoll wird angefragt. */
     fputs("\x1b[?25l", stdout);
     fputs("\x1b[>1u", stdout);
     fputs("\x1b[>4;2m", stdout);
@@ -319,17 +333,20 @@ bool dialog_navigate(AppState *state, Key k)
         }
         return true;
     case KEY_DOWN:
-        /* obere kante kennt erst das layout -> einfach erhoehen,
-         * layout_compute() klemmt zurueck */
+        /* obere kante kennt erst der dock-renderer -> einfach
+         * erhoehen, die naechste frame-Normalisierung klemmt zurueck */
         state->dialog.selected++;
         return true;
     case KEY_CHAR: {
+        /* k.ch ist eine utf-8-sequence (1..4 bytes) – umlaute in
+         * der suche muessen als ganze folge rein */
         size_t c_len = strlen(state->dialog.search);
-        if (c_len + 1 >= sizeof state->dialog.search) {
+        size_t add = strlen(k.ch);
+        if (c_len + add >= sizeof state->dialog.search) {
             return true;
         }
-        state->dialog.search[c_len] = k.ch;
-        state->dialog.search[c_len + 1] = '\0';
+        memcpy(state->dialog.search + c_len, k.ch, add);
+        state->dialog.search[c_len + add] = '\0';
         state->dialog.selected = 0;
         state->dialog.scroll = 0;
         return true;

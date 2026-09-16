@@ -33,7 +33,7 @@ CPPFLAGS += -I$(INC_DIR) -I$(SRC_DIR)
 CFLAGS   += -std=$(STD) $(WARNINGS)
 DEPFLAGS  = -MMD -MP
 LDFLAGS  +=
-LDLIBS   += -lcurl
+LDLIBS   += -lcurl -pthread
 
 ifeq ($(BUILD),debug)
   CFLAGS += -O0 -g3 -fno-omit-frame-pointer

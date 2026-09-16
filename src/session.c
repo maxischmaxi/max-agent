@@ -121,6 +121,7 @@ static void session_reset_fields(Session *s)
     s->id[0] = '\0';
     s->created_at = 0;
     s->updated_at = 0;
+    s->worked_ms = 0;
     s->messages = 0;
 }
 
@@ -174,6 +175,7 @@ static int meta_write(const Session *s)
     }
     cJSON_AddNumberToObject(o, "created_at", (double)s->created_at);
     cJSON_AddNumberToObject(o, "updated_at", (double)s->updated_at);
+    cJSON_AddNumberToObject(o, "worked_ms", (double)s->worked_ms);
     cJSON_AddNumberToObject(o, "messages", (double)s->messages);
     if (s->model != NULL) {
         cJSON_AddStringToObject(o, "model", s->model);
@@ -358,6 +360,9 @@ static int meta_read(Session *s, cJSON *meta)
                                              : s->created_at;
     const cJSON *jmsgs = cJSON_GetObjectItemCaseSensitive(meta, "messages");
     s->messages = cJSON_IsNumber(jmsgs) ? (size_t)jmsgs->valuedouble : 0;
+    const cJSON *jworked = cJSON_GetObjectItemCaseSensitive(meta, "worked_ms");
+    s->worked_ms =
+        cJSON_IsNumber(jworked) ? (long long)jworked->valuedouble : 0;
 
     /* name == NULL darf nicht heissen "allokation gescheitert" –
      * dup_str OOM waere fatal, das meta bleibt trotzdem brauchbar */
@@ -534,11 +539,21 @@ int session_log_user(Session *s, const char *text)
     return log_line(s, o);
 }
 
+void session_worked_set(Session *s, long long worked_ms)
+{
+    if (s == NULL || !s->active) {
+        return;
+    }
+    s->worked_ms = worked_ms;
+    (void)meta_write(s);
+}
+
 int session_log_assistant(Session *s, const char *text,
                           const ChatToolCall *calls, size_t calls_len,
-                          long long ttft_ms, long long total_ms, int round,
-                          const char *model, int prompt_tokens,
-                          int completion_tokens, bool aborted)
+                          long long ttft_ms, long long total_ms,
+                          long long work_ms, int round, const char *model,
+                          int prompt_tokens, int completion_tokens,
+                          bool aborted)
 {
     if (!s->active) {
         return 0;
@@ -554,6 +569,10 @@ int session_log_assistant(Session *s, const char *text,
     }
     if (total_ms >= 0) {
         cJSON_AddNumberToObject(o, "total_ms", (double)total_ms);
+    }
+    if (work_ms >= 0) {
+        /* zeit des GESAMTEN turns: thinking + alle runden + tools */
+        cJSON_AddNumberToObject(o, "work_ms", (double)work_ms);
     }
     if (round >= 0) {
         cJSON_AddNumberToObject(o, "round", round);

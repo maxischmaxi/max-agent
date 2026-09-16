@@ -77,7 +77,9 @@ int main(void)
         if (state.resized) {
             state.resized = 0;
             term_size(&rows, &cols);
-            fputs("\x1b[2J", stdout);
+            /* KEIN \x1b[2J – der verlauf lebt im terminal-
+             * scrollback. nur den renderer neu verankern */
+            draw_reset(rows);
         }
 
         handle_key(&state, &cfg, rows, cols);

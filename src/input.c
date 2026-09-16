@@ -93,6 +93,10 @@ void input_cursor_end(Input *in)
     in->cursor = input_len(in);
 }
 
+/* utf8-zeichenlaengen (definitionen weiter unten bei wrap_step) */
+static size_t utf8_at(const char *s, size_t i);
+static size_t utf8_before(const char *s, size_t i);
+
 bool input_cursor_left(Input *in)
 {
     if (in->cursor == 0) {
@@ -104,7 +108,8 @@ bool input_cursor_left(Input *in)
         in->cursor = input_len(in); /* ans ende der zeile davor */
         return true;
     }
-    in->cursor--;
+    /* ganzes utf-8-zeichen: bis zum lead-byte zurueck */
+    in->cursor -= utf8_before(in->lines[in->cursor_line], in->cursor);
     return true;
 }
 
@@ -119,7 +124,9 @@ bool input_cursor_right(Input *in)
         in->cursor = 0;
         return true;
     }
-    in->cursor++;
+    /* ganzes utf-8-zeichen vorruecken */
+    char *line = in->lines[in->cursor_line];
+    in->cursor += utf8_at(line, in->cursor);
     return true;
 }
 
@@ -191,8 +198,14 @@ bool input_delete_forward(Input *in)
     char *line = in->lines[in->cursor_line];
     size_t len = strlen(line);
     if (in->cursor < len) {
-        /* rest (inkl. '\0') eine position zurueckruecken */
-        memmove(line + in->cursor, line + in->cursor + 1, len - in->cursor);
+        /* ganzes utf-8-zeichen loeschen: umlaut/emoji sind mehrere
+         * bytes, ein halbes wuerde kaputte zeichen hinterlassen */
+        size_t n = utf8_at(line, in->cursor);
+        if (in->cursor + n > len) {
+            n = 1; /* kaputte folge am rand: nur das byte */
+        }
+        memmove(line + in->cursor, line + in->cursor + n,
+                len - in->cursor - n + 1);
         return true;
     }
     return input_join_next(in); /* am zeilenende: umbruch dahinter */
@@ -618,10 +631,15 @@ void input_backspace(Input *in)
     char *line = in->lines[in->cursor_line];
     size_t len = strlen(line);
     if (in->cursor > 0 && in->cursor <= len) {
-        /* zeichen VOR dem cursor loeschen: rest (inkl. '\0')
-         * rueckt eine position zurueck */
-        memmove(line + in->cursor - 1, line + in->cursor, len - in->cursor + 1);
-        in->cursor--;
+        /* GANZES zeichen vor dem cursor loeschen: umlaut/sz sind
+         * zwei bytes, ein halbes wuerde kaputte utf-8-sequenzen im
+         * feld hinterlassen */
+        size_t n = utf8_before(line, in->cursor);
+        if (in->cursor < n) {
+            n = in->cursor; /* defensive: randfaelle */
+        }
+        memmove(line + in->cursor - n, line + in->cursor, len - in->cursor + 1);
+        in->cursor -= n;
         return;
     }
     /* am zeilenanfang: den zeilenumbruch davor loeschen. bei einer
@@ -685,6 +703,35 @@ void input_init(Input *in)
 
 /* ein codepoint ab s: byte-laenge. defekte sequenzen zaehlen als
  * einzelbyte, gelesen wird nie ueber den terminator hinaus. */
+/* byte-laenge des utf-8-zeichens, das BEI byte i beginnt (cursor
+ * steht auf dem zeichenanfang). kaputte/alleinige bytes: 1 */
+static size_t utf8_at(const char *s, size_t i)
+{
+    unsigned char c = (unsigned char)s[i];
+    if ((c & 0xE0U) == 0xC0U) {
+        return 2;
+    }
+    if ((c & 0xF0U) == 0xE0U) {
+        return 3;
+    }
+    if ((c & 0xF8U) == 0xF0U) {
+        return 4;
+    }
+    return 1;
+}
+
+/* byte-laenge des utf-8-zeichens, das VOR byte i ENDET. der cursor
+ * muss auf einer zeichengrenze stehen; von dort rueckwaerts zum
+ * lead-byte laufen (maximal 3 continuation-bytes) */
+static size_t utf8_before(const char *s, size_t i)
+{
+    size_t n = 0;
+    while (n < 3 && i > n && (((unsigned char)s[i - n - 1] & 0xC0U) == 0x80U)) {
+        n++;
+    }
+    return n + 1;
+}
+
 static size_t wrap_step(const char *s)
 {
     unsigned char c = (unsigned char)s[0];

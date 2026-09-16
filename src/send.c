@@ -1,8 +1,12 @@
-#define _POSIX_C_SOURCE 200809L // NOLINT(bugprone-reserved-identifier)
+#define _GNU_SOURCE // NOLINT(bugprone-reserved-identifier)
+/* (ueberdeckt _POSIX_C_SOURCE: wir brauchen pthread_timedjoin_np
+ * fuer die gnadenfrist beim abbruch nicht-killbarer tools) */
 
 #include "send.h"
 
+#include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,15 +55,6 @@ _Static_assert(sizeof(ChatToolCall) == sizeof(OaiToolCall),
 /* puffer fuer fehlermeldungen, die im transcript landen; laengere
  * server-texte werden abgeschnitten (chat_wrap umbricht eh). */
 #define ERR_MAX 160
-
-/* monotone uhr in ms: messung der antwort- und tool-dauern (fuer
- * das session-log) und redraw-drossel */
-static long long mono_ms(void)
-{
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ((long long)ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
-}
 
 int send_role(ChatRole role)
 {
@@ -362,8 +357,9 @@ int send_message(AppState *state, const Config *cfg)
         ctok = result.completion.usage.completion_tokens;
     }
     (void)session_log_assistant(
-        &state->session, text, NULL, 0, t_done - t_start, t_done - t_start, 0,
-        (req.model->id != NULL) ? req.model->id : NULL, ptok, ctok, false);
+        &state->session, text, NULL, 0, t_done - t_start, t_done - t_start,
+        t_done - t_start, 0, (req.model->id != NULL) ? req.model->id : NULL,
+        ptok, ctok, false);
     oai_completion_result_free(&result);
     return 0;
 }
@@ -471,11 +467,14 @@ static void acc_compact(ToolAcc *acc)
 
 typedef struct {
     Chat *chat;
-    Session *session;  /* NULL-sicher: inaktive session loggt nicht */
-    const char *model; /* id des modells dieser runde (fuer das log) */
-    int round;         /* agent-loop-runde, 0-basiert */
-    long long t_start; /* runden-beginn (request abgeschickt) */
-    long long t_first; /* erster chunk; 0 = noch nichts angekommen */
+    Session *session;     /* NULL-sicher: inaktive session loggt nicht */
+    const char *model;    /* id des modells dieser runde (fuer das log) */
+    int round;            /* agent-loop-runde, 0-basiert */
+    long long t_start;    /* runden-beginn (request abgeschickt) */
+    long long t_first;    /* erster chunk; 0 = noch nichts an    */
+    long long turn_start; /* beginn des GESAMTEN turns (busy_start);
+                           * die arbeitszeit des turns laeuft ueber
+                           * alle runden und tools hinweg */
     void *redraw_ctx;
     void (*redraw)(void *);
     long long last_ms;     /* zeit des letzten gedrosselten redraw */
@@ -496,6 +495,13 @@ static int stream_should_abort(void *ud)
     StreamCtx *sc = ud;
     if (sc->aborted) {
         return 1;
+    }
+    /* der watchdog laeuft ~alle 100ms – auch waehrend das modell
+     * nur denkt und kein chunk fliesst. jede poll ist der frame-
+     * tick, ohne den der spinner und die sekunden in der input-
+     * rahmenzeile einfrieren wuerden */
+    if (sc->redraw != NULL) {
+        sc->redraw(sc->redraw_ctx);
     }
     if (keys_abort_pressed()) {
         sc->aborted = true;
@@ -566,7 +572,8 @@ static void stream_on_error(long http_status, const char *message, void *ud)
         (void)session_log_assistant(
             sc->session, chat->msgs[chat->len - 1].text, NULL, 0,
             (sc->t_first > 0) ? sc->t_first - sc->t_start : -1,
-            mono_ms() - sc->t_start, sc->round, sc->model, -1, -1, false);
+            mono_ms() - sc->t_start, mono_ms() - sc->turn_start, sc->round,
+            sc->model, -1, -1, false);
     }
     char buf[ERR_MAX];
     if (http_status > 0) {
@@ -581,6 +588,101 @@ static void stream_on_error(long http_status, const char *message, void *ud)
     if (chat_append(chat, CHAT_ROLE_ERROR, buf) != 0) {
         die("out of memory");
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* asynchrone tool-ausfuehrung: das tool laeuft in einem worker-      */
+/* thread, der haupt-thread haelt die ui am leben (spinner-tick) und  */
+/* pollt fertig + abbruch. beim abbruch killt er das bash-kind samt   */
+/* prozessgruppe (tool_kill_current) – ein haengendes kommando kann   */
+/* die app damit NIE mehr blockieren, und ctrl+c wirkt auch hier.    */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    char *name; /* heap-kopien: ein abgekoppelter worker darf das */
+    char *args; /* chat-objekt nicht mehr beruehren               */
+    char *result;
+    long long dur_ms; /* ausfuehrungsdauer, vom worker gemessen */
+    atomic_bool done; /* worker fertig, result ist gueltig */
+} ToolJob;
+
+static void tool_job_free(ToolJob *job)
+{
+    free(job->name);
+    free(job->args);
+    free(job->result);
+    free(job);
+}
+
+static void *tool_thread(void *ud)
+{
+    ToolJob *job = ud;
+    long long t0 = mono_ms();
+    job->result = tool_execute(job->name, job->args);
+    job->dur_ms = mono_ms() - t0;
+    atomic_store(&job->done, true);
+    return NULL;
+}
+
+/* ein tool asynchron ausfuehren und dabei die ui am leben halten.
+ * *dur_ms = ausfuehrungsdauer, *out_result = ergebnis (owned).
+ * rueckgabe false = der benutzer hat abgebrochen (ergebnis verworfen
+ * oder der worker abgekoppelt); OOM stirbt ehrlich. */
+static bool tool_run_async(const ChatToolCall *call, const SendHooks *hooks,
+                           char **out_result, long long *dur_ms)
+{
+    ToolJob *job = calloc(1, sizeof *job);
+    if (job == NULL) {
+        die("out of memory");
+    }
+    job->name = dup_str((call->name != NULL) ? call->name : "?");
+    job->args = dup_str((call->arguments != NULL) ? call->arguments : "");
+    if (job->name == NULL || job->args == NULL) {
+        die("out of memory");
+    }
+    atomic_init(&job->done, false);
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, tool_thread, job) != 0) {
+        die("thread create failed"); /* ressourcen alle: ehrlich scheitern */
+    }
+
+    while (!atomic_load(&job->done)) {
+        /* ui-tick: spinner und sekundenzaehler leben weiter, solange
+         * das tool arbeitet */
+        hooks->redraw(hooks->ctx);
+        if (keys_abort_pressed()) {
+            /* bash-kind killen (ganze prozessgruppe inkl. enkel-
+             * kinder) – der worker kehrt danach sofort aus dem
+             * read zurueck. DANN erst joinen: ein join vorher
+             * wuerde auf das haengende kommando warten */
+            tool_kill_current();
+
+            /* gnadenfrist: killbare tools (bash) enden sofort.
+             * nicht-killbare (read_file auf einem haengenden fs)
+             * bekommen zwei sekunden, danach werden sie abgekoppelt
+             * – die app blockiert NIE. der worker raeumt sein job
+             * selbst ab (heap, strings sind kopiert). */
+            struct timespec grace = {2, 0};
+            if (pthread_timedjoin_np(th, NULL, &grace) == 0) {
+                tool_job_free(job);
+            } else {
+                (void)pthread_detach(th);
+            }
+            return false;
+        }
+        /* 50ms: fluessige animation, kaum cpu */
+        struct timespec ts = {0, 50L * 1000L * 1000L};
+        (void)nanosleep(&ts, NULL);
+    }
+
+    (void)pthread_join(th, NULL);
+    *dur_ms = job->dur_ms;
+    *out_result = job->result;
+    job->result = NULL; /* eigentum an den aufrufer */
+    free(job->name);
+    free(job->args);
+    free(job);
+    return true;
 }
 
 int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
@@ -600,6 +702,12 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
      * tool_choice-feld entspricht das "auto" */
     size_t tools_len = 0;
     const OaiTool *tools = tool_registry(&tools_len);
+
+    /* beginn des gesamt-turns: keys.c setzt busy_start_ms beim
+     * abschicken; ohne das (tests rufen send_stream direkt) zaehlt
+     * ab hier */
+    long long turn_start =
+        (state->busy_start_ms > 0) ? state->busy_start_ms : mono_ms();
 
     for (int round = 0;; round++) {
         if (send_round_build(state, cfg, &req) != 0) {
@@ -644,6 +752,7 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
             .model = (req.model->id != NULL) ? req.model->id : NULL,
             .round = round,
             .t_start = mono_ms(),
+            .turn_start = turn_start,
             .redraw_ctx = hooks->ctx,
             .redraw = hooks->redraw,
         };
@@ -688,7 +797,8 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
                 (void)session_log_assistant(
                     &state->session, chat->msgs[chat->len - 1].text, NULL, 0,
                     (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
-                    mono_ms() - sc.t_start, round, sc.model, -1, -1, true);
+                    mono_ms() - sc.t_start, mono_ms() - sc.turn_start, round,
+                    sc.model, -1, -1, true);
             }
             notice(state, "abgebrochen");
             return 0;
@@ -726,8 +836,8 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
             (void)session_log_assistant(
                 &state->session, last->text, NULL, 0,
                 (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
-                mono_ms() - sc.t_start, round, sc.model, sc.prompt_tokens,
-                sc.completion_tokens, false);
+                mono_ms() - sc.t_start, mono_ms() - sc.turn_start, round,
+                sc.model, sc.prompt_tokens, sc.completion_tokens, false);
             return 0;
         }
 
@@ -736,8 +846,8 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
         (void)session_log_assistant(
             &state->session, last->text, last->tool_calls, last->tool_calls_len,
             (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
-            mono_ms() - sc.t_start, round, sc.model, sc.prompt_tokens,
-            sc.completion_tokens, false);
+            mono_ms() - sc.t_start, mono_ms() - sc.turn_start, round, sc.model,
+            sc.prompt_tokens, sc.completion_tokens, false);
 
         /* tools ausfuehren, ergebnisse als TOOL-nachrichten anhaengen;
          * die naechste runde schickt sie mit. fehler-ergebnisse sind
@@ -751,9 +861,18 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
         for (size_t i = 0; i < calls_len; i++) {
             ChatToolCall *call = &calls[i];
 
-            long long t_tool = mono_ms();
-            char *result = tool_execute(call->name, call->arguments);
-            long long dur = mono_ms() - t_tool;
+            /* asynchron: die ui bleibt lebendig, und der abbruch
+             * killt das tool (bash: ganze prozessgruppe). die calls
+             * laufen bewusst weiter sequenziell – ihre ergebnisse
+             * haengen in der regel voneinander ab */
+            long long dur = -1;
+            char *result = NULL;
+            if (!tool_run_async(call, hooks, &result, &dur)) {
+                /* abbruch: angefangene calls bleiben ohne antwort
+                 * (wie beim stream-abbruch), die runde endet hier */
+                notice(state, "abgebrochen");
+                return 0;
+            }
             if (result == NULL) {
                 die("out of memory");
             }

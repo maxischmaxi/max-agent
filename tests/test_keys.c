@@ -18,7 +18,7 @@
 static void test_key_from_byte(void)
 {
     CHECK(key_from_byte('a').kind == KEY_CHAR);
-    CHECK(key_from_byte('a').ch == 'a');
+    CHECK(strcmp(key_from_byte('a').ch, "a") == 0);
     CHECK(key_from_byte('\r').kind == KEY_ENTER);
     CHECK(key_from_byte('\n').kind == KEY_NEWLINE);
     CHECK(key_from_byte(0x03).kind == KEY_CTRL_C);
@@ -69,8 +69,8 @@ static void test_key_from_escape(void)
     CHECK(key_from_escape("\x1b[117;5u", 8).kind == KEY_CTRL_U);
     CHECK(key_from_escape("\x1b[104;5u", 8).kind == KEY_CTRL_H);
     /* kitty: ohne ctrl-modifikator kein shortcut */
-    CHECK(key_from_escape("\x1b[119;2u", 8).kind == KEY_NONE); /* shift+w */
-    CHECK(key_from_escape("\x1b[119u", 6).kind == KEY_NONE);   /* plain w  */
+    CHECK(key_from_escape("\x1b[119;2u", 8).kind == KEY_CHAR); /* shift+w = w */
+    CHECK(key_from_escape("\x1b[119u", 6).kind == KEY_CHAR);   /* kitty: w */
     /* meta-bindings: legacy-encoding (ESC + zeichen).
      * wichtig: "\x1b" "b" getrennt schreiben – "\x1bb" waere
      * EINE hex-escape (b ist eine hex-ziffer) */
@@ -140,7 +140,7 @@ static void test_key_read_batch(void)
     keys_unread("\x1b[98;3ux", 8);
     CHECK(key_read().kind == KEY_ALT_B);
     Key c = key_read();
-    CHECK(c.kind == KEY_CHAR && c.ch == 'x');
+    CHECK(c.kind == KEY_CHAR && strcmp(c.ch, "x") == 0);
 
     keys_unread("\x1b[98;3u\x1b[102;3u", 15);
     CHECK(key_read().kind == KEY_ALT_B);
@@ -151,7 +151,7 @@ static void test_key_read_batch(void)
                 4);
     CHECK(key_read().kind == KEY_ALT_B);
     CHECK(key_read().kind == KEY_CTRL_W);
-    CHECK(key_read().ch == 'z');
+    CHECK(strcmp(key_read().ch, "z") == 0);
 }
 
 /* keys_abort_pressed: der poll waehrend einer laufenden anfrage.
@@ -163,9 +163,9 @@ static void test_abort_poll(void)
     keys_unread("abc", 3);
     CHECK(!keys_abort_pressed()); /* nichts zum abbrechen */
     /* die zeichen sind noch da */
-    CHECK(key_read().ch == 'a');
-    CHECK(key_read().ch == 'b');
-    CHECK(key_read().ch == 'c');
+    CHECK(strcmp(key_read().ch, "a") == 0);
+    CHECK(strcmp(key_read().ch, "b") == 0);
+    CHECK(strcmp(key_read().ch, "c") == 0);
 
     keys_unread("ab\x03"
                 "cd",
@@ -173,7 +173,22 @@ static void test_abort_poll(void)
     CHECK(keys_abort_pressed());
     /* nach dem abbruch ist der puffer leer: wer stoppt, tippt nicht */
     keys_unread("z", 1);
-    CHECK(key_read().ch == 'z');
+    CHECK(strcmp(key_read().ch, "z") == 0);
+
+    /* kitty-encoding: terminal mit "alle tasten als escape-codes"
+     * meldet ctrl+c als CSI 99;5u und esc als CSI 27u – rohe bytes
+     * kommen nie an. der watchdog muss BEIDE erkennen (genau das
+     * war der haenger, der die app nur per kill beenden liess) */
+    keys_unread("\x1b[99;5u", 7);
+    CHECK(keys_abort_pressed());
+    keys_unread("\x1b[27u", 5);
+    CHECK(keys_abort_pressed());
+    /* xterm modifyOtherKeys: CSI 27;5;99 ~ = ctrl+c */
+    keys_unread("\x1b[27;5;99~", 11);
+    CHECK(keys_abort_pressed());
+    /* normale tasten bleiben kein abbruch */
+    keys_unread("\x1b[65u", 6); /* kitty 'a' */
+    CHECK(!keys_abort_pressed());
 
     keys_unread("\x1b", 1); /* escape allein zaehlt auch */
     CHECK(keys_abort_pressed());
@@ -216,8 +231,8 @@ static void test_abort_poll(void)
     CHECK(write(fds[1], "xy", 2) == 2);
     CHECK(!keys_abort_pressed());
     /* die bytes sind nicht verloren, sondern zurueck im puffer */
-    CHECK(key_read().ch == 'x');
-    CHECK(key_read().ch == 'y');
+    CHECK(strcmp(key_read().ch, "x") == 0);
+    CHECK(strcmp(key_read().ch, "y") == 0);
 
     CHECK(write(fds[1],
                 "q\x03"
@@ -242,16 +257,16 @@ static void test_keys_unread_fifo(void)
     /* key_read greift zuerst auf pending zu - ohne stdin zu lesen */
     keys_unread("ab", 2);
     Key k1 = key_read();
-    CHECK(k1.kind == KEY_CHAR && k1.ch == 'a');
+    CHECK(k1.kind == KEY_CHAR && strcmp(k1.ch, "a") == 0);
     Key k2 = key_read();
-    CHECK(k2.kind == KEY_CHAR && k2.ch == 'b');
+    CHECK(k2.kind == KEY_CHAR && strcmp(k2.ch, "b") == 0);
 
     /* prepend: neue bytes landen VOR vorhandenen */
     keys_unread("yz", 2);
-    CHECK(key_read().ch == 'y');
+    CHECK(strcmp(key_read().ch, "y") == 0);
     keys_unread("x", 1); /* vor 'z' einsortiert */
-    CHECK(key_read().ch == 'x');
-    CHECK(key_read().ch == 'z');
+    CHECK(strcmp(key_read().ch, "x") == 0);
+    CHECK(strcmp(key_read().ch, "z") == 0);
 
     /* randfaelle */
     keys_unread(NULL, 4); /* kein crash */
@@ -579,6 +594,83 @@ static void test_wrapped_arrows(void)
     stdin_pipe_close(&sp);
 }
 
+/* ------------------------------------------------------------------ */
+/* utf-8: umlaute und sz kommen im legacy-encoding als 2-byte-folge,   */
+/* emoji als 4 bytes; kitty-terminals melden sie als CSI-u-codepoint.  */
+/* beides muss als KEY_CHAR mit der KOMPLETTEN sequenz ankommen (vorher */
+/* fielen die bytes als KEY_NONE unter den tisch). shift+space ist     */
+/* schlicht space.                                                     */
+/* ------------------------------------------------------------------ */
+static void test_utf8_input(void)
+{
+    Key k;
+
+    /* legacy: 'ae-umlaut' = C3 A4 */
+    keys_unread("\xC3\xA4", 2);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR);
+    CHECK(strcmp(k.ch, "\xC3\xA4") == 0);
+
+    /* 'sz' = C3 9F */
+    keys_unread("\xC3\x9F", 2);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR);
+    CHECK(strcmp(k.ch, "\xC3\x9F") == 0);
+
+    /* 'oe-umlaut' + 'ue-umlaut' direkt hintereinander */
+    keys_unread("\xC3\xB6\xC3\xBC", 4);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR && strcmp(k.ch, "\xC3\xB6") == 0);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR && strcmp(k.ch, "\xC3\xBC") == 0);
+
+    /* emoji: 4 bytes */
+    keys_unread("\xF0\x9F\x98\x80", 4);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR);
+    CHECK(strcmp(k.ch, "\xF0\x9F\x98\x80") == 0);
+
+    /* folge-grenzen: halbe folge = warten, kaputte = 1 byte muell */
+    CHECK(key_seq_len("\xC3", 1) == 0);
+    CHECK(key_seq_len("\xC3\xA4", 2) == 2);
+    CHECK(key_seq_len("\xC3"
+                      "A",
+                      2) == 1);
+    CHECK(key_seq_len("\xE2\x86\x92", 3) == 3);
+    CHECK(key_seq_len("\xF0\x9F\x98", 3) == 0);
+
+    /* kitty: 'ae-umlaut' = codepoint 228 */
+    keys_unread("\x1b[228u", 7);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR);
+    CHECK(strcmp(k.ch, "\xC3\xA4") == 0);
+
+    /* kitty: 'sz' = codepoint 223 */
+    keys_unread("\x1b[223u", 7);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR);
+    CHECK(strcmp(k.ch, "\xC3\x9F") == 0);
+
+    /* kitty: emoji = codepoint 128512 (4 utf-8-bytes) */
+    keys_unread("\x1b[128512u", 10);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR);
+    CHECK(strcmp(k.ch, "\xF0\x9F\x98\x80") == 0);
+
+    /* shift+space: schlicht space (kitty meldet CSI 32;2u) */
+    keys_unread("\x1b[32;2u", 7);
+    k = key_read();
+    CHECK(k.kind == KEY_CHAR);
+    CHECK(strcmp(k.ch, " ") == 0);
+
+    /* legacy schickt fuer shift+space einfach das nackte byte */
+    CHECK(key_from_byte(' ').kind == KEY_CHAR);
+    CHECK(strcmp(key_from_byte(' ').ch, " ") == 0);
+
+    /* shift+tab bleibt frei (kein text, keine sondertaste) */
+    CHECK(key_from_escape("\x1b[9;2u", 7).kind == KEY_NONE);
+}
+
 int main(void)
 {
     test_key_from_byte();
@@ -590,5 +682,6 @@ int main(void)
     test_prompt_setting();
     test_wrapped_arrows();
     test_key_read_batch();
+    test_utf8_input();
     return test_report();
 }

@@ -20,6 +20,12 @@ const OaiTool *tool_registry(size_t *len);
 /* tool nach name suchen; NULL wenn unbekannt */
 const OaiTool *tool_find(const char *name);
 
+/* den aktuell laufenden tool-call abbrechen (kill an die prozess-
+ * gruppe des bash-kinds). aufrufer: der agent-loop beim abbruch;
+ * ohne laufendes tool ein no-op. der worker-thread kehrt nach dem
+ * kill umgehend zurueck. */
+void tool_kill_current(void);
+
 /* ein tool ausfuehren. arguments_json ist der json-string, den das
  * modell erzeugt hat. rueckgabe: ergebnis als heap-string des
  * aufrufers – auch fehlerfaelle (unbekanntes tool, kaputtes json,

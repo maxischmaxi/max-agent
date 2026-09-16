@@ -289,6 +289,230 @@ static void wrap_emit(ChatRole role, size_t msg, size_t off, size_t len,
     (*count)++;
 }
 
+/* hex-wert einer ziffer, -1 bei allem anderen */
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* "\uXXXX" an s (zeigt auf den backslash) parsen. rueckgabe: der
+ * codepoint, -1 wenn kein gueltiges escape dasteht. *consumed = die
+ * byte-laenge des escapes (6, oder 12 bei einem surrogate-paar).
+ * liest nie ueber den string-terminator hinaus: hex_val('\0')
+ * liefert -1 und bricht ab. */
+static long parse_unicode_escape(const char *s, size_t *consumed)
+{
+    if (s[0] != '\\' || s[1] != 'u') {
+        return -1;
+    }
+    long cp = 0;
+    for (int k = 0; k < 4; k++) {
+        int v = hex_val(s[2 + k]);
+        if (v < 0) {
+            return -1;
+        }
+        cp = (cp * 16) + v;
+    }
+    *consumed = 6;
+    if (cp >= 0xD800 && cp <= 0xDBFF) {
+        /* high-surrogate: nur zusammen mit einem low-paar ein
+         * gueltiges zeichen (z.B. emoji) */
+        if (s[6] == '\\' && s[7] == 'u') {
+            long lo = 0;
+            bool ok = true;
+            for (int k = 0; k < 4; k++) {
+                int v = hex_val(s[8 + k]);
+                if (v < 0) {
+                    ok = false;
+                    break;
+                }
+                lo = (lo * 16) + v;
+            }
+            if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                *consumed = 12;
+                return 0x10000 + ((cp - 0xD800) * 0x400) + (lo - 0xDC00);
+            }
+        }
+        return -1; /* unpaariges surrogate: original stehen lassen */
+    }
+    if (cp >= 0xDC00 && cp <= 0xDFFF) {
+        return -1; /* lone low-surrogate */
+    }
+    return cp;
+}
+
+/* codepoint als utf-8 nach dst, byte-laenge zurueck (1..4) */
+static size_t utf8_encode(long cp, char *dst)
+{
+    if (cp < 0x80) {
+        dst[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        dst[0] = (char)(0xC0 | (cp >> 6));
+        dst[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        dst[0] = (char)(0xE0 | (cp >> 12));
+        dst[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        dst[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    dst[0] = (char)(0xF0 | (cp >> 18));
+    dst[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    dst[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    dst[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* json-unicode-escapes (\uXXXX) in s IN-PLACE dekodieren: manche
+ * modelle schicken "&" oder umlaute als \u0026/\u00e4 – in der
+ * anzeige soll das lesbar sein. nur die DARSTELLUNG wird beruehrt,
+ * die rohen argumente (api-round-trip, session-log) bleiben wie
+ * sie sind. steuerzeichen-escapes (\u000a) bleiben stehen: ein
+ * echter zeilenumbruch mitten in der darstellungs-zeile wuerde
+ * das rendering kaputt machen. kaputte escapes bleiben literal. */
+static void decode_unicode_escapes(char *s)
+{
+    size_t r = 0; /* lese-position */
+    size_t w = 0; /* schreib-position */
+    while (s[r] != '\0') {
+        if (s[r] == '\\') {
+            if (s[r + 1] == '\\') {
+                /* doppelter backslash: im rohen json ein ESCAPTER
+                 * backslash – das folgende \u0026 gehoert nicht
+                 * uns. beide zeichen unangetastet lassen */
+                s[w++] = s[r++];
+                s[w++] = s[r++];
+                continue;
+            }
+            size_t consumed = 0;
+            long cp = parse_unicode_escape(s + r, &consumed);
+            if (cp > 0x1F && cp != 0x7F) {
+                /* invariante: w <= r, und dekodieren liest mindestens
+                 * 6 byte (bzw. 12), schreibt aber hoechstens 4 – der
+                 * schreibzeiger kann den lesezeiger nie ueberholen,
+                 * jedes geschriebene byte bleibt im string */
+                char enc[4];
+                size_t n = utf8_encode(cp, enc);
+                for (size_t k = 0; k < n; k++) {
+                    s[w++] = enc[k];
+                }
+                r += consumed;
+                continue;
+            }
+        }
+        s[w++] = s[r++];
+    }
+    s[w] = '\0';
+}
+
+char *chat_tool_display(const ChatToolCall *call)
+{
+    static const char arrow[] = "\xE2\x86\x92 "; /* utf-8 pfeil + space */
+    static const size_t arrow_len = sizeof arrow - 1;
+    const char *name = (call->name != NULL) ? call->name : "?";
+    const char *args = (call->arguments != NULL) ? call->arguments : "";
+    size_t nlen = strlen(name);
+    size_t alen = strlen(args);
+    if (nlen > SIZE_MAX - alen || nlen + alen > SIZE_MAX - arrow_len - 2) {
+        die("out of memory"); /* laengen-ueberlauf: rein theoretisch */
+    }
+    char *s = malloc(arrow_len + nlen + 1 + alen + 1 + 1);
+    if (s == NULL) {
+        die("out of memory");
+    }
+    size_t pos = 0;
+    memcpy(s + pos, arrow, arrow_len);
+    pos += arrow_len;
+    memcpy(s + pos, name, nlen);
+    pos += nlen;
+    s[pos++] = '(';
+    memcpy(s + pos, args, alen);
+    pos += alen;
+    s[pos++] = ')';
+    s[pos] = '\0';
+    /* anzeige entschaerfen: \u0026 -> & usw. (nur darstellung!) */
+    decode_unicode_escapes(s);
+    return s;
+}
+
+/* tool-call in darstellungs-zeilen zerlegen: die erste beginnt mit
+ * pfeil und name am linken rand, fortsetzungen ruecken um
+ * TOOL_INDENT_W ein. off/len der emittierten ChatLines verweisen
+ * auf den darstellungs-string (chat_tool_display) – genau den
+ * baut sich row_tool_call zum zeichnen wieder auf. umbruch wie beim
+ * nachrichten-text: am letzten leerzeichen, ueberlange worte hart
+ * an der breite. */
+static void wrap_tool_call(ChatRole role, size_t msg, int tool,
+                           const ChatToolCall *call, int width, ChatLine *out,
+                           size_t out_max, size_t *count)
+{
+    char *s = chat_tool_display(call);
+    if (s == NULL) {
+        die("out of memory");
+    }
+
+    int line_w = width;
+    if (line_w < 1) {
+        line_w = 1;
+    }
+    bool first_line = true;
+    size_t off = 0;        /* byte-offset des zeilenanfangs in s */
+    size_t brk = SIZE_MAX; /* letztes passendes leerzeichen */
+    int cells = 0;         /* sichtbare zellen seit zeilenanfang */
+    size_t i = 0;
+    while (s[i] != '\0') {
+        if (s[i] == ' ') {
+            brk = i;
+        }
+        size_t blen;
+        (void)utf8_step(s + i, &blen);
+        if (cells + 1 > line_w) {
+            size_t next;
+            if (brk != SIZE_MAX && brk > off) {
+                wrap_emit(role, msg, off, brk - off, first_line, tool, out,
+                          out_max, count);
+                next = brk + 1;
+            } else {
+                wrap_emit(role, msg, off, i - off, first_line, tool, out,
+                          out_max, count);
+                next = i;
+            }
+            first_line = false;
+            line_w = width - TOOL_INDENT_W;
+            if (line_w < 1) {
+                line_w = 1;
+            }
+            i = next;
+            off = next;
+            brk = SIZE_MAX;
+            cells = 0;
+            continue;
+        }
+        cells++;
+        i += blen;
+    }
+    /* rest; auch ein kurzer aufruf ("-> name()") ist genau eine
+     * zeile. endete der text exakt am letzten umbruch, bleibt
+     * nichts uebrig */
+    if (off < i || first_line) {
+        wrap_emit(role, msg, off, i - off, first_line, tool, out, out_max,
+                  count);
+    }
+    free(s);
+}
+
 size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
 {
     if (chat == NULL || width < 1) {
@@ -376,10 +600,13 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
             wrap_emit(role, mi, off, i - off, first, -1, out, out_max, &count);
         }
 
-        /* tool-calls der nachricht: je eine darstellungs-zeile nach
-         * dem text (die renderer in draw.c schneidet sie am rand ab) */
+        /* tool-calls der nachricht: darstellungs-zeilen nach dem
+         * text. uebergrosse aufrufe – z.B. bash mit sehr langen
+         * parametern – brechen am zeilenrand um, fortsetzungen
+         * ruecken um TOOL_INDENT_W ein */
         for (size_t t = 0; t < chat->msgs[mi].tool_calls_len; t++) {
-            wrap_emit(role, mi, 0, 0, first, (int)t, out, out_max, &count);
+            wrap_tool_call(role, mi, (int)t, &chat->msgs[mi].tool_calls[t],
+                           width, out, out_max, &count);
         }
     }
     return count;

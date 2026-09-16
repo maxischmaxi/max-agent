@@ -44,6 +44,12 @@ int cmd_lookup(const char *word);
 int cmd_name_col(void);
 int cmd_match(const char *prefix, int *out, int out_max);
 
+/* hoehe der befehlsliste unter dem eingabefeld (0 = geschlossen):
+ * treffer-zeilen oder eine hinweis-zeile. keys.c braucht sie fuer
+ * die wachstumsentscheidung der eingabe, der dock fuer seine
+ * geometrie – beide muessen dieselbe zahl sehen. */
+int cmd_list_height(const AppState *st);
+
 /* dialog-oeffner: setzen die dialog-flags im state und leeren die
  * chat-eingabe (das input liegt als member im state) */
 void cmd_new(AppState *state);

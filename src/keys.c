@@ -179,6 +179,16 @@ static bool has_abort(const char *buf, size_t len)
             if (seq == 0) {
                 return false; /* sequenz unvollstaendig: abwarten */
             }
+            /* kitty-terminals (die app fragt "alle tasten als
+             * escape-codes" an) melden ctrl+c als CSI 99;5u und
+             * esc als CSI 27u – rohe bytes kommen dann NIE an.
+             * die sequenz dekodieren und auf die abbruch-kinds
+             * pruefen, sonst laegest die app in jeder anfrage
+             * fest, bis der idle-timeout feuert. */
+            Key k = key_from_escape(buf + i, (ssize_t)seq);
+            if (k.kind == KEY_CTRL_C || k.kind == KEY_ESCAPE) {
+                return true;
+            }
             i += seq; /* ganze sequenz ueberspringen */
             continue;
         }
@@ -223,6 +233,10 @@ static unsigned mods_bits(int mods)
     return bits & ~(64U | 128U);
 }
 
+/* codepoint als utf-8 in einen KEY_CHAR-key schreiben (kitty-
+ * protokoll meldet zeichen als codepoint, nicht als bytes) */
+static void key_set_cp(Key *k, int cp);
+
 static KeyKind modified_key(int cp, unsigned bits)
 {
     if ((bits & 4U) != 0U) {
@@ -236,34 +250,47 @@ static KeyKind modified_key(int cp, unsigned bits)
 
 /* CSI <codepoint>;<mods> u (kitty) und CSI 27;<mods>;<codepoint> ~
  * (xterm modifyOtherKeys) tragen dieselbe information */
-static KeyKind key_from_csi_codepoint(int cp, unsigned bits)
+static Key key_from_csi_codepoint(int cp, unsigned bits)
 {
+    Key k = {KEY_NONE, {0}};
+
     if (cp == 13 && (bits & 7U) != 0U) {
-        return KEY_NEWLINE; /* shift/alt/ctrl + enter */
+        k.kind = KEY_NEWLINE; /* shift/alt/ctrl + enter */
+        return k;
     }
     if (cp == 106 && (bits & 4U) != 0U) {
-        return KEY_NEWLINE; /* ctrl+j */
+        k.kind = KEY_NEWLINE; /* ctrl+j */
+        return k;
+    }
+    if ((bits == 0U || bits == 1U) && cp >= 32 && cp != 127 && cp <= 0x10FFFF) {
+        /* text-codepoint, unmodifiziert oder NUR shift: das ist das
+         * zeichen selbst. kitty-terminals mit "alle tasten als
+         * escape-codes" melden auch gewoehnliche buchstaben und
+         * umlaute so (bits == 0); shift+space oder shift+ziffern
+         * laufen hier als das schlichte zeichen (bits == 1).
+         * tab, enter und esc sind cp < 32 und treffen nicht ein. */
+        k.kind = KEY_CHAR;
+        key_set_cp(&k, cp);
+        return k;
     }
     if (bits == 0U) {
-        /* unmodifizierte tasten, die das kitty-protokoll ebenfalls
-         * als CSI u meldet */
+        /* sondertasten im kitty-encoding */
         if (cp == 9) {
-            return KEY_TAB;
+            k.kind = KEY_TAB;
+        } else if (cp == 13) {
+            k.kind = KEY_ENTER;
+        } else if (cp == 27) {
+            k.kind = KEY_ESCAPE;
         }
-        if (cp == 13) {
-            return KEY_ENTER;
-        }
-        if (cp == 27) {
-            return KEY_ESCAPE;
-        }
-        return KEY_NONE;
+        return k;
     }
-    return modified_key(cp, bits);
+    k.kind = modified_key(cp, bits);
+    return k;
 }
 
 Key key_from_escape(const char *seq, ssize_t len)
 {
-    Key k = {KEY_NONE, 0};
+    Key k = {KEY_NONE, {0}};
 
     if (len == 1) {
         /* einzelnes esc ohne nachfolgende bytes */
@@ -335,17 +362,17 @@ Key key_from_escape(const char *seq, ssize_t len)
         /* kitty-protokoll: CSI <codepoint>;<mods> u. shift+tab
          * (9;2u bzw. CSI Z) bleibt frei, z.B. fuer spaeteres
          * reverse-completion */
-        k.kind = key_from_csi_codepoint(p[0], mods_bits(p[1]));
+        k = key_from_csi_codepoint(p[0], mods_bits(p[1]));
     } else if (final == '~' && p[0] == 27 && p[2] >= 0) {
         /* xterm modifyOtherKeys: CSI 27;<mods>;<codepoint> ~ */
-        k.kind = key_from_csi_codepoint(p[2], mods_bits(p[1]));
+        k = key_from_csi_codepoint(p[2], mods_bits(p[1]));
     }
     return k;
 }
 
 Key key_from_byte(char c)
 {
-    Key k = {KEY_NONE, 0};
+    Key k = {KEY_NONE, {0}};
     if (c == '\r') {
         k.kind = KEY_ENTER;
     } else if (c == '\n') {
@@ -358,12 +385,52 @@ Key key_from_byte(char c)
         k.kind = KEY_TAB;
     } else if (c >= 32 && c <= 126) {
         k.kind = KEY_CHAR;
-        k.ch = c;
+        k.ch[0] = c;
+        k.ch[1] = '\0';
     } else {
         /* ctrl-shortcuts aus dem steuerzeichen-bereich (tabelle) */
         k.kind = ctrl_from_byte((unsigned char)c);
     }
     return k;
+}
+
+/* rohe utf-8-folge als KEY_CHAR: umlaute und sz kommen im legacy-
+ * encoding als 2-byte-folge an, emoji als 4 bytes. die laenge
+ * stammt aus key_seq_len, ist also schon validiert */
+Key key_from_utf8(const char *buf, size_t len)
+{
+    Key k = {KEY_NONE, {0}};
+    if (len < 1 || len > 4) {
+        return k; /* keine zeichen laenger als 4 bytes */
+    }
+    memcpy(k.ch, buf, len);
+    k.ch[len] = '\0';
+    k.kind = KEY_CHAR;
+    return k;
+}
+
+static void key_set_cp(Key *k, int cp)
+{
+    char *c = k->ch;
+    if (cp < 0x80) {
+        c[0] = (char)cp;
+        c[1] = '\0';
+    } else if (cp < 0x800) {
+        c[0] = (char)(0xC0 | (cp >> 6));
+        c[1] = (char)(0x80 | (cp & 0x3F));
+        c[2] = '\0';
+    } else if (cp < 0x10000) {
+        c[0] = (char)(0xE0 | (cp >> 12));
+        c[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        c[2] = (char)(0x80 | (cp & 0x3F));
+        c[3] = '\0';
+    } else {
+        c[0] = (char)(0xF0 | (cp >> 18));
+        c[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        c[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        c[3] = (char)(0x80 | (cp & 0x3F));
+        c[4] = '\0';
+    }
 }
 
 size_t key_seq_len(const char *buf, size_t len)
@@ -372,6 +439,29 @@ size_t key_seq_len(const char *buf, size_t len)
         return 0;
     }
     if (buf[0] != 0x1b) {
+        /* utf-8-folge: ein umlaut/sz sind 2 bytes, emoji bis zu 4.
+         * erst wenn sie komplett ist, ist es EIN tastendruck; eine
+         * halbe folge wartet auf den rest. kaputte folge = 1 byte
+         * muell, der als einzelbyte verworfen wird */
+        unsigned char c = (unsigned char)buf[0];
+        if (c >= 0xC2U && c <= 0xF4U) {
+            size_t need = 2; /* lead-byte-art sagt die folgenlaenge */
+            if (c >= 0xE0U) {
+                need = 3;
+            }
+            if (c >= 0xF0U) {
+                need = 4;
+            }
+            if (len < need) {
+                return 0; /* folge unvollstaendig: rest kommt noch */
+            }
+            for (size_t i = 1; i < need; i++) {
+                if (((unsigned char)buf[i] & 0xC0U) != 0x80U) {
+                    return 1; /* kaputte folge: nur das lead-byte */
+                }
+            }
+            return need;
+        }
         return 1; /* normales zeichen */
     }
     if (len == 1) {
@@ -423,9 +513,16 @@ static FillResult fill_pending(void)
 /* die ersten seq_len bytes als eine taste auswerten und entfernen */
 static Key take_pending(size_t seq_len)
 {
-    Key k = (g_pending[0] == 0x1b)
-                ? key_from_escape(g_pending, (ssize_t)seq_len)
-                : key_from_byte(g_pending[0]);
+    unsigned char first = (unsigned char)g_pending[0];
+    Key k = {KEY_NONE, {0}};
+    if (g_pending[0] == 0x1b) {
+        k = key_from_escape(g_pending, (ssize_t)seq_len);
+    } else if (first >= 0xC2U && first <= 0xF4U) {
+        /* umlaut/sz/emoji: rohe utf-8-folge */
+        k = key_from_utf8(g_pending, seq_len);
+    } else {
+        k = key_from_byte(g_pending[0]);
+    }
     g_pending_len -= seq_len;
     memmove(g_pending, g_pending + seq_len, g_pending_len);
     return k;
@@ -466,10 +563,10 @@ Key key_read(void)
         }
         FillResult r = fill_pending();
         if (r == FILL_EOF) {
-            return (Key){KEY_CTRL_Q, 0};
+            return (Key){KEY_CTRL_Q, {0}};
         }
         if (r == FILL_NONE) {
-            return (Key){KEY_NONE, 0}; /* EINTR: resize pruefen */
+            return (Key){KEY_NONE, {0}}; /* EINTR: resize pruefen */
         }
         waited = 0; /* fortschritt: die wartezeit beginnt von vorn */
     }
@@ -745,9 +842,9 @@ static void handle_models(AppState *state, Config *cfg, Key k)
         break;
     case KEY_ENTER:
     case KEY_NEWLINE: {
-        /* treffer uebernehmen: layout-daten sind nur im draw
-         * gueltig -> hier nochmal filtern (billig), selected
-         * ist von layout_compute() schon angeglichen */
+        /* treffer uebernehmen: die dialog-normalisierung laeuft im
+         * draw (dock_build) -> hier nochmal filtern (billig),
+         * selected ist dort schon angeglichen */
         int hits[DIALOG_MATCH_MAX];
         int n = models_match(cfg, state->dialog.search, hits, DIALOG_MATCH_MAX);
         if (n > 0 && state->dialog.selected < n) {
@@ -773,9 +870,9 @@ static void handle_models(AppState *state, Config *cfg, Key k)
 }
 
 /* ------------------------------------------------------------------ */
-/* resume-dialog: session-liste full-screen. suchen/cursor wie bei   */
-/* allen dialogs (dialog_navigate); enter laedt die gewaehlte        */
-/* session zurueck in den chat, esc laesst alles unangetastet.       */
+/* resume-dialog: session-liste als unten angedockte box, wie alle */
+/* dialogs. suchen/cursor via dialog_navigate; enter laedt die ge-  */
+/* waehlte session zurueck in den chat, esc laesst alles unberuehrt */
 /* ------------------------------------------------------------------ */
 
 static void sessions_dialog_close(AppState *state)
@@ -836,7 +933,10 @@ static void handle_sessions(AppState *state, Config *cfg, Key k)
                 state->ctx.dropped = 0;
                 (void)session_read_transcript(&state->session, &state->chat,
                                               &state->ctx);
-                state->chat_scroll = 0; /* ans ende folgen */
+                state->worked_ms = state->session.worked_ms;
+                /* renderer-frontier: der chat wurde ersetzt, neu
+                 * gedruckt wird nur der schwanz */
+                draw_content_reset();
             } else {
                 if (chat_append(&state->chat, CHAT_ROLE_ERROR,
                                 "session nicht lesbar") != 0) {
@@ -893,19 +993,14 @@ typedef struct {
 static void stream_redraw(void *ud)
 {
     StreamRedrawCtx *rc = ud;
+    /* der anker bleibt WAHREND der ganzen antwort aktiv: die
+     * wachsende antwort darf die gesendete nachricht nicht aus
+     * dem viewport druecken – auch nicht, wenn sie laenger wird
+     * als der viewport fasst (dann schneidet der hinten unten
+     * ab und der benutzer blaettert selbst hin). gehoben wird
+     * er erst durch blaettern, eine neue nachricht, /new oder
+     * resume. */
     draw(rc->rows, rc->cols, rc->state, rc->cfg);
-}
-
-static int cmd_list_height(const AppState *st)
-{
-    if (!st->cmd_active) {
-        return 0;
-    }
-    char prefix[64];
-    int idx[COMMAND_COUNT];
-    cmd_prefix(&st->input, prefix, sizeof prefix);
-    int n = cmd_match(prefix, idx, COMMAND_COUNT);
-    return (n > 0) ? n : 1; /* kein treffer: hinweis-zeile reservieren */
 }
 
 static void cmd_parse(const AppState *st, char *word, size_t word_sz,
@@ -1065,9 +1160,14 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
                 }
                 (void)session_log_user(&state->session, text);
                 free(text);
-                state->chat_scroll = 0; /* neue nachricht: folgen */
+                /* viewport am ANFANG der eigenen nachricht fest-
+                 * machen: eine mehrzeilige nachricht darf nie von
+                 * oben beschnitten werden ("dem ende folgen" wuerde
+                 * sonst die ersten zeilen wegschneiden). der erste
+                 * stream-redraw hebt das wieder auf. */
 
                 state->busy = true;
+                state->busy_start_ms = mono_ms();
                 draw(rows, cols, state, cfg);
                 StreamRedrawCtx rc = {
                     .state = state,
@@ -1081,6 +1181,14 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
                 };
                 (void)send_stream(state, cfg, &hooks);
                 state->busy = false;
+                /* turn vorbei: die arbeitszeit in die gesamt-
+                 * buchhaltung und die session schreiben. gescheiterter
+                 * turn zaehlt nicht (kein busy_start gesetzt) */
+                if (state->busy_start_ms > 0) {
+                    state->worked_ms += mono_ms() - state->busy_start_ms;
+                    state->busy_start_ms = 0;
+                    session_worked_set(&state->session, state->worked_ms);
+                }
             }
             state->dirty = true;
         }
@@ -1093,7 +1201,12 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
         state->dirty = true;
         break;
     case KEY_CHAR:
-        input_char(input, k.ch);
+        /* k.ch ist eine utf-8-sequence (umlaute = 2 bytes): das
+         * feld frisst byteweise, die zellzaehlung (wrap_step) ist
+         * utf-8-faehig – ein umlaut bleibt EINE zelle */
+        for (const char *p = k.ch; *p != '\0'; p++) {
+            input_char(input, *p);
+        }
         state->cmd_active = input_in_cmd(input);
         state->dirty = true;
         break;
@@ -1118,27 +1231,6 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
             true; /* egal ob vervollstaendigt: redraw zeigt den log */
         break;
     }
-    /* chat-viewport blaettern: die hoehe des verlaufs entspricht
-     * den zeilen ueber der input-box (rows - input-zeilen - rahmen);
-     * layout_compute klemmt alles weitere und schreibt zurueck */
-    case KEY_PGUP:
-    case KEY_PGDN: {
-        int page = rows - (int)input->count - 3;
-        if (page < 1) {
-            page = 1;
-        }
-        if (k.kind == KEY_PGUP) {
-            state->chat_scroll += page;
-        } else if (state->chat_scroll > 0) {
-            state->chat_scroll -= page;
-            if (state->chat_scroll < 0) {
-                state->chat_scroll = 0;
-            }
-        }
-        state->dirty = true;
-        break;
-    }
-
     /* POSIX/readline-shortcuts: nur im normalen chat-input aktiv
      * (die dialog-handler ignorieren sie). alles laeuft ueber die
      * multiline-faehige cursor-utility aus input.c. */
@@ -1191,8 +1283,8 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
         state->dirty = true;
         break;
     case KEY_CTRL_L:
-        /* bildschirm neu zeichnen (clear + redraw, wie resize) */
-        fputs("\x1b[2J", stdout);
+        /* dock neu zeichnen. KEIN \x1b[2J: das wuerde den terminal-
+         * scrollback zerstoeren, in dem der ganze verlauf lebt */
         state->dirty = true;
         break;
     case KEY_CTRL_T:
@@ -1277,7 +1369,12 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
     case KEY_NONE:
     case KEY_CTRL_C:
     case KEY_CTRL_Q:
-        break; /* alle ohne wirkung im chat-modus */
+    case KEY_PGUP:
+    case KEY_PGDN:
+        /* pgup/pgdn: das blaettern uebernimmt das terminal selbst
+         * (tmux-history, mausrad) – die app hat keinen viewport
+         * mehr, der verlauf lebt im scrollback */
+        break;
     }
 }
 

@@ -18,11 +18,15 @@ typedef enum {
     MODE_SETTINGS, /* settings-liste am unteren rand */
     MODE_THEME,    /* theme-untermenue des settings-dialogs */
     MODE_PROMPT,   /* system-prompt-untermenue des settings-dialogs */
-    MODE_SESSIONS, /* resume-dialog: session-liste ueber den ganzen */
-                   /* bildschirm */
+    MODE_SESSIONS, /* resume-dialog: session-liste als dock-box */
 } UIMode;
 
 const char *get_home(void);
+
+/* monotone uhr in millisekunden: laufzeitmessungen (spinner,
+ * arbeitszeit der ki, stream-drossel) – nie wandern, auch nicht
+ * bei ntp-spruengen */
+long long mono_ms(void);
 char *append_to_home(char *suffix);
 int read_file(const char *restrict path, char **restrict out_buf,
               size_t *restrict out_size);

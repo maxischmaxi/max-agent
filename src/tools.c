@@ -3,11 +3,15 @@
 
 #include "tools.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 #include "utils.h"
@@ -178,6 +182,24 @@ static char *tool_write_file(const cJSON *args)
     return fmt("ok (%d bytes written)", (int)len);
 }
 
+/* aktuell laufendes bash-kind. der worker-thread setzt es nach dem
+ * fork, der haupt-thread liest es fuer den abbruch — volatile
+ * sig_atomic_t reicht, pid_t passt rein und zugriffe sind auf
+ * linux praktisch atomar. 0 = kein tool laeuft. */
+static volatile sig_atomic_t g_bash_child = 0;
+
+/* den laufenden tool-call abbrechen (haupt-thread, bei ctrl+c/esc):
+ * SIGKILL an die PROZESSGRUPPE – das erwischt die shell samt aller
+ * von ihr gestarteten kinder. der worker-thread kehrt danach sofort
+ * aus dem read zurueck (EOF) und wartet das kind ab. */
+void tool_kill_current(void)
+{
+    pid_t child = (pid_t)g_bash_child;
+    if (child > 0) {
+        (void)kill(-child, SIGKILL);
+    }
+}
+
 static char *tool_bash(const cJSON *args)
 {
     char *command = arg_string(args, "command");
@@ -187,26 +209,64 @@ static char *tool_bash(const cJSON *args)
     /* stderr wird mit eingesammelt; die subshell-klammer stellt
      * sicher, dass NUTZER-redirections (z.B. "echo x 1>&2")
      * zuerst wirken und "2>&1" sie nicht kaputtmacht */
-    char cmd_buf[512];
-    int n = snprintf(cmd_buf, sizeof cmd_buf, "(%s) 2>&1", command);
+    size_t clen = strlen(command);
+    /* "(%s) 2>&1": klammer, space und "2>&1" sind 7 zeichen + NUL */
+    size_t cmd_len = clen + 8;
+    char *cmd_buf = malloc(cmd_len);
+    if (cmd_buf == NULL) {
+        free(command);
+        return NULL;
+    }
+    (void)snprintf(cmd_buf, cmd_len, "(%s) 2>&1", command);
     free(command);
-    if (n < 0 || (size_t)n >= sizeof cmd_buf) {
-        return fmt("error: command too long");
-    }
 
-    /* die shell ist hier der zweck des tools, nicht der unfall */
+    /* eigenes fork/exec statt popen: popen gibt die pid nicht her,
+     * und wir MUessen das kind beim abbruch killen koennen. das
+     * kind bekommt eine eigene prozessgruppe (kill -pid erwischt
+     * auch seine kinder) und stdin aus /dev/null – ein kommando,
+     * das eingaben erwartet, kann das terminal NIE anfassen. */
+    int outfd[2];
+    if (pipe(outfd) != 0) {
+        free(cmd_buf);
+        return fmt("error: pipe failed");
+    }
     // NOLINTNEXTLINE(bugprone-command-processor)
-    FILE *p = popen(cmd_buf, "r");
-    if (p == NULL) {
-        return fmt("error: popen failed");
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(outfd[0]);
+        close(outfd[1]);
+        free(cmd_buf);
+        return fmt("error: fork failed");
     }
+    if (pid == 0) {
+        /* kind: eigene prozessgruppe, umlenken, exec */
+        (void)setpgid(0, 0);
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
+        (void)dup2(outfd[1], STDOUT_FILENO);
+        (void)dup2(outfd[1], STDERR_FILENO);
+        close(outfd[0]);
+        close(outfd[1]);
+        execl("/bin/sh", "sh", "-c", cmd_buf, (char *)NULL);
+        _exit(127);
+    }
+    free(cmd_buf);
+    close(outfd[1]);
+    g_bash_child = (sig_atomic_t)pid;
 
-    /* output einsammeln, bis datei-ende oder tool-budget */
+    /* output einsammeln, bis datei-ende oder tool-budget. rohes
+     * read auf dem pipe-fd (kein stdio): der leser ist der worker-
+     * thread, und beim kill des kinds liefert read sofort EOF */
     size_t cap = 4096;
     size_t got = 0;
     char *buf = malloc(cap);
     if (buf == NULL) {
-        pclose(p);
+        close(outfd[0]);
+        (void)waitpid(pid, NULL, 0);
+        g_bash_child = 0;
         return NULL;
     }
     for (;;) {
@@ -217,20 +277,33 @@ static char *tool_bash(const cJSON *args)
             char *grown = realloc(buf, cap * 2);
             if (grown == NULL) {
                 free(buf);
-                pclose(p);
+                close(outfd[0]);
+                (void)waitpid(pid, NULL, 0);
+                g_bash_child = 0;
                 return NULL;
             }
             buf = grown;
             cap *= 2;
         }
-        size_t chunk = fread(buf + got, 1, cap - got - 1, p);
-        got += chunk;
-        buf[got] = '\0';
-        if (chunk == 0) {
-            break;
+        ssize_t chunk = read(outfd[0], buf + got, cap - got - 1);
+        if (chunk < 0) {
+            if (errno == EINTR) {
+                continue; /* signal: einfach weiterlesen */
+            }
+            break; /* lesefehler: was da ist, ist da */
         }
+        if (chunk == 0) {
+            break; /* eof: das kind ist fertig (oder gekillt) */
+        }
+        got += (size_t)chunk;
     }
-    int status = pclose(p);
+    buf[got] = '\0'; /* terminierung EINMAL nach der schleife */
+    close(outfd[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        /* weiter warten: nur EINTR abfangen */
+    }
+    g_bash_child = 0;
     int exit_code = -1;
     if (WIFEXITED(status)) {
         exit_code = WEXITSTATUS(status);

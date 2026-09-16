@@ -41,6 +41,8 @@ typedef struct {
     char *name;           /* NULL = unbenannt (via /rename setzbar) */
     long long created_at; /* unix-millisekunden */
     long long updated_at; /* dito, bei jedem ereignis nachgefuehrt */
+    long long worked_ms;  /* kumulierte zeit, die die ki in dieser */
+                          /* session gearbeitet hat (alle turns)  */
     size_t messages;      /* ereignisse im transcript (list-anzeige) */
     char *model;          /* snapshot des modells bei session_start */
     char *base_url;       /* dito provider-url */
@@ -102,15 +104,22 @@ int session_prompt_changed(Session *s, const char *prompt);
 /* ------------------------------------------------------------------ */
 int session_log_user(Session *s, const char *text);
 
+/* die kumulierte arbeitszeit der session setzen (turn-ende, wenn
+ * die ki fertig ist) und ins meta schreiben */
+void session_worked_set(Session *s, long long worked_ms);
+
 /* eine (ggf. noch teil-) antwort des modells. calls = die tool-
  * calls, die daran haengen (NULL/0 = keine). ttft/total in ms,
- * <0 = nicht gemessen. round = agent-loop-runde, <0 = unbekannt.
+ * <0 = nicht gemessen. work_ms = die zeit des GESAMTEN turns seit
+ * der user-nachricht (thinking + alle runden + tools), <0 = un-
+ * bekannt. round = agent-loop-runde, <0 = unbekannt.
  * token-zaehlung <0 = die api hat nichts geliefert. */
 int session_log_assistant(Session *s, const char *text,
                           const ChatToolCall *calls, size_t calls_len,
-                          long long ttft_ms, long long total_ms, int round,
-                          const char *model, int prompt_tokens,
-                          int completion_tokens, bool aborted);
+                          long long ttft_ms, long long total_ms,
+                          long long work_ms, int round, const char *model,
+                          int prompt_tokens, int completion_tokens,
+                          bool aborted);
 
 /* ergebnis eines tool-aufrufs. dur_ms = ausfuehrungsdauer. */
 int session_log_tool(Session *s, const char *call_id, const char *name,

@@ -70,7 +70,10 @@ typedef enum {
 
 typedef struct {
     KeyKind kind;
-    char ch;
+    /* KEY_CHAR: das getippte zeichen als utf-8-sequence (1..4
+     * bytes, immer '\0'-terminiert) – umlaute und sz sind mehr-
+     * byte-folgen. alles, was kein KEY_CHAR ist, laesst es leer */
+    char ch[5];
 } Key;
 
 typedef struct {
@@ -80,6 +83,11 @@ typedef struct {
 
 Key key_from_escape(const char *seq, ssize_t len);
 Key key_from_byte(char c);
+
+/* rohe utf-8-folge (die komplette sequenz, 1..4 bytes) als
+ * KEY_CHAR: so kommen umlaute und sz im legacy-encoding an. */
+Key key_from_utf8(const char *buf, size_t len);
+
 Key key_read(void);
 
 /* laenge der ersten vollstaendigen tastensequenz in buf. 0 heisst

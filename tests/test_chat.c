@@ -301,331 +301,169 @@ static void test_wrap(void)
     chat_free(&c);
 }
 
-static void test_layout(void)
+/* tool-calls brechen um, wenn die darstellung laenger ist als die
+ * zeile: erste zeile mit pfeil am rand, fortsetzungen eingerueckt.
+ * die segment-grenzen (off/len) muessen auf den darstellungs-
+ * string passen und duerfen die breite nie ueberschreiten. */
+static void test_tool_call_wrap(void)
 {
-    /* --- layout: scroll-normalisierung im viewport --- */
-    AppState st = {0};
-    input_init(&st.input);
-    Config cfg = {0};
+    Chat chat = {0};
+    CHECK(chat_append(&chat, CHAT_ROLE_ASSISTANT, "") == 0);
 
-    /* verlauf GROESSER als das viewport (24 zeilen terminal:
-     * input-box 3 zeilen -> chat_h = 20), damit scroll greift */
-    for (int i = 1; i <= 30; i++) {
-        char buf[32];
-        snprintf(buf, sizeof buf, "zeile %d", i);
-        CHECK(chat_append(&st.chat, CHAT_ROLE_USER, buf) == 0);
-    }
-    st.chat_scroll = 0; /* unten */
-
-    Layout lt;
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.chat_h == lt.input_top - 1);
-    CHECK((int)lt.chat_lines_len == 30);
-    CHECK(lt.chat_h > 0);
-    CHECK(st.chat_scroll == 0);
-    /* am ende des verlaufs: nichts unten verdeckt, aber oben – der
-     * "weiter oben"-hinweis belegt zeile 1 und kostet eine
-     * verlaufs-zeile */
-    CHECK(lt.more_below == 0);
-    CHECK(lt.more_below_row == 0);
-    CHECK(lt.more_above_row == 1);
-    CHECK(lt.chat_top == 2);
-    int view = lt.chat_h - 1; /* eine zeile geht an den hinweis */
-    CHECK(lt.chat_first == 30 - view);
-    CHECK(lt.more_above == lt.chat_first);
-    /* slot-mapping: die erste verlaufs-zeile liegt jetzt in zeile 2 */
-    Slot sHint = layout_slot(&lt, 1);
-    CHECK(sHint.kind == SLOT_MORE_ABOVE);
-    Slot s1 = layout_slot(&lt, lt.chat_top);
-    CHECK(s1.kind == SLOT_MSG_USER);
-    CHECK(s1.index == lt.chat_first);
-    Slot sLast = layout_slot(&lt, lt.chat_h);
-    CHECK(sLast.kind == SLOT_MSG_USER);
-    CHECK(sLast.index == (int)lt.chat_lines_len - 1);
-
-    /* zu weit gescrollt: layout klemmt und schreibt zurueck. ganz
-     * oben faellt der obere hinweis weg, dafuer kommt der untere */
-    st.chat_scroll = 999;
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.chat_first == 0);
-    CHECK(lt.more_above == 0);
-    CHECK(lt.more_above_row == 0);
-    CHECK(lt.chat_top == 1);
-    CHECK(lt.more_below > 0);
-    CHECK(lt.more_below_row == lt.input_top - 1);
-    CHECK(st.chat_scroll == 30 - (lt.chat_h - 1));
-    CHECK(layout_slot(&lt, lt.more_below_row).kind == SLOT_MORE_BELOW);
-
-    /* pgup um 2 zeilen: viewport rutscht mit, jetzt sind BEIDE
-     * hinweise noetig und kosten zusammen zwei zeilen */
-    st.chat_scroll = 2;
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(st.chat_scroll == 2);
-    CHECK(lt.more_below == 2);
-    CHECK(lt.more_above > 0);
-    CHECK(lt.chat_first == 30 - 2 - (lt.chat_h - 2));
-    CHECK(lt.chat_first > 0);
-    CHECK(layout_slot(&lt, 1).kind == SLOT_MORE_ABOVE);
-    CHECK(layout_slot(&lt, lt.input_top - 1).kind == SLOT_MORE_BELOW);
-
-    /* verlauf KLEINER als viewport: oben anfangen, kein scroll */
-    st.chat_scroll = 5;
-    chat_clear(&st.chat);
-    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "eins") == 0);
-    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "zwei") == 0);
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(st.chat_scroll == 0);
-    CHECK(lt.chat_first == 0);
-    /* alles sichtbar: kein hinweis, verlauf beginnt wieder bei 1 */
-    CHECK(lt.more_above == 0);
-    CHECK(lt.more_below == 0);
-    CHECK(lt.chat_top == 1);
-    Slot sA = layout_slot(&lt, 1);
-    CHECK(sA.kind == SLOT_MSG_USER);
-    Slot sB = layout_slot(&lt, 2);
-    CHECK(sB.kind == SLOT_MSG_ASSISTANT);
-    Slot sEmpty = layout_slot(&lt, 3);
-    CHECK(sEmpty.kind == SLOT_BLANK); /* nichts mehr im verlauf */
-
-    /* zeilen unterm chat-fenster sind keine chat-zeilen: rahmen und
-     * eingabefeld liegen unterhalb */
-    Slot sIn = layout_slot(&lt, lt.input_top);
-    CHECK(sIn.kind == SLOT_BORDER);
-    Slot sLine = layout_slot(&lt, lt.input_top + 1);
-    CHECK(sLine.kind == SLOT_INPUT);
-
-    input_free(&st.input);
-    chat_free(&st.chat);
-}
-
-/* die scroll-hinweise an ihren raendern: sie kosten platz, also
- * muessen sie verschwinden, wenn keiner da ist – und dem thinking-
- * indikator ausweichen, wenn gerade eine anfrage laeuft. */
-static void test_scroll_hints(void)
-{
-    AppState st = {0};
-    input_init(&st.input);
-    Config cfg = {0};
-    Layout lt;
-
-    for (int i = 1; i <= 40; i++) {
-        char buf[32];
-        snprintf(buf, sizeof buf, "zeile %d", i);
-        CHECK(chat_append(&st.chat, CHAT_ROLE_USER, buf) == 0);
-    }
-
-    /* --- waehrend einer anfrage: der untere hinweis rueckt ueber
-     *     den thinking-indikator --- */
-    st.chat_scroll = 3;
-    st.busy = true;
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.busy_row == lt.input_top - 1);
-    CHECK(lt.more_below == 3);
-    CHECK(lt.more_below_row == lt.busy_row - 1);
-    CHECK(layout_slot(&lt, lt.busy_row).kind == SLOT_BUSY);
-    CHECK(layout_slot(&lt, lt.more_below_row).kind == SLOT_MORE_BELOW);
-    /* der verlauf liegt dazwischen, ohne ueberschneidung */
-    CHECK(layout_slot(&lt, lt.chat_top).kind == SLOT_MSG_USER);
-    CHECK(layout_slot(&lt, lt.more_below_row - 1).kind == SLOT_MSG_USER);
-    st.busy = false;
-
-    /* --- winziges terminal: lieber verlauf zeigen als hinweise --- */
-    for (int rows = 5; rows <= 8; rows++) {
-        st.chat_scroll = 3;
-        layout_compute(&lt, rows, 80, MODE_INPUT, &st, &cfg);
-        int hints =
-            (lt.more_above_row > 0 ? 1 : 0) + (lt.more_below_row > 0 ? 1 : 0);
-        /* nie mehr hinweise als platz da ist, und immer mindestens
-         * eine zeile echter verlauf */
-        CHECK(hints <= lt.chat_h - 1 || hints == 0);
-        if (lt.chat_h > 0) {
-            CHECK(lt.chat_top <= lt.chat_h);
-        }
-        /* die hinweis-zeilen ueberschneiden sich nie */
-        if (lt.more_above_row > 0 && lt.more_below_row > 0) {
-            CHECK(lt.more_above_row < lt.more_below_row);
-        }
-    }
-
-    /* --- der zurueckgeschriebene scroll passt zum layout --- */
-    st.chat_scroll = 0;
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(st.chat_scroll == 0);
-    CHECK(lt.more_below == 0);
-    /* summe stimmt: oben verdeckt + sichtbar + unten verdeckt */
-    int visible = 0;
-    for (int row = 1; row < lt.input_top; row++) {
-        Slot s = layout_slot(&lt, row);
-        if (s.kind == SLOT_MSG_USER || s.kind == SLOT_MSG_ASSISTANT) {
-            visible++;
-        }
-    }
-    CHECK(lt.more_above + visible + lt.more_below == (int)lt.chat_lines_len);
-
-    input_free(&st.input);
-    chat_free(&st.chat);
-}
-
-/* soft-wrap im eingabefeld: die box waechst mit den umgebrochenen
- * zeilen, ein resize rechnet neu – und der TEXT bleibt dabei
- * unangetastet. das ist der grund, warum der umbruch nicht ins
- * datenmodell geht. */
-static void test_input_wrap_layout(void)
-{
-    AppState st = {0};
-    input_init(&st.input);
-    Config cfg = {0};
-    Layout lt;
-
-    /* --- kurzer text: eine zeile, box wie gehabt --- */
-    input_set_text(&st.input, "kurz");
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.input_bottom - lt.input_top == 2); /* 1 zeile + 2 rahmen */
-    CHECK(lt.input_first == 0);
-    CHECK(lt.input_w > 0);
-    CHECK(layout_slot(&lt, lt.input_top + 1).kind == SLOT_INPUT);
-
-    /* --- text laenger als das feld: die box waechst --- */
-    size_t n = (size_t)lt.input_w * 3;
-    char *lang = malloc(n + 1);
-    CHECK(lang != NULL);
-    if (lang == NULL) {
+    ChatToolCall *call = calloc(1, sizeof *call);
+    CHECK(call != NULL);
+    if (call == NULL) {
         return;
     }
-    memset(lang, 'x', n);
-    lang[n] = '\0';
-    input_set_text(&st.input, lang);
-    CHECK(st.input.count == 1); /* EINE logische zeile */
+    call->id = dup_str("c1");
+    call->name = dup_str("bash");
+    /* argumente mit vielen trennern: nach dem letzten leerzeichen
+     * wird umgebrochen, ein ueberlanges wort haert an der breite */
+    char args[400];
+    args[0] = '\0';
+    strcat(args, "{\"command\":\"");
+    for (int i = 0; i < 40; i++) {
+        strcat(args, "par");
+    }
+    strcat(args, " rest\"}");
+    call->arguments = dup_str(args);
+    CHECK(call->id != NULL && call->name != NULL && call->arguments != NULL);
+    CHECK(chat_set_tool_calls(&chat, call, 1) == 0);
 
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.input_bottom - lt.input_top == 4);  /* 3 zeilen + rahmen */
-    CHECK(strcmp(st.input.lines[0], lang) == 0); /* text unveraendert */
+    ChatLine lines[64];
+    size_t n = chat_wrap(&chat, 40, lines, 64);
+    /* zeile 0: der leere text; danach mindestens 3 segmente */
+    CHECK(n >= 4);
+    CHECK(lines[0].tool == -1);
+    CHECK(lines[1].tool == 0);
+    CHECK(lines[1].off == 0); /* erste zeile beginnt am anfang */
+    CHECK(lines[1].first);    /* (tool-zeilen nutzen first als       */
+                              /*  segment-1-flag, der renderer       */
+                              /*  wertet off == 0 aus)              */
+    char *s = chat_tool_display(&chat.msgs[0].tool_calls[0]);
+    CHECK(s != NULL);
+    if (s != NULL) {
+        /* jedes segment: innerhalb des strings, hoechstens so breit
+         * wie die zeile (erste: 40, folge: 40 - TOOL_INDENT_W) */
+        for (size_t i = 1; i < n; i++) {
+            CHECK(lines[i].tool == 0);
+            CHECK(lines[i].off + lines[i].len <= strlen(s));
+            int w = (i == 1) ? 40 : 40 - TOOL_INDENT_W;
+            CHECK((int)lines[i].len <= w);
+        }
+        /* die segmentation ist lueckenlos bis auf die spaces an
+         * den umbruch-punkten: der erste segment-anfang ist 0, und
+         * nach jedem umbruch geht es dort weiter, wo der letzte
+         * aufhoerte (+1 space) */
+        size_t pos = 0;
+        for (size_t i = 1; i < n; i++) {
+            CHECK(pos <= lines[i].off);
+            if (i > 1) {
+                /* die folgezeile schliesst direkt an (space
+                 * gefallen oder hart umbrochen) */
+                CHECK(lines[i].off >= pos);
+            }
+            pos = lines[i].off + lines[i].len;
+        }
+        free(s);
+    }
 
-    /* --- schmaleres fenster: mehr zeilen, gleicher text --- */
-    layout_compute(&lt, 24, 40, MODE_INPUT, &st, &cfg);
-    int narrow = lt.input_bottom - lt.input_top - 1;
-    CHECK(narrow > 3);
-    CHECK(strcmp(st.input.lines[0], lang) == 0);
-    CHECK(st.input.count == 1);
+    /* schmaler = mehr zeilen, breiter = weniger (resize) */
+    size_t narrow = chat_wrap(&chat, 20, NULL, 0);
+    size_t wide = chat_wrap(&chat, 200, NULL, 0);
+    CHECK(narrow > wide);
+    CHECK(wide == 2); /* text + EIN segment in einer zeile */
 
-    /* --- breiteres fenster: wieder weniger zeilen --- */
-    layout_compute(&lt, 24, 200, MODE_INPUT, &st, &cfg);
-    int wide = lt.input_bottom - lt.input_top - 1;
-    CHECK(wide < narrow);
-    CHECK(strcmp(st.input.lines[0], lang) == 0);
-    CHECK(st.input.count == 1);
-    free(lang);
-
-    /* --- sehr viel text: die box deckelt und scrollt mit --- */
-    char *riesig = malloc(4001);
-    CHECK(riesig != NULL);
-    if (riesig == NULL) {
+    /* kurzer aufruf: weiterhin genau eine zeile */
+    chat_free(&chat);
+    CHECK(chat_append(&chat, CHAT_ROLE_ASSISTANT, "") == 0);
+    ChatToolCall *short_call = calloc(1, sizeof *short_call);
+    CHECK(short_call != NULL);
+    if (short_call == NULL) {
         return;
     }
-    memset(riesig, 'y', 4000);
-    riesig[4000] = '\0';
-    input_set_text(&st.input, riesig);
-    free(riesig);
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    int box_h = lt.input_bottom - lt.input_top - 1;
-    CHECK(box_h > 0);
-    CHECK(lt.input_top >= 1);  /* nie ueber den rand hinaus */
-    CHECK(lt.input_top >= 2);  /* zwei zeilen bleiben oben frei */
-    CHECK(lt.input_first > 0); /* es wird gescrollt */
-    /* die cursor-zeile ist sichtbar */
-    size_t crow = 0;
-    input_cursor_screen(&st.input, lt.input_w, &crow, NULL);
-    CHECK(crow >= lt.input_first);
-    CHECK(crow < lt.input_first + (size_t)box_h);
+    short_call->name = dup_str("bash");
+    short_call->arguments = dup_str("{}");
+    CHECK(chat_set_tool_calls(&chat, short_call, 1) == 0);
+    CHECK(chat_wrap(&chat, 40, lines, 64) == 2);
+    CHECK(lines[1].off == 0);
 
-    /* cursor nach vorn: das feld scrollt zurueck */
-    input_cursor_line_set(&st.input, 0);
-    input_cursor_set(&st.input, 0);
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.input_first == 0);
-
-    /* --- explizite newlines bleiben eigene zeilen --- */
-    input_set_text(&st.input, "a\nb\nc");
-    CHECK(st.input.count == 3);
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.input_bottom - lt.input_top == 4); /* 3 zeilen + rahmen */
-
-    input_free(&st.input);
-    chat_free(&st.chat);
+    chat_free(&chat);
 }
 
-/* die zwei statuszeilen unten: sie sind fest reserviert, gehoeren
- * niemandem sonst, und alles andere rueckt darueber. */
-static void test_status_rows(void)
+/* chat_tool_display dekodiert json-unicode-escapes NUR fuer die
+ * anzeige: \u0026 -> &, umlaute, surrogate-paare (emoji) – und
+ * laesst steuerzeichen-escapes und kaputte escapes literal. */
+static void test_tool_display_escapes(void)
 {
-    AppState st = {0};
-    input_init(&st.input);
-    Config cfg = {0};
-    Layout lt;
+    ChatToolCall call = {0};
+    call.name = "bash";
 
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    /* zeile 24 bleibt frei (dort parkt frame_end den cursor),
-     * darueber die beiden statuszeilen */
-    CHECK(lt.status_row == 24 - STATUS_H);
-    CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
-    CHECK(layout_slot(&lt, lt.status_row + 1).kind == SLOT_STATUS_TOKENS);
-
-    /* das eingabefeld liegt komplett DARUEBER */
-    CHECK(lt.input_bottom < lt.status_row);
-    CHECK(lt.input_top < lt.input_bottom);
-
-    /* keine andere zeile beansprucht die statuszeilen */
-    for (int row = 1; row < lt.status_row; row++) {
-        Slot s = layout_slot(&lt, row);
-        CHECK(s.kind != SLOT_STATUS_MODEL);
-        CHECK(s.kind != SLOT_STATUS_TOKENS);
+    /* das gemeldete szenario: && als \u0026\u0026 */
+    call.arguments = "{\"command\":\"pwd \\u0026\\u0026 ls\"}";
+    char *s = chat_tool_display(&call);
+    CHECK(s != NULL);
+    if (s != NULL) {
+        CHECK(strcmp(s, "\xE2\x86\x92 bash({\"command\":\"pwd && ls\"})") == 0);
+        free(s);
     }
 
-    /* --- mit befehlsliste: alles rueckt hoch, status bleibt --- */
-    input_set_text(&st.input, "/");
-    st.cmd_active = true;
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.status_row == 24 - STATUS_H);
-    CHECK(lt.cmd_h > 0);
-    CHECK(lt.cmd_top + lt.cmd_h <= lt.status_row); /* kein ueberlapp */
-    CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
-    st.cmd_active = false;
-    input_reset(&st.input);
-
-    /* --- mit quit-meldung: die liegt ueber dem status --- */
-    st.confirm_quit = true;
-    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(lt.quit_row > 0);
-    CHECK(lt.quit_row < lt.status_row);
-    CHECK(layout_slot(&lt, lt.quit_row).kind == SLOT_QUIT);
-    CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
-    st.confirm_quit = false;
-
-    /* --- in den dialogen ebenfalls immer sichtbar --- */
-    st.models_dialog = true;
-    layout_compute(&lt, 24, 80, MODE_MODELS, &st, &cfg);
-    CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
-    CHECK(layout_slot(&lt, lt.status_row + 1).kind == SLOT_STATUS_TOKENS);
-    CHECK(lt.box_bottom < lt.status_row); /* dialog bleibt darueber */
-    st.models_dialog = false;
-
-    /* --- kleine terminals: entweder passt der status sauber
-     *     darunter, oder er faellt ganz weg. nie ueberlappen. --- */
-    for (int rows = 1; rows <= 12; rows++) {
-        layout_compute(&lt, rows, 80, MODE_INPUT, &st, &cfg);
-        if (lt.status_row == 0) {
-            continue; /* kein platz: bewusst kein status */
-        }
-        CHECK(lt.status_row >= 1);
-        CHECK(lt.status_row + STATUS_H - 1 <= rows);
-        CHECK(lt.input_bottom < lt.status_row); /* box liegt darueber */
-        CHECK(lt.input_top >= 1);
-        CHECK(layout_slot(&lt, lt.status_row).kind == SLOT_STATUS_MODEL);
-        CHECK(layout_slot(&lt, lt.status_row + 1).kind == SLOT_STATUS_TOKENS);
+    /* umlaute (\u00e4 -> a-umlaut, utf-8) */
+    call.arguments = "\"\\u00e4\\u00f6\\u00fc\"";
+    s = chat_tool_display(&call);
+    CHECK(s != NULL);
+    if (s != NULL) {
+        CHECK(strstr(s, "\xC3\xA4\xC3\xB6\xC3\xBC") != NULL);
+        free(s);
     }
 
-    input_free(&st.input);
-    chat_free(&st.chat);
+    /* surrogate-paar: emoji (D83D DE00 = U+1F600) */
+    call.arguments = "\"\\uD83D\\uDE00\"";
+    s = chat_tool_display(&call);
+    CHECK(s != NULL);
+    if (s != NULL) {
+        CHECK(strstr(s, "\xF0\x9F\x98\x80") != NULL);
+        free(s);
+    }
+
+    /* steuerzeichen bleiben escape: ein echter umbruch mitten in
+     * der darstellungs-zeile wuerde das rendering zerstoeren */
+    call.arguments = "\"a\\u000ab\"";
+    s = chat_tool_display(&call);
+    CHECK(s != NULL);
+    if (s != NULL) {
+        CHECK(strstr(s, "\\u000a") != NULL);
+        free(s);
+    }
+
+    /* kapurze escapes bleiben literal */
+    call.arguments = "\"\\u00zz \\u12\"";
+    s = chat_tool_display(&call);
+    CHECK(s != NULL);
+    if (s != NULL) {
+        CHECK(strstr(s, "\\u00zz") != NULL);
+        CHECK(strstr(s, "\\u12") != NULL);
+        free(s);
+    }
+
+    /* unpaariges surrogate bleibt stehen */
+    call.arguments = "\"\\uD83D allein\"";
+    s = chat_tool_display(&call);
+    CHECK(s != NULL);
+    if (s != NULL) {
+        CHECK(strstr(s, "\\uD83D") != NULL);
+        free(s);
+    }
+
+    /* ein doppelter backslash ist KEIN escape: \u0026 im rohen
+     * json bedeutet "literaler backslash + u0026" */
+    call.arguments = "\\\\u0026";
+    s = chat_tool_display(&call);
+    CHECK(s != NULL);
+    if (s != NULL) {
+        CHECK(strstr(s, "\\\\u0026") != NULL);
+        free(s);
+    }
 }
 
 int main(void)
@@ -633,9 +471,7 @@ int main(void)
     test_append_pop_clear();
     test_flatten();
     test_wrap();
-    test_layout();
-    test_scroll_hints();
-    test_input_wrap_layout();
-    test_status_rows();
+    test_tool_call_wrap();
+    test_tool_display_escapes();
     return test_report();
 }

@@ -15,7 +15,7 @@
 /* ------------------------------------------------------------------ */
 typedef enum {
     THEME_ROLE_USER = 0,  /* label "you"                             */
-    THEME_ROLE_ASSISTANT, /* label "max" – default: die match-farbe  */
+    THEME_ROLE_ASSISTANT, /* antwort des modells (kein label)        */
     THEME_ROLE_ERROR,     /* label "err"                             */
     THEME_ROLE_TOOL,      /* label "tool" und die tool-call-zeilen   */
     THEME_ROLE_SYSTEM,    /* label "sys"                             */

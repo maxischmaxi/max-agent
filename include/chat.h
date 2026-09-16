@@ -48,6 +48,23 @@ typedef struct {
     char *arguments; /* json-argumente als string (vom modell) */
 } ChatToolCall;
 
+/* einrueckung der fortsetzungs-zeilen eines umgebrochenen tool-
+ * calls (z.B. bash mit sehr langen parametern). chat_wrap plant
+ * die umbrueche mit dieser breite, row_tool_call rueckt genau so
+ * weit ein – beide muessen dieselbe zahl sehen. */
+#define TOOL_INDENT_W 2
+
+/* darstellungs-string eines tool-calls: pfeil + name + argumente,
+ * genau so, wie row_tool_call ihn zeichnet. json-unicode-escapes
+ * in den argumenten (\u0026 -> &, \u00e4 -> ae-umlaut) werden fuer
+ * DIE ANZEIGE dekodiert – die rohen argumente bleiben immer
+ * unangetastet: sie gehen 1:1 an die api zurueck (round-trip im
+ * agent-loop) und ins session-log. die ChatLine.off/len der
+ * tool-zeilen aus chat_wrap verweisen auf genau diesen string;
+ * der renderer baut ihn sich je zeile wieder auf. NULL nur bei
+ * OOM (dann stirbt die app eh). */
+char *chat_tool_display(const ChatToolCall *call);
+
 typedef struct {
     ChatRole role;
     char *text; /* heap-kopie, utf-8, mehrzeilig ('\n'-getrennt) */

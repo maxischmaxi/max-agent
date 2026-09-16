@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "chat.h"
+#include "draw.h"
 #include "state.h"
 #include "utils.h"
 
@@ -45,6 +46,18 @@ int cmd_lookup(const char *word)
     return -1;
 }
 
+int cmd_list_height(const AppState *st)
+{
+    if (!st->cmd_active) {
+        return 0;
+    }
+    char prefix[64];
+    int idx[COMMAND_COUNT];
+    cmd_prefix(&st->input, prefix, sizeof prefix);
+    int n = cmd_match(prefix, idx, COMMAND_COUNT);
+    return (n > 0) ? n : 1; /* kein treffer: hinweis-zeile */
+}
+
 /* neue session beginnen: die aktuelle bleibt auf der platte liegen,
  * wie sie ist (session_end schliesst nur), und der chat startet
  * neu. /clear tut exakt dasselbe. die ctx-gesamtzaehler gehoeren
@@ -55,10 +68,14 @@ void cmd_new(AppState *state)
     input_reset(&state->input);   /* draw() schreibt eh jeden frame */
     session_end(&state->session); /* dateien bleiben unangetastet */
     chat_clear(&state->chat);     /* "start a new session" */
-    state->chat_scroll = 0;
+    /* renderer-frontier: der chat ist geleert, neu gedruckt wird
+     * nur, was danach ankommt */
+    draw_content_reset();
     state->ctx.dropped = 0;
     state->ctx.total_prompt = 0;
     state->ctx.total_completion = 0;
+    state->worked_ms = 0;
+    state->busy_start_ms = 0;
 }
 
 void cmd_clear(AppState *state)

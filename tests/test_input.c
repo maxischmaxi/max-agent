@@ -727,6 +727,65 @@ static void test_screen_cursor(void)
     input_free(&in);
 }
 
+/* utf-8-editierung: backspace, delete und cursor arbeiten auf
+ * ZEICHEN, nicht auf bytes – ein umlaut ist eine einheit, ein
+ * halbes wuerde kaputte sequenzen im feld hinterlassen */
+static void test_utf8_editing(void)
+{
+    Input in;
+    input_init(&in);
+
+    /* backspace hinter dem umlaut nimmt das GANZE zeichen */
+    input_set_text(&in, "h\xC3\xA4llo");
+    in.cursor_line = 0;
+    in.cursor = 3; /* hinter 'ae' (h + 2 bytes) */
+    input_backspace(&in);
+    CHECK(strcmp(in.lines[0], "hllo") == 0);
+    CHECK(in.cursor == 1);
+
+    /* backspace ueber einem emoji (4 bytes) */
+    input_set_text(&in, "\xF0\x9F\x98\x80x");
+    in.cursor_line = 0;
+    in.cursor = 4; /* hinter dem emoji */
+    input_backspace(&in);
+    CHECK(strcmp(in.lines[0], "x") == 0);
+    CHECK(in.cursor == 0);
+
+    /* cursor links: einmal vor das GANZE umlaut (nicht mitten rein) */
+    input_set_text(&in, "\xC3\xA4l");
+    in.cursor_line = 0;
+    in.cursor = 3; /* zeilenende */
+    CHECK(input_cursor_left(&in));
+    CHECK(in.cursor == 2); /* vor 'l' */
+    CHECK(input_cursor_left(&in));
+    CHECK(in.cursor == 0); /* vor dem umlaut, nicht byte 1 */
+
+    /* cursor rechts: um das ganze zeichen */
+    input_set_text(&in, "\xC3\xA4l");
+    in.cursor_line = 0;
+    in.cursor = 0;
+    CHECK(input_cursor_right(&in));
+    CHECK(in.cursor == 2); /* hinter dem umlaut */
+
+    /* delete forward unter dem umlaut loescht es komplett */
+    input_set_text(&in, "x\xC3\xA4y");
+    in.cursor_line = 0;
+    in.cursor = 1;
+    CHECK(input_delete_forward(&in));
+    CHECK(strcmp(in.lines[0], "xy") == 0);
+    CHECK(in.cursor == 1);
+
+    /* ascii bleibt 1:1 (kein verhalten kaputt) */
+    input_set_text(&in, "ab");
+    in.cursor_line = 0;
+    in.cursor = 1;
+    input_backspace(&in);
+    CHECK(strcmp(in.lines[0], "b") == 0);
+    CHECK(in.cursor == 0);
+
+    input_free(&in);
+}
+
 int main(void)
 {
     test_cursor_utility();
@@ -746,5 +805,6 @@ int main(void)
     test_typing_past_edge();
     test_screen_wrap();
     test_screen_cursor();
+    test_utf8_editing();
     return test_report();
 }

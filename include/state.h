@@ -32,25 +32,32 @@ typedef struct {
     History history; /* zuletzt abgeschickte eingaben (modul
                       * history.c): pfeil-hoch holt sie zurueck */
 
-    Chat chat;       /* transcript der unterhaltung (modul chat.c):
-                      * zero-initialisiert, chat_free am app-ende */
-    int chat_scroll; /* render-zeilen, die im viewport unten abgeschnitten */
-                     /* sind (pgup); 0 = ans ende folgen. layout_compute */
-                     /* klemmt und schreibt normalisiert zurueck */
+    Chat chat; /* transcript der unterhaltung (modul chat.c):
+                * zero-initialisiert, chat_free am app-ende. das
+                * RENDERN ist inkrementell (draw.c): fertige
+                * nachrichten werden einmal gedruckt und scrollen
+                * ins terminal-scrollback, nur die aktuelle
+                * streaming-zeile und der dock unten leben */
 
     bool confirm_quit;  /* when ctrl+c was hit the first time */
     bool models_dialog; /* when entering the models dialog */
     bool cmd_active;    /* when typing "/", currently writing a command */
     bool settings_dialog;
-    bool sessions_dialog; /* resume-dialog: session-liste full-screen */
+    bool sessions_dialog; /* resume-dialog: session-liste im dock */
     bool theme_sub;       /* theme-untermenue offen (nur mit settings_dialog) */
     bool prompt_sub;      /* system-prompt-untermenue (dito) */
     /* das eingabefeld bearbeitet gerade den system-prompt statt
      * einer nachricht: enter speichert, escape verwirft */
     bool prompt_edit;
     volatile sig_atomic_t resized;
-    bool busy; /* anfrage laeuft: draw zeigt thinking-indikator, die */
-               /* UI blockiert bis die antwort da ist               */
+    bool busy; /* anfrage laeuft: die obere input-rahmenzeile zeigt */
+               /* spinner + sekunden, die UI blockiert bis die ant-   */
+               /* wort da ist                                          */
+    long long busy_start_ms; /* mono-ms des turn-beginns; 0 = kein     */
+                             /* laufender turn (spinner/sekunden)      */
+    long long worked_ms;     /* kumulierte zeit, die die ki in dieser  */
+                             /* session gearbeitet hat (alle turns:   */
+                             /* thinking, tool calls, antworten)      */
 
     /* token-buchhaltung ueber die runden hinweg: wieviel der
      * letzte request geschaetzt/wirklich gekostet hat und wieviel
