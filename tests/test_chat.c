@@ -203,7 +203,7 @@ static void test_flatten(void)
 static void test_wrap(void)
 {
     /* --- chat_wrap --- */
-    ChatLine lines[32];
+    ChatLine lines[32] = {0};
     Chat c = {0};
 
     /* leeres chat: 0 zeilen */
@@ -291,8 +291,12 @@ static void test_wrap(void)
     /* arena zu klein: rueckgabe zaehlt trotzdem alles */
     chat_clear(&c);
     CHECK(chat_append(&c, CHAT_ROLE_USER, "a\nb\nc\nd\n") == 0);
+    /* marker jenseits von out_max: chat_wrap darf ihn nicht anfassen.
+     * ohne marker haengt die pruefung am zufaelligen stack-inhalt und
+     * faellt nur im release-build auf. */
+    lines[2].len = 4242;
     CHECK(chat_wrap(&c, 20, lines, 2) == 4);
-    CHECK(lines[2].len == 0); /* nicht mehr gefuellt */
+    CHECK(lines[2].len == 4242); /* nicht mehr gefuellt */
 
     chat_free(&c);
 }

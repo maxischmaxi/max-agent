@@ -97,6 +97,7 @@ int main(void)
 
     input_free(&state.input);
     chat_free(&state.chat);
+    history_free(&state.history);
     free_config(&cfg);
     return 0;
 }

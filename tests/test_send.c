@@ -8,9 +8,11 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "chat.h"
+#include "keys.h"
 #include "send.h"
 #include "state.h"
 #include "test.h"
@@ -232,6 +234,68 @@ static pid_t start_probe_server(int *port, const char *marker)
                    "data: [DONE]\n\n",
                    found);
     (void)write(cfd, resp, strlen(resp));
+    close(cfd);
+    _exit(0);
+}
+
+static void sleep_ms(long ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+/* server, der den stream BEWUSST in die laenge zieht: erst ein
+ * fragment, dann eine pause, dann der rest. nur so kommt der
+ * idle-watchdog des clients (und damit der abbruch-callback)
+ * ueberhaupt zum zug. */
+static pid_t start_slow_server(int *port)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    int cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        _exit(1);
+    }
+    char buf[16384];
+    buf[0] = '\0';
+    (void)read_request(cfd, buf, sizeof buf);
+
+    static const char head[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ANFANG\"}}]}\n\n";
+    static const char tail[] =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"-ENDE\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    (void)write(cfd, head, sizeof head - 1);
+    sleep_ms(600); /* in dieser pause schlaegt der abbruch zu */
+    (void)write(cfd, tail, sizeof tail - 1);
     close(cfd);
     _exit(0);
 }
@@ -563,6 +627,236 @@ static void test_context_fits(void)
     waitpid(server, NULL, 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* abbruch: esc/ctrl+c waehrend der antwort stoppt den stream. was    */
+/* schon da ist, bleibt stehen – der rest kommt nie an.               */
+/* ------------------------------------------------------------------ */
+
+static void test_stream_abort(void)
+{
+    int port = 0;
+    pid_t server = start_slow_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "erzaehl was langes") == 0);
+
+    /* ctrl+c liegt an, bevor der stream laeuft: der watchdog des
+     * clients findet es beim ersten tick */
+    keys_unread("\x03", 1);
+
+    g_redraws = 0;
+    struct timespec t0;
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    CHECK(rc == 0); /* abbruch ist kein fehler */
+
+    /* der server pausiert 600ms vor dem rest. sind wir deutlich
+     * frueher zurueck, wurde wirklich abgebrochen und nicht nur
+     * hinterher ein hinweis gesetzt. */
+    long ms =
+        (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    CHECK(ms < 500);
+
+    /* der erste teil steht im verlauf, der zweite kam nie an */
+    bool has_notice = false;
+    bool has_part = false;
+    for (size_t i = 0; i < st.chat.len; i++) {
+        const ChatMessage *m = &st.chat.msgs[i];
+        if (m->role == CHAT_ROLE_NOTICE) {
+            has_notice = true;
+            CHECK(strstr(m->text, "abgebrochen") != NULL);
+        }
+        if (m->role == CHAT_ROLE_ASSISTANT) {
+            has_part = true;
+            CHECK(strstr(m->text, "-ENDE") == NULL);
+        }
+    }
+    CHECK(has_notice);
+    /* has_part haengt am timing: kam der erste chunk noch durch,
+     * bleibt er stehen; kam er nicht, geht der leere platzhalter
+     * weg und nur der hinweis bleibt. beides ist richtig. */
+    (void)has_part;
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+/* gegenprobe: ohne tastendruck laeuft derselbe langsame stream durch */
+static void test_stream_no_abort(void)
+{
+    int port = 0;
+    pid_t server = start_slow_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "erzaehl was langes") == 0);
+
+    CHECK(send_stream(&st, &cfg, &dbg, NULL, count_redraw) == 0);
+
+    ChatMessage *answer = &st.chat.msgs[st.chat.len - 1];
+    CHECK(answer->role == CHAT_ROLE_ASSISTANT);
+    CHECK(answer->text != NULL && strcmp(answer->text, "ANFANG-ENDE") == 0);
+    for (size_t i = 0; i < st.chat.len; i++) {
+        CHECK(st.chat.msgs[i].role != CHAT_ROLE_NOTICE);
+    }
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* regression: im agent-loop zeigte ein ChatMessage* in das msgs-     */
+/* array, waehrend chat_append_tool() es wachsen liess. mehrere       */
+/* tool-calls in EINER antwort loesen das realloc mitten in der       */
+/* schleife aus – ohne den fix meldet asan hier use-after-free.       */
+/* ------------------------------------------------------------------ */
+
+static pid_t start_multitool_server(int *port)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    for (int round = 0; round < 2; round++) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+            _exit(1);
+        }
+        char *req = malloc(1 << 20);
+        if (req == NULL) {
+            _exit(1);
+        }
+        req[0] = '\0';
+        (void)read_request(cfd, req, 1 << 20);
+        bool second = strstr(req, "tool_call_id") != NULL;
+        free(req);
+
+        const char *resp =
+            second
+                ? "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/event-stream\r\n"
+                  "Connection: close\r\n"
+                  "\r\n"
+                  "data: {\"choices\":[{\"delta\":{\"content\":\"fertig\"}}]}"
+                  "\n\n"
+                  "data: [DONE]\n\n"
+                /* runde 1: VIER calls auf einmal */
+                : "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/event-stream\r\n"
+                  "Connection: close\r\n"
+                  "\r\n"
+                  "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
+                  "{\"index\":0,\"id\":\"c0\",\"function\":{\"name\":"
+                  "\"bash\",\"arguments\":\"{\\\"command\\\":"
+                  "\\\"echo a\\\"}\"}},"
+                  "{\"index\":1,\"id\":\"c1\",\"function\":{\"name\":"
+                  "\"bash\",\"arguments\":\"{\\\"command\\\":"
+                  "\\\"echo b\\\"}\"}},"
+                  "{\"index\":2,\"id\":\"c2\",\"function\":{\"name\":"
+                  "\"bash\",\"arguments\":\"{\\\"command\\\":"
+                  "\\\"echo c\\\"}\"}},"
+                  "{\"index\":3,\"id\":\"c3\",\"function\":{\"name\":"
+                  "\"bash\",\"arguments\":\"{\\\"command\\\":"
+                  "\\\"echo d\\\"}\"}}]}}]}\n\n"
+                  "data: [DONE]\n\n";
+        (void)write(cfd, resp, strlen(resp));
+        close(cfd);
+    }
+    _exit(0);
+}
+
+static void test_agent_realloc(void)
+{
+    int port = 0;
+    pid_t server = start_multitool_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+
+    /* den verlauf so fuellen, dass die naechsten anhaenge-vorgaenge
+     * die kapazitaet sprengen (chat waechst 8 -> 16 -> ...) */
+    for (int i = 0; i < 6; i++) {
+        CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "fuellnachricht") == 0);
+        CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "ok") == 0);
+    }
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu vier dinge") == 0);
+
+    CHECK(send_stream(&st, &cfg, &dbg, NULL, count_redraw) == 0);
+
+    /* alle vier tool-ergebnisse sind im verlauf gelandet */
+    size_t tools = 0;
+    for (size_t i = 0; i < st.chat.len; i++) {
+        if (st.chat.msgs[i].role == CHAT_ROLE_TOOL) {
+            tools++;
+            CHECK(st.chat.msgs[i].tool_call_id != NULL);
+        }
+    }
+    CHECK(tools == 4);
+    CHECK(strcmp(st.chat.msgs[st.chat.len - 1].text, "fertig") == 0);
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
 static void test_stream(void)
 {
     /* mock-server starten und eine streaming-config bauen */
@@ -852,6 +1146,9 @@ int main(void)
     test_agent_broken_call();
     test_context_trim();
     test_context_fits();
+    test_stream_abort();
+    test_stream_no_abort();
+    test_agent_realloc();
 
     chat_free(&chat);
     return test_report();

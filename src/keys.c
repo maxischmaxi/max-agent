@@ -14,6 +14,7 @@
 #include "config.h"
 #include "debug.h"
 #include "draw.h"
+#include "history.h"
 #include "send.h"
 #include "settings.h"
 #include "theme.h"
@@ -150,6 +151,62 @@ static bool wait_readable(int timeout_ms)
     if (r > 0) {
         return true;
     }
+    return false;
+}
+
+/* steckt in diesen bytes ein abbruch?
+ *
+ * ctrl+c (0x03) ist eindeutig. escape dagegen ist das erste byte
+ * JEDER sequenz – pfeiltasten, pos1/ende, f-tasten. wer waehrend der
+ * antwort pfeil-hoch drueckt, will nicht abbrechen. escape zaehlt
+ * deshalb nur, wenn nichts darauf folgt.
+ *
+ * die grenze: kaeme eine sequenz zerstueckelt an (erst 0x1b, der
+ * rest im naechsten read), wuerde das erste byte als escape gelten.
+ * terminals schicken sequenzen praktisch immer am stueck. */
+static bool has_abort(const char *buf, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        if (buf[i] == 0x03) {
+            return true;
+        }
+        if (buf[i] == 0x1b) {
+            if (len - i == 1) {
+                return true; /* escape steht allein */
+            }
+            size_t seq = key_seq_len(buf + i, len - i);
+            if (seq == 0) {
+                return false; /* sequenz unvollstaendig: abwarten */
+            }
+            i += seq; /* ganze sequenz ueberspringen */
+            continue;
+        }
+        i++;
+    }
+    return false;
+}
+
+bool keys_abort_pressed(void)
+{
+    /* was schon im puffer liegt, zuerst: es ist aelter als stdin */
+    if (has_abort(g_pending, g_pending_len)) {
+        g_pending_len = 0; /* rest verwerfen, siehe keys.h */
+        return true;
+    }
+    if (!wait_readable(0)) {
+        return false;
+    }
+    char buf[SEQ_MAX];
+    ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
+    if (n <= 0) {
+        return false;
+    }
+    if (has_abort(buf, (size_t)n)) {
+        g_pending_len = 0;
+        return true;
+    }
+    keys_unread(buf, (size_t)n); /* nichts dabei: alles zurueck */
     return false;
 }
 
@@ -416,6 +473,36 @@ Key key_read(void)
         }
         waited = 0; /* fortschritt: die wartezeit beginnt von vorn */
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* history-navigation: der entwurf im feld wird beim ersten schritt   */
+/* gesichert, danach ersetzt jeder eintrag die eingabe komplett.      */
+/* liefert die history NULL, bleibt die eingabe unveraendert (am      */
+/* aeltesten eintrag, oder wenn gar nicht geblaettert wird).          */
+/* ------------------------------------------------------------------ */
+
+static void history_apply(AppState *state, Input *input, const char *entry)
+{
+    if (entry == NULL) {
+        return;
+    }
+    input_set_text(input, entry);
+    state->cmd_active = input_in_cmd(input);
+    state->dirty = true;
+}
+
+static void history_back(AppState *state, Input *input)
+{
+    char *current = chat_flatten_input(input); /* NULL = leeres feld */
+    const char *entry = history_prev(&state->history, current);
+    free(current);
+    history_apply(state, input, entry);
+}
+
+static void history_forward(AppState *state, Input *input)
+{
+    history_apply(state, input, history_next(&state->history));
 }
 
 static void handle_ctrl_c(AppState *state, DebugState *dbg, const Config *cfg)
@@ -721,6 +808,13 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
         char args[128];
         cmd_parse(state, word, sizeof word, args, sizeof args);
 
+        /* alles abgeschickte kommt in die history – auch befehle,
+         * die will man genauso wiederholen. muss VOR der
+         * verzweigung passieren: cmd_clear() leert die eingabe. */
+        char *entry = chat_flatten_input(input);
+        history_add(&state->history, entry);
+        free(entry);
+
         if (word[0] == '/') {
             switch (cmd_lookup(word)) {
             case CMD_CLEAR:
@@ -805,6 +899,7 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
         state->dirty = true;
         break;
     case KEY_ESCAPE:
+        history_reset(&state->history); /* entwurf ist hinfaellig */
         input_reset(input);
         state->cmd_active = input_in_cmd(input);
         state->dirty = true;
@@ -949,13 +1044,33 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
         (void)input_word_capitalize(input);
         state->dirty = true;
         break;
-    case KEY_CTRL_P:
-    case KEY_CTRL_N:
-        /* history: spaeter – bis dahin wie up/down ohne funktion */
-    case KEY_DOWN:
     case KEY_UP:
-        /* im chat-modus noch ohne funktion (spaeter evtl.
-         * history) – auf keinen fall die eingabe loeschen */
+        /* in einer mehrzeiligen eingabe erst die zeile wechseln;
+         * erst an der obersten zeile geht es in die history. genau
+         * so verhalten sich zsh und fish. */
+        if (input->cursor_line > 0) {
+            input_cursor_line_set(input, input->cursor_line - 1);
+            state->dirty = true;
+            break;
+        }
+        history_back(state, input);
+        break;
+    case KEY_DOWN:
+        if (input->cursor_line + 1 < input->count) {
+            input_cursor_line_set(input, input->cursor_line + 1);
+            state->dirty = true;
+            break;
+        }
+        history_forward(state, input);
+        break;
+    case KEY_CTRL_P:
+        /* readline: ctrl+p/n sind immer history, auch mitten in
+         * einer mehrzeiligen eingabe */
+        history_back(state, input);
+        break;
+    case KEY_CTRL_N:
+        history_forward(state, input);
+        break;
     case KEY_NONE:
     case KEY_CTRL_C:
     case KEY_CTRL_Q:

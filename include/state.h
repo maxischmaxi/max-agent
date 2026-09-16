@@ -6,6 +6,7 @@
 
 #include "chat.h"
 #include "context.h"
+#include "history.h"
 #include "input.h"
 
 /* ------------------------------------------------------------------ */
@@ -26,6 +27,9 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 typedef struct {
     Input input; /* chat-eingabe: zeilen + cursor (modul input.c) */
+
+    History history; /* zuletzt abgeschickte eingaben (modul
+                      * history.c): pfeil-hoch holt sie zurueck */
 
     Chat chat;       /* transcript der unterhaltung (modul chat.c):
                       * zero-initialisiert, chat_free am app-ende */

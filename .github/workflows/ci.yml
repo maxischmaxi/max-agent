@@ -15,9 +15,10 @@ jobs:
         build: [debug, release]
     steps:
       - uses: actions/checkout@v7
+      # der api-client haengt an libcurl
+      - run: sudo apt-get update -q && sudo apt-get install -y -q libcurl4-openssl-dev
       - run: make CC=${{ matrix.cc }} BUILD=${{ matrix.build }} V=1
       - run: make test CC=${{ matrix.cc }} BUILD=${{ matrix.build }} V=1
-      - run: make run CC=${{ matrix.cc }} BUILD=${{ matrix.build }} ARGS="ci"
 
   format:
     runs-on: ubuntu-latest

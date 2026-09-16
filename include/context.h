@@ -2,6 +2,7 @@
 #define MAX_AGENT_CONTEXT
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "chat.h"
 #include "config.h"
@@ -32,7 +33,7 @@
 /* "das modell gibt kein fenster an": dann wird nicht gekuerzt.
  * raten waere schlimmer als nichts tun – ein zu kleines budget
  * wuerde verlauf wegwerfen, den das modell haette sehen koennen. */
-#define CTX_NO_LIMIT ((size_t)-1)
+#define CTX_NO_LIMIT SIZE_MAX
 
 /* korrekturfaktor in promille; 1000 = schaetzung unveraendert */
 #define CTX_SCALE_ONE 1000

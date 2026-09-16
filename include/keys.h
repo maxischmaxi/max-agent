@@ -92,6 +92,18 @@ size_t key_seq_len(const char *buf, size_t len);
  * die waehrend des terminal-query-fensters angekommen sind).
  * der interne puffer laeuft nie ueber: ueberschuss wird verworfen. */
 void keys_unread(const char *buf, size_t len);
+
+/* waehrend einer laufenden anfrage: hat der benutzer abgebrochen?
+ * prueft den tasten-puffer und stdin, ohne je zu blockieren.
+ *
+ * abbruch sind ctrl+c und ein ALLEIN stehendes escape – pfeil-
+ * tasten und andere sequenzen fangen auch mit 0x1b an und duerfen
+ * nicht stoppen. alles andere bleibt erhalten und
+ * landet nach der anfrage im eingabefeld – wer waehrend der antwort
+ * weitertippt, verliert nichts. beim abbruch wird der rest der
+ * eingabe dagegen verworfen: wer stoppt, will nicht gleichzeitig
+ * tippen. */
+bool keys_abort_pressed(void);
 void handle_key(AppState *state, Config *cfg, DebugState *dbg, int rows,
                 int cols);
 

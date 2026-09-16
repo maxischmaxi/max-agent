@@ -1,6 +1,13 @@
-#include <string.h>
+#define _POSIX_C_SOURCE 200809L // NOLINT(bugprone-reserved-identifier)
 
+#include <string.h>
+#include <unistd.h>
+
+#include "chat.h"
+#include "config.h"
+#include "history.h"
 #include "keys.h"
+#include "state.h"
 #include "test.h"
 
 static void test_key_from_byte(void)
@@ -142,6 +149,89 @@ static void test_key_read_batch(void)
     CHECK(key_read().ch == 'z');
 }
 
+/* keys_abort_pressed: der poll waehrend einer laufenden anfrage.
+ * darf nie blockieren, muss ctrl+c/esc melden und alles andere
+ * unberuehrt lassen. */
+static void test_abort_poll(void)
+{
+    /* --- quelle 1: der tasten-puffer --- */
+    keys_unread("abc", 3);
+    CHECK(!keys_abort_pressed()); /* nichts zum abbrechen */
+    /* die zeichen sind noch da */
+    CHECK(key_read().ch == 'a');
+    CHECK(key_read().ch == 'b');
+    CHECK(key_read().ch == 'c');
+
+    keys_unread("ab\x03"
+                "cd",
+                5);
+    CHECK(keys_abort_pressed());
+    /* nach dem abbruch ist der puffer leer: wer stoppt, tippt nicht */
+    keys_unread("z", 1);
+    CHECK(key_read().ch == 'z');
+
+    keys_unread("\x1b", 1); /* escape allein zaehlt auch */
+    CHECK(keys_abort_pressed());
+
+    /* ABER: pfeiltasten & co. fangen ebenfalls mit 0x1b an und
+     * duerfen die laufende antwort nicht stoppen */
+    keys_unread("\x1b[A", 3); /* pfeil hoch */
+    CHECK(!keys_abort_pressed());
+    CHECK(key_read().kind == KEY_UP); /* unberuehrt im puffer */
+
+    keys_unread("\x1b[B", 3); /* pfeil runter */
+    CHECK(!keys_abort_pressed());
+    CHECK(key_read().kind == KEY_DOWN);
+
+    keys_unread("\x1bOH", 3); /* SS3: pos1 */
+    CHECK(!keys_abort_pressed());
+    (void)key_read();
+
+    /* eine sequenz schuetzt ein danach folgendes ctrl+c nicht */
+    keys_unread("\x1b[A\x03", 4);
+    CHECK(keys_abort_pressed());
+
+    /* zwei escapes hintereinander: das erste steht fuer sich */
+    keys_unread("\x1b\x1b", 2);
+    CHECK(keys_abort_pressed());
+
+    /* --- quelle 2: stdin, per pipe untergeschoben --- */
+    int saved = dup(STDIN_FILENO);
+    CHECK(saved >= 0);
+    if (saved < 0) {
+        return;
+    }
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    CHECK(dup2(fds[0], STDIN_FILENO) >= 0);
+
+    /* leere pipe: kein abbruch, und der aufruf blockiert nicht */
+    CHECK(!keys_abort_pressed());
+
+    CHECK(write(fds[1], "xy", 2) == 2);
+    CHECK(!keys_abort_pressed());
+    /* die bytes sind nicht verloren, sondern zurueck im puffer */
+    CHECK(key_read().ch == 'x');
+    CHECK(key_read().ch == 'y');
+
+    CHECK(write(fds[1],
+                "q\x03"
+                "q",
+                3) == 3);
+    CHECK(keys_abort_pressed());
+
+    /* halbe sequenz: noch nicht entscheiden, der rest kann folgen.
+     * die leere pipe macht das auslesen danach deterministisch. */
+    keys_unread("\x1b[", 2);
+    CHECK(!keys_abort_pressed());
+    (void)key_read(); /* puffer leeren fuer die folgetests */
+
+    CHECK(dup2(saved, STDIN_FILENO) >= 0);
+    close(saved);
+    close(fds[0]);
+    close(fds[1]);
+}
+
 static void test_keys_unread_fifo(void)
 {
     /* key_read greift zuerst auf pending zu - ohne stdin zu lesen */
@@ -163,12 +253,124 @@ static void test_keys_unread_fifo(void)
     keys_unread("", 0);
 }
 
+/* pfeiltasten im chat-feld: in einer mehrzeiligen eingabe wechseln
+ * sie erst die zeile, an den raendern gehen sie in die history.
+ * gefahren wird ueber handle_key(), also die echte kette. */
+static void test_history_keys(void)
+{
+    /* stdin auf eine leere pipe legen: key_read() prueft nach einem
+     * einzelnen escape, ob noch eine sequenz nachkommt. an einem
+     * echten terminal oder an /dev/null faellt das je nach umgebung
+     * anders aus – die leere pipe ist einfach nie lesbar. */
+    int saved = dup(STDIN_FILENO);
+    CHECK(saved >= 0);
+    if (saved < 0) {
+        return;
+    }
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    CHECK(dup2(fds[0], STDIN_FILENO) >= 0);
+
+    AppState st = {0};
+    input_init(&st.input);
+    Config cfg = {0};
+    DebugState dbg = {0};
+
+    /* zwei eintraege in die history, ohne senden (das wuerde die
+     * api rufen) */
+    history_add(&st.history, "alte frage");
+    history_add(&st.history, "neue frage");
+
+    /* --- leeres feld: hoch holt den juengsten eintrag --- */
+    keys_unread("\x1b[A", 3); /* pfeil hoch */
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.count == 1);
+    CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
+
+    keys_unread("\x1b[A", 3);
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(strcmp(st.input.lines[0], "alte frage") == 0);
+
+    /* am aeltesten ende bleibt die eingabe stehen */
+    keys_unread("\x1b[A", 3);
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(strcmp(st.input.lines[0], "alte frage") == 0);
+
+    /* runter fuehrt zurueck bis zum leeren entwurf */
+    keys_unread("\x1b[B", 3); /* pfeil runter */
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
+    keys_unread("\x1b[B", 3);
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.lines[0][0] == '\0'); /* entwurf war leer */
+
+    /* --- mehrzeilig: die pfeile wechseln erst die zeile --- */
+    input_set_text(&st.input, "zeile1\nzeile2\nzeile3");
+    CHECK(st.input.cursor_line == 2);
+
+    keys_unread("\x1b[A", 3);
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.cursor_line == 1); /* nur cursor, text bleibt */
+    CHECK(st.input.count == 3);
+
+    keys_unread("\x1b[A", 3);
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.cursor_line == 0);
+    CHECK(st.input.count == 3);
+
+    /* erst OBEN angekommen geht es in die history */
+    keys_unread("\x1b[A", 3);
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.count == 1);
+    CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
+
+    /* der mehrzeilige entwurf kommt vollstaendig zurueck */
+    keys_unread("\x1b[B", 3);
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.count == 3);
+    CHECK(strcmp(st.input.lines[0], "zeile1") == 0);
+    CHECK(strcmp(st.input.lines[2], "zeile3") == 0);
+
+    /* --- ctrl+p/ctrl+n gehen immer in die history --- */
+    input_set_text(&st.input, "a\nb");
+    CHECK(st.input.cursor_line == 1);
+    keys_unread("\x10", 1); /* ctrl+p, mitten in der eingabe */
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.count == 1);
+    CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
+    keys_unread("\x0e", 1); /* ctrl+n */
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.count == 2);
+    CHECK(strcmp(st.input.lines[0], "a") == 0);
+
+    /* --- escape verwirft den entwurf --- */
+    keys_unread("\x10", 1); /* ctrl+p: history, egal welche zeile */
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
+    keys_unread("\x1b", 1); /* escape */
+    handle_key(&st, &cfg, &dbg, 24, 80);
+    CHECK(st.input.lines[0][0] == '\0');
+    CHECK(st.history.pos == 0);
+    CHECK(st.history.draft == NULL);
+
+    input_free(&st.input);
+    chat_free(&st.chat);
+    history_free(&st.history);
+
+    CHECK(dup2(saved, STDIN_FILENO) >= 0);
+    close(saved);
+    close(fds[0]);
+    close(fds[1]);
+}
+
 int main(void)
 {
     test_key_from_byte();
     test_key_from_escape();
     test_key_seq_len();
     test_keys_unread_fifo();
+    test_abort_poll();
+    test_history_keys();
     test_key_read_batch();
     return test_report();
 }

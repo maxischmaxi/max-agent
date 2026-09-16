@@ -464,6 +464,71 @@ static void test_word_case(void)
     input_free(&in);
 }
 
+static void test_set_text(void)
+{
+    Input in;
+    input_init(&in);
+
+    /* einzeilig: cursor landet am ende */
+    input_set_text(&in, "hallo welt");
+    CHECK(in.count == 1);
+    CHECK(strcmp(in.lines[0], "hallo welt") == 0);
+    CHECK(in.cursor_line == 0);
+    CHECK(in.cursor == strlen("hallo welt"));
+
+    /* mehrzeilig: an '\n' zerlegt, cursor am ende der LETZTEN zeile */
+    input_set_text(&in, "eins\nzwei\ndrei");
+    CHECK(in.count == 3);
+    CHECK(strcmp(in.lines[0], "eins") == 0);
+    CHECK(strcmp(in.lines[1], "zwei") == 0);
+    CHECK(strcmp(in.lines[2], "drei") == 0);
+    CHECK(in.cursor_line == 2);
+    CHECK(in.cursor == strlen("drei"));
+
+    /* ersetzt wirklich, haengt nicht an */
+    input_set_text(&in, "kurz");
+    CHECK(in.count == 1);
+    CHECK(strcmp(in.lines[0], "kurz") == 0);
+
+    /* leere zeilen mittendrin bleiben erhalten */
+    input_set_text(&in, "a\n\nb");
+    CHECK(in.count == 3);
+    CHECK(in.lines[1][0] == '\0');
+
+    /* abschliessendes '\n' erzeugt eine leere letzte zeile */
+    input_set_text(&in, "a\n");
+    CHECK(in.count == 2);
+    CHECK(strcmp(in.lines[0], "a") == 0);
+    CHECK(in.lines[1][0] == '\0');
+    CHECK(in.cursor_line == 1);
+    CHECK(in.cursor == 0);
+
+    /* NULL und "" leeren das feld */
+    input_set_text(&in, "");
+    CHECK(in.count == 1);
+    CHECK(in.lines[0][0] == '\0');
+    input_set_text(&in, "x\ny");
+    input_set_text(&in, NULL);
+    CHECK(in.count == 1);
+    CHECK(in.lines[0][0] == '\0');
+
+    /* mehr zeilen als das feld fasst: der rest faellt weg, die
+     * invariante (cursor_line < count) bleibt heil */
+    char many[4 * (INPUT_MAX_LINES + 8)];
+    size_t pos = 0;
+    for (int i = 0; i < INPUT_MAX_LINES + 8; i++) {
+        many[pos++] = (char)('a' + (i % 26));
+        many[pos++] = '\n';
+    }
+    many[pos - 1] = '\0'; /* letztes '\n' weg */
+    input_set_text(&in, many);
+    CHECK(in.count == INPUT_MAX_LINES);
+    CHECK(in.cursor_line == in.count - 1);
+    CHECK(in.cursor <= strlen(in.lines[in.cursor_line]));
+
+    input_free(&in);
+}
+
 int main(void)
 {
     test_cursor_utility();
@@ -479,5 +544,6 @@ int main(void)
     test_word_kills();
     test_transpose();
     test_word_case();
+    test_set_text();
     return test_report();
 }

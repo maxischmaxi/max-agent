@@ -21,6 +21,13 @@ bool input_in_cmd(const Input *in);
 void cmd_prefix(const Input *in, char *out, size_t out_sz);
 void input_init(Input *in);
 void input_reset(Input *in);
+
+/* die eingabe komplett durch text ersetzen: an '\n' in zeilen
+ * zerlegt, cursor ans ende der letzten zeile. das ist der gegenpart
+ * zu chat_flatten_input() und holt history-eintraege zurueck ins
+ * feld. mehr als INPUT_MAX_LINES zeilen passen nicht hinein – der
+ * rest faellt weg. NULL/"" leeren das feld. */
+void input_set_text(Input *in, const char *text);
 void input_backspace(Input *in);
 void input_newline(Input *in, int rows, int list_h, bool g_confirm_quit);
 void input_char(Input *in, char c, int cols);

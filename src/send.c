@@ -10,6 +10,7 @@
 
 #include "chat.h"
 #include "context.h"
+#include "keys.h"
 #include "prompt.h"
 #include "tools.h"
 #include "utils.h"
@@ -471,6 +472,7 @@ typedef struct {
     ToolAcc acc;       /* tool-call-deltas waechsen hier zusammen */
     int prompt_tokens; /* aus dem letzten chunk (include_usage): die  */
                        /* eichgroesse fuer ctx_calibrate, 0 = keine   */
+    bool aborted;      /* benutzer hat esc/ctrl+c gedrueckt           */
 } StreamCtx;
 
 /* monotone uhr in ms – allein fuer die redraw-drossel */
@@ -479,6 +481,22 @@ static long long mono_ms(void)
     struct timespec ts;
     (void)clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((long long)ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+}
+
+/* der watchdog des clients fragt das hier ~alle 100ms, auch waehrend
+ * das modell noch denkt – der abbruch wartet also nicht auf den
+ * naechsten chunk. */
+static int stream_should_abort(void *ud)
+{
+    StreamCtx *sc = ud;
+    if (sc->aborted) {
+        return 1;
+    }
+    if (keys_abort_pressed()) {
+        sc->aborted = true;
+        return 1;
+    }
+    return 0;
 }
 
 static int stream_on_chunk(const OaiChatCompletionChunk *chunk, void *ud)
@@ -508,6 +526,12 @@ static int stream_on_chunk(const OaiChatCompletionChunk *chunk, void *ud)
         sc->last_ms = now;
         sc->drew = true;
         sc->redraw(sc->redraw_ctx);
+        /* an der drossel mitpruefen: waehrend die daten fliessen,
+         * kaeme der watchdog erst nach bis zu einer sekunde. hier
+         * kostet es einen select() pro frame. */
+        if (stream_should_abort(sc)) {
+            return 1;
+        }
     }
     return 0;
 }
@@ -600,6 +624,7 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
         OaiStreamCallbacks cbs = {
             .on_chunk = stream_on_chunk,
             .on_error = stream_on_error,
+            .should_abort = stream_should_abort,
             .user_data = &sc,
         };
 
@@ -621,6 +646,21 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
             acc_free(&sc.acc);
             return -1; /* die fehlermeldung steht als ERROR-nachricht */
         } /* im verlauf – mehr gibt es hier nicht zu tun */
+
+        /* abbruch durch den benutzer: angefangene tool-calls werden
+         * NICHT ausgefuehrt (er wollte ja gerade, dass nichts mehr
+         * passiert). eine teil-antwort bleibt stehen, ein leerer
+         * platzhalter geht weg. */
+        if (sc.aborted) {
+            acc_free(&sc.acc);
+            if (chat->len > 0 && chat->msgs[chat->len - 1].text[0] == '\0' &&
+                chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT) {
+                chat_pop(chat);
+            }
+            notice(chat, "abgebrochen");
+            dbg_log(dbg, "stream: vom benutzer abgebrochen");
+            return 0;
+        }
 
         /* schaetzung gegen die api-zaehlung halten: die naechste
          * runde rechnet mit dem korrigierten faktor */
@@ -660,8 +700,14 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
         /* tools ausfuehren, ergebnisse als TOOL-nachrichten anhaengen;
          * die naechste runde schickt sie mit. fehler-ergebnisse sind
          * auch nur text – das model darf sie korrigieren. */
-        for (size_t i = 0; i < last->tool_calls_len; i++) {
-            ChatToolCall *call = &last->tool_calls[i];
+        /* die call-liste VOR der schleife sichern: chat_append_tool
+         * laesst das msgs-array wachsen und verschiebt es dabei –
+         * `last` zeigt danach ins freigegebene. das tool_calls-array
+         * selbst gehoert der nachricht und bleibt liegen. */
+        ChatToolCall *calls = last->tool_calls;
+        size_t calls_len = last->tool_calls_len;
+        for (size_t i = 0; i < calls_len; i++) {
+            ChatToolCall *call = &calls[i];
             dbg_log(dbg, "tool: %s(%s)", call->name, call->arguments);
             char *result = tool_execute(call->name, call->arguments);
             if (result == NULL) {

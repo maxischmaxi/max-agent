@@ -433,6 +433,12 @@ typedef struct {
     /* wird bei fehlern aufgerufen (auch nach retries); http_status   */
     /* ist 0 bei verbindungsfehlern.                                  */
     void (*on_error)(long http_status, const char *message, void *user_data);
+    /* wird waehrend des streams regelmaessig (~100ms) gerufen, auch  */
+    /* solange keine daten fliessen. rueckgabe != 0 bricht ab – wie   */
+    /* ein abbruch aus on_chunk, nur ohne auf den naechsten chunk zu  */
+    /* warten (z.B. um auf einen tastendruck zu reagieren).           */
+    /* NULL = kein abbruch von aussen.                                */
+    int (*should_abort)(void *user_data);
 } OaiStreamCallbacks;
 
 /* oai_chat_completions_create_stream: entspricht                     */

@@ -1107,8 +1107,16 @@ static int xferinfo_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
     (void)ultotal;
     (void)ulnow;
     RequestState *st = ud;
-    if (mono_now() - st->last_activity >
-        (double)st->client->stream_idle_timeout_ms / 1000.0) {
+    /* abbruch von aussen hat vorrang: er ist kein fehler, der stream
+     * endet wie nach einem abbruch aus on_chunk */
+    if (st->cb.should_abort != NULL &&
+        st->cb.should_abort(st->cb.user_data) != 0) {
+        st->aborted = true;
+        return 1;
+    }
+    if (st->client->stream_idle_timeout_ms > 0 &&
+        mono_now() - st->last_activity >
+            (double)st->client->stream_idle_timeout_ms / 1000.0) {
         st->idle_hit = true;
         return 1;
     }
@@ -1244,7 +1252,11 @@ static void perform_once( // NOLINT(readability-function-size)
         /* regelmaessig gerufen und bricht bei datenstillstand ab      */
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
                          OAI_STREAM_CONNECT_TIMEOUT_MS);
-        if (st->client->stream_idle_timeout_ms > 0) {
+        /* der watchdog traegt zwei aufgaben: idle-timeout UND den
+         * abbruch von aussen. einer von beiden genuegt, damit er
+         * gebraucht wird. */
+        if (st->client->stream_idle_timeout_ms > 0 ||
+            st->cb.should_abort != NULL) {
             curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
             curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_cb);
             curl_easy_setopt(curl, CURLOPT_XFERINFODATA, st);

@@ -636,6 +636,37 @@ void input_reset(Input *in)
     input_init(in);
 }
 
+void input_set_text(Input *in, const char *text)
+{
+    input_reset(in);
+    if (text == NULL) {
+        return;
+    }
+    const char *p = text;
+    size_t line = 0;
+    for (;;) {
+        const char *nl = strchr(p, '\n');
+        size_t len = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
+        char *copy = malloc(len + 1);
+        if (copy == NULL) {
+            die("out of memory");
+        }
+        memcpy(copy, p, len);
+        copy[len] = '\0';
+        free(in->lines[line]);
+        in->lines[line] = copy;
+        in->count = line + 1;
+
+        if (nl == NULL || line + 1 >= INPUT_MAX_LINES) {
+            break; /* fertig, oder das feld ist voll */
+        }
+        line++;
+        p = nl + 1;
+    }
+    in->cursor_line = in->count - 1;
+    in->cursor = strlen(in->lines[in->cursor_line]);
+}
+
 void input_init(Input *in)
 {
     memset(in, 0, sizeof *in);
