@@ -595,7 +595,7 @@ int session_log_assistant(Session *s, const char *text,
 }
 
 int session_log_tool(Session *s, const char *call_id, const char *name,
-                     const char *result, long long dur_ms, const char *confirm)
+                     const char *result, long long dur_ms)
 {
     if (!s->active || call_id == NULL) {
         return 0;
@@ -611,9 +611,6 @@ int session_log_tool(Session *s, const char *call_id, const char *name,
     cJSON_AddStringToObject(o, "text", (result != NULL) ? result : "");
     if (dur_ms >= 0) {
         cJSON_AddNumberToObject(o, "dur_ms", (double)dur_ms);
-    }
-    if (confirm != NULL) {
-        cJSON_AddStringToObject(o, "confirm", confirm);
     }
     return log_line(s, o);
 }

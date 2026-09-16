@@ -48,20 +48,15 @@ const Model *send_find_model(const Config *cfg, const char *id,
 int send_message(AppState *state, const Config *cfg);
 
 /* ------------------------------------------------------------------ */
-/* haken, die send_stream in die UI zurueckruft. beide bekommen den  */
-/* gemeinsamen ctx – die streaming-schleife selbst weiss nichts von  */
-/* terminal, tasten oder layout.                                      */
+/* haken, die send_stream in die UI zurueckruft. der callback       */
+/* bekommt den gemeinsamen ctx – die streaming-schleife selbst      */
+/* weiss nichts von terminal, tasten oder layout.                    */
 /* ------------------------------------------------------------------ */
 typedef struct {
     void *ctx;
     /* nach chunks aufrufen, damit der aufrufer neu zeichnet.
      * pflicht: ohne redraw sieht man vom stream nichts. */
     void (*redraw)(void *ctx);
-    /* rueckfrage vor einem tool, das etwas veraendert (siehe
-     * tool_needs_confirm). true = ausfuehren, false = ablehnen.
-     * NULL heisst: alles laeuft ungefragt durch – das ist der
-     * modus fuer tests und nicht-interaktive aufrufer. */
-    bool (*confirm_tool)(const char *name, const char *arguments, void *ctx);
 } SendHooks;
 
 /* wie send_message, aber als stream: vor dem request entsteht eine

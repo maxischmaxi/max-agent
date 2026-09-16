@@ -243,12 +243,11 @@ void layout_compute(Layout *lt, int rows, int cols, UIMode mode, AppState *st,
         lt->chat_lines_len = 0;
         lt->chat_first = 0;
         lt->busy_row = 0;
-        snprintf(lt->tool_ask, sizeof lt->tool_ask, "%s", st->tool_ask);
         lt->more_above = 0;
         lt->more_below = 0;
         lt->more_above_row = 0;
         lt->more_below_row = 0;
-        if (lt->chat_h > 0 && (st->busy || st->tool_ask[0] != '\0')) {
+        if (lt->chat_h > 0 && st->busy) {
             lt->busy_row = lt->input_top - 1;
         }
         int view_h = lt->chat_h - ((lt->busy_row > 0) ? 1 : 0);
@@ -466,10 +465,7 @@ Slot layout_slot(const Layout *lt, int row)
     switch (lt->mode) {
     case MODE_INPUT:
         if (lt->busy_row > 0 && row == lt->busy_row) {
-            /* dieselbe zeile, anderer inhalt: solange eine
-             * rueckfrage offen ist, wartet nicht das modell auf
-             * uns, sondern wir auf den benutzer */
-            s.kind = (lt->tool_ask[0] != '\0') ? SLOT_TOOL_ASK : SLOT_BUSY;
+            s.kind = SLOT_BUSY;
             return s;
         }
         if (lt->more_above_row > 0 && row == lt->more_above_row) {
@@ -1152,21 +1148,6 @@ static void row_more(Row *r, const char *arrow, int lines)
     row_sgr(r, THEME_ROLE_RESET);
 }
 
-/* rueckfrage vor einem tool: was aufgerufen werden soll, steht
- * schon als tool-call im verlauf darueber – hier reicht der name
- * und die auswahl. */
-static void row_tool_ask(Row *r, const char *name)
-{
-    row_sgr(r, theme_role(THEME_ROLE_ERROR));
-    row_puts(r, "ask  ");
-    row_sgr(r, THEME_ROLE_RESET);
-    row_puts(r, name);
-    row_puts(r, " ausfuehren? ");
-    row_sgr(r, theme_role(THEME_ROLE_DIM));
-    row_puts(r, "[j]a  [n]ein  [a]lle");
-    row_sgr(r, THEME_ROLE_RESET);
-}
-
 static void row_busy(Row *r)
 {
     row_sgr(r, theme_role(THEME_ROLE_ASSISTANT));
@@ -1231,9 +1212,6 @@ void draw_slot(Frame *f, const Layout *lt, const Slot *s, const AppState *st,
     }
     case SLOT_BUSY:
         row_busy(&r);
-        break;
-    case SLOT_TOOL_ASK:
-        row_tool_ask(&r, lt->tool_ask);
         break;
     case SLOT_MORE_ABOVE:
         row_more(&r, GLYPH_ARROW_UP, lt->more_above);

@@ -34,12 +34,18 @@ _Static_assert(sizeof(ChatToolCall) == sizeof(OaiToolCall),
  * alle 80ms. */
 #define SEND_REDRAW_MS 80
 
-/* agent-loop deckel: so viele runden (antwort -> tools -> antwort)
- * laufen hoechstens, bis die finale antwort kommen muss – sonst
- * kann ein model sich selbst endlos weiterschicken */
-#define SEND_MAX_ROUNDS 8
+/* agent-loop: BEWUSST ohne runden-deckel, exakt wie der agent-loop
+ * von pi (badlogic/pi-mono, agent-loop.ts): die schleife laeuft,
+ * bis das modell keine tool-calls mehr ausgibt – ein fixer deckel
+ * wuerde nur harmlose aufgaben abwuerzen, echte arbeiten brauchen
+ * routinemaessig dutzende runden. die "grenzen" sind dieselben
+ * wie dort: abbruch per esc/ctrl+c (stream_should_abort) und das
+ * kontextfenster (ctx_trim_start kuemmt alten verlauf weg).
+ * ein model, das sich in identischen calls todespiralt, ist ein
+ * modell-problem (pi-issue #6158) – der benutzer bricht ab. */
 
-/* deckel fuer parallel tool-calls in EINER antwort */
+/* deckel fuer parallel tool-calls in EINER antwort (schuetzt nur
+ * den akku vor speicher-sprengung, kein verhaltens-limit) */
 #define SEND_MAX_TOOLS 32
 
 /* puffer fuer fehlermeldungen, die im transcript landen; laengere
@@ -733,11 +739,6 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
             mono_ms() - sc.t_start, round, sc.model, sc.prompt_tokens,
             sc.completion_tokens, false);
 
-        if (round + 1 >= SEND_MAX_ROUNDS) {
-            fail(state, 0, "tool-runden-limit (%d) erreicht", SEND_MAX_ROUNDS);
-            return -1;
-        }
-
         /* tools ausfuehren, ergebnisse als TOOL-nachrichten anhaengen;
          * die naechste runde schickt sie mit. fehler-ergebnisse sind
          * auch nur text – das model darf sie korrigieren. */
@@ -750,38 +751,6 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
         for (size_t i = 0; i < calls_len; i++) {
             ChatToolCall *call = &calls[i];
 
-            /* alles, was etwas veraendert, wird vorgelegt. lehnt der
-             * benutzer ab, bekommt das MODELL das als ergebnis: ohne
-             * antwort auf den call wuerde die api die naechste runde
-             * zurueckweisen, und das modell wuesste nicht, warum
-             * nichts passiert ist. die entscheidung wandert mit ins
-             * session-log ("auto" = gar nicht erst gefragt). */
-            bool asked = false;
-            if (hooks->confirm_tool != NULL && tool_needs_confirm(call->name)) {
-                asked = true;
-            }
-            bool allowed = true;
-            if (asked) {
-                allowed = hooks->confirm_tool(call->name, call->arguments,
-                                              hooks->ctx);
-            }
-            if (asked && !allowed) {
-                if (chat_append_tool(chat, call->id,
-                                     "error: vom benutzer abgelehnt") != 0) {
-                    die("out of memory");
-                }
-                (void)session_log_tool(&state->session, call->id, call->name,
-                                       "error: vom benutzer abgelehnt", -1,
-                                       "no");
-                continue;
-            }
-            const char *confirm = "auto";
-            if (asked && state->tools_always) {
-                confirm = "always";
-            } else if (asked) {
-                confirm = "yes";
-            }
-
             long long t_tool = mono_ms();
             char *result = tool_execute(call->name, call->arguments);
             long long dur = mono_ms() - t_tool;
@@ -789,7 +758,7 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
                 die("out of memory");
             }
             (void)session_log_tool(&state->session, call->id, call->name,
-                                   result, dur, confirm);
+                                   result, dur);
             if (chat_append_tool(chat, call->id, result) != 0) {
                 die("out of memory");
             }

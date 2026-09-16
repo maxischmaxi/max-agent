@@ -52,15 +52,6 @@ typedef struct {
     bool busy; /* anfrage laeuft: draw zeigt thinking-indikator, die */
                /* UI blockiert bis die antwort da ist               */
 
-    /* offene tool-rueckfrage: name des tools, das gerade vorgelegt
-     * wird ("" = keine frage offen). die zeile des thinking-
-     * indikators traegt solange die frage. */
-    char tool_ask[64];
-    /* "alle" gewaehlt: fuer den rest der sitzung nicht mehr fragen.
-     * bewusst NICHT in der config – eine pauschale erlaubnis soll
-     * den neustart nicht ueberleben. */
-    bool tools_always;
-
     /* token-buchhaltung ueber die runden hinweg: wieviel der
      * letzte request geschaetzt/wirklich gekostet hat und wieviel
      * verlauf dabei weggelassen wurde (context.c) */

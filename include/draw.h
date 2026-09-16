@@ -25,10 +25,6 @@ typedef struct {
                     /* der "weiter oben"-hinweis belegt zeile 1)   */
     int chat_first; /* index der ersten sichtbaren zeile */
     int busy_row;   /* zeile des thinking-indikators, 0 = keiner */
-    /* offene tool-rueckfrage (kopie aus dem state, weil layout_slot
-     * nur das layout sieht). "" = keine frage, dann zeigt busy_row
-     * den thinking-indikator. */
-    char tool_ask[64];
 
     /* scroll-hinweise: wieviele render-zeilen ausserhalb des
      * viewports liegen, und in welcher zeile der hinweis steht
@@ -89,7 +85,6 @@ typedef enum {
     SLOT_MORE_ABOVE,    /* hinweis: verlauf geht oberhalb weiter */
     SLOT_MORE_BELOW,    /* hinweis: verlauf geht unterhalb weiter */
     SLOT_BUSY,          /* thinking-indikator waehrend einer anfrage */
-    SLOT_TOOL_ASK,      /* rueckfrage, ob ein tool laufen darf */
     SLOT_DLG_BORDER,    /* trenn-linie ueber dem dialog */
     SLOT_DLG_SEARCH,    /* such-zeile mit cursor */
     SLOT_DLG_EMPTY,     /* hinweis: kein eintrag passt */

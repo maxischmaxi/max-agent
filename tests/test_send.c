@@ -315,8 +315,8 @@ static void count_redraw(void *ud)
     g_redraw_ctx = ud; /* wird der ctx durchgereicht? siehe unten */
 }
 
-/* standard-haken der tests: nur zeichnen, keine rueckfrage –
- * confirm_tool bleibt NULL, tools laufen also ungefragt durch */
+/* standard-haken der tests: nur zeichnen – tools laufen ohnehin
+ * ungefragt durch (der hook existiert nicht mehr) */
 static const SendHooks HOOKS = {.redraw = count_redraw};
 
 /* ------------------------------------------------------------------ */
@@ -864,123 +864,6 @@ static void test_agent_realloc(void)
     waitpid(server, NULL, 0);
 }
 
-/* ------------------------------------------------------------------ */
-/* rueckfrage vor tools: was abgelehnt wird, laeuft nicht – und das  */
-/* MODELL muss es erfahren, sonst haengt der loop.                    */
-/* ------------------------------------------------------------------ */
-
-static int g_asked = 0;
-static char g_asked_name[64];
-static bool g_answer = false;
-
-static bool answer_hook(const char *name, const char *arguments, void *ud)
-{
-    (void)arguments;
-    (void)ud;
-    g_asked++;
-    snprintf(g_asked_name, sizeof g_asked_name, "%s",
-             (name != NULL) ? name : "");
-    return g_answer;
-}
-
-static void run_confirm_case(bool answer, bool *out_ran, size_t *out_tools)
-{
-    int port = 0;
-    pid_t server = start_tool_server(&port);
-    CHECK(server >= 0);
-    if (server < 0) {
-        return;
-    }
-
-    Config cfg;
-    build_mock_cfg(&cfg, port);
-
-    AppState st = {0};
-    input_init(&st.input);
-    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
-
-    /* das mock-tool schreibt eine datei, an der sich ablesen laesst,
-     * ob es wirklich gelaufen ist */
-    (void)unlink(CONFIRM_MARK);
-
-    g_asked = 0;
-    g_asked_name[0] = '\0';
-    g_answer = answer;
-    SendHooks hooks = {
-        .ctx = NULL,
-        .redraw = count_redraw,
-        .confirm_tool = answer_hook,
-    };
-    CHECK(send_stream(&st, &cfg, &hooks) == 0);
-
-    /* gefragt wurde genau einmal, und zwar nach dem bash-tool */
-    CHECK(g_asked == 1);
-    CHECK(strcmp(g_asked_name, "bash") == 0);
-
-    *out_ran = (access(CONFIRM_MARK, F_OK) == 0);
-    *out_tools = 0;
-    for (size_t i = 0; i < st.chat.len; i++) {
-        if (st.chat.msgs[i].role == CHAT_ROLE_TOOL) {
-            (*out_tools)++;
-            /* jedes tool-ergebnis MUSS eine call-id tragen, sonst
-             * weist die api die naechste runde zurueck */
-            CHECK(st.chat.msgs[i].tool_call_id != NULL);
-            if (!answer) {
-                CHECK(strstr(st.chat.msgs[i].text, "abgelehnt") != NULL);
-            }
-        }
-    }
-
-    (void)unlink(CONFIRM_MARK);
-    chat_free(&st.chat);
-    input_free(&st.input);
-    free_mock_cfg(&cfg);
-    kill(server, SIGKILL);
-    waitpid(server, NULL, 0);
-}
-
-static void test_tool_confirm(void)
-{
-    /* --- abgelehnt: das kommando laeuft NICHT --- */
-    bool ran = true;
-    size_t tools = 0;
-    run_confirm_case(false, &ran, &tools);
-    CHECK(!ran);       /* die datei wurde nie geschrieben */
-    CHECK(tools == 1); /* trotzdem eine antwort auf den call */
-
-    /* --- zugestimmt: es laeuft --- */
-    ran = false;
-    tools = 0;
-    run_confirm_case(true, &ran, &tools);
-    CHECK(ran);
-    CHECK(tools == 1);
-
-    /* --- ohne hook laeuft alles ungefragt (tests, nicht-
-     *     interaktive aufrufer) --- */
-    int port = 0;
-    pid_t server = start_tool_server(&port);
-    CHECK(server >= 0);
-    if (server < 0) {
-        return;
-    }
-    Config cfg;
-    build_mock_cfg(&cfg, port);
-    AppState st = {0};
-    input_init(&st.input);
-    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
-    (void)unlink(CONFIRM_MARK);
-    g_asked = 0;
-    CHECK(send_stream(&st, &cfg, &HOOKS) == 0);
-    CHECK(g_asked == 0);                    /* niemand wurde gefragt */
-    CHECK(access(CONFIRM_MARK, F_OK) == 0); /* und es lief */
-    (void)unlink(CONFIRM_MARK);
-    chat_free(&st.chat);
-    input_free(&st.input);
-    free_mock_cfg(&cfg);
-    kill(server, SIGKILL);
-    waitpid(server, NULL, 0);
-}
-
 /* der ctx aus SendHooks muss unveraendert im redraw-callback
  * ankommen. das klingt trivial, ist aber die stelle, an der die UI
  * ihren zeichen-kontext bekommt: geht sie verloren, dereferenziert
@@ -1308,7 +1191,6 @@ int main(void)
     test_stream_abort();
     test_stream_no_abort();
     test_agent_realloc();
-    test_tool_confirm();
     test_hooks_ctx();
 
     chat_free(&chat);

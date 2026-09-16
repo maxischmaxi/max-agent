@@ -112,10 +112,9 @@ int session_log_assistant(Session *s, const char *text,
                           const char *model, int prompt_tokens,
                           int completion_tokens, bool aborted);
 
-/* ergebnis eines tool-aufrufs. dur_ms = ausfuehrungsdauer,
- * confirm: "auto" (ungefragt), "yes"/"always"/"no" (rueckfrage). */
+/* ergebnis eines tool-aufrufs. dur_ms = ausfuehrungsdauer. */
 int session_log_tool(Session *s, const char *call_id, const char *name,
-                     const char *result, long long dur_ms, const char *confirm);
+                     const char *result, long long dur_ms);
 
 /* lokale fehlermeldung (http_status 0 = verbindungs-/setup-fehler) */
 int session_log_error(Session *s, const char *text, long http_status);

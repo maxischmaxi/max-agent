@@ -896,55 +896,6 @@ static void stream_redraw(void *ud)
     draw(rc->rows, rc->cols, rc->state, rc->cfg);
 }
 
-/* rueckfrage vor einem tool. haelt den agent-loop an, zeichnet die
- * frage in die zeile des thinking-indikators und wartet auf eine
- * taste. der aufgerufene tool-call steht schon im verlauf darueber,
- * man sieht also, worum es geht.
- *
- * [j]a fuehrt einmal aus, [n]ein lehnt ab, [a]lle schaltet die
- * rueckfrage fuer den rest der sitzung ab. escape und ctrl+c
- * gelten als nein – wer abbricht, will nichts ausfuehren. */
-static bool confirm_tool(const char *name, const char *arguments, void *ud)
-{
-    StreamRedrawCtx *rc = ud;
-    AppState *st = rc->state;
-    (void)arguments; /* steht schon als tool-call im verlauf */
-
-    if (st->tools_always) {
-        return true;
-    }
-
-    snprintf(st->tool_ask, sizeof st->tool_ask, "%s",
-             (name != NULL) ? name : "?");
-    bool allow = false;
-    for (;;) {
-        draw(rc->rows, rc->cols, st, rc->cfg);
-        Key k = key_read();
-        if (k.kind == KEY_ESCAPE || k.kind == KEY_CTRL_C ||
-            k.kind == KEY_CTRL_Q) {
-            break; /* abbruch = nein */
-        }
-        if (k.kind != KEY_CHAR) {
-            continue; /* alles andere ignorieren, weiter fragen */
-        }
-        if (k.ch == 'j' || k.ch == 'y') {
-            allow = true;
-            break;
-        }
-        if (k.ch == 'a') {
-            st->tools_always = true;
-            allow = true;
-            break;
-        }
-        if (k.ch == 'n') {
-            break;
-        }
-    }
-    st->tool_ask[0] = '\0'; /* frage wieder weg */
-    st->dirty = true;
-    return allow;
-}
-
 static int cmd_list_height(const AppState *st)
 {
     if (!st->cmd_active) {
@@ -1127,7 +1078,6 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
                 SendHooks hooks = {
                     .ctx = &rc,
                     .redraw = stream_redraw,
-                    .confirm_tool = confirm_tool,
                 };
                 (void)send_stream(state, cfg, &hooks);
                 state->busy = false;
