@@ -11,8 +11,34 @@
 
 #define TMP_PATH "/tmp/max-agent-test-tools.txt"
 
+/* welche tools vorgelegt werden muessen: lesen darf durchlaufen,
+ * alles andere nicht. unbekanntes gilt als gefaehrlich. */
+static void test_needs_confirm(void)
+{
+    CHECK(!tool_needs_confirm("read_file")); /* nur lesen */
+    CHECK(tool_needs_confirm("write_file"));
+    CHECK(tool_needs_confirm("bash"));
+    CHECK(tool_needs_confirm("gibts-nicht")); /* im zweifel fragen */
+    CHECK(tool_needs_confirm(NULL));
+
+    /* jedes registrierte tool hat eine klare antwort, und alles
+     * ausser read_file wird vorgelegt */
+    size_t len = 0;
+    const OaiTool *tools = tool_registry(&len);
+    CHECK(len > 0);
+    for (size_t i = 0; i < len; i++) {
+        const char *name = tools[i].function.name;
+        CHECK(name != NULL);
+        if (strcmp(name, "read_file") != 0) {
+            CHECK(tool_needs_confirm(name));
+        }
+    }
+}
+
 int main(void)
 {
+    test_needs_confirm();
+
     /* --- registry: name, beschreibung, gueltiges schema-json --- */
     size_t len = 0;
     const OaiTool *reg = tool_registry(&len);

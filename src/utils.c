@@ -286,6 +286,9 @@ UIMode ui_mode(const AppState *st)
         if (st->theme_sub) {
             return MODE_THEME;
         }
+        if (st->prompt_sub) {
+            return MODE_PROMPT;
+        }
         return MODE_SETTINGS;
     }
     return MODE_INPUT;

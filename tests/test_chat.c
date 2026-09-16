@@ -323,27 +323,50 @@ static void test_layout(void)
     CHECK((int)lt.chat_lines_len == 30);
     CHECK(lt.chat_h > 0);
     CHECK(st.chat_scroll == 0);
-    CHECK(lt.chat_first == 30 - lt.chat_h); /* letzte chat_h zeilen */
-    /* slot-mapping: viewport-zeile 1 = erste sichtbare verlaufs-zeile */
-    Slot s1 = layout_slot(&lt, 1);
+    /* am ende des verlaufs: nichts unten verdeckt, aber oben – der
+     * "weiter oben"-hinweis belegt zeile 1 und kostet eine
+     * verlaufs-zeile */
+    CHECK(lt.more_below == 0);
+    CHECK(lt.more_below_row == 0);
+    CHECK(lt.more_above_row == 1);
+    CHECK(lt.chat_top == 2);
+    int view = lt.chat_h - 1; /* eine zeile geht an den hinweis */
+    CHECK(lt.chat_first == 30 - view);
+    CHECK(lt.more_above == lt.chat_first);
+    /* slot-mapping: die erste verlaufs-zeile liegt jetzt in zeile 2 */
+    Slot sHint = layout_slot(&lt, 1);
+    CHECK(sHint.kind == SLOT_MORE_ABOVE);
+    Slot s1 = layout_slot(&lt, lt.chat_top);
     CHECK(s1.kind == SLOT_MSG_USER);
     CHECK(s1.index == lt.chat_first);
     Slot sLast = layout_slot(&lt, lt.chat_h);
     CHECK(sLast.kind == SLOT_MSG_USER);
     CHECK(sLast.index == (int)lt.chat_lines_len - 1);
 
-    /* zu weit gescrollt: layout klemmt und schreibt zurueck */
+    /* zu weit gescrollt: layout klemmt und schreibt zurueck. ganz
+     * oben faellt der obere hinweis weg, dafuer kommt der untere */
     st.chat_scroll = 999;
     layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
-    CHECK(st.chat_scroll == 30 - lt.chat_h);
     CHECK(lt.chat_first == 0);
+    CHECK(lt.more_above == 0);
+    CHECK(lt.more_above_row == 0);
+    CHECK(lt.chat_top == 1);
+    CHECK(lt.more_below > 0);
+    CHECK(lt.more_below_row == lt.input_top - 1);
+    CHECK(st.chat_scroll == 30 - (lt.chat_h - 1));
+    CHECK(layout_slot(&lt, lt.more_below_row).kind == SLOT_MORE_BELOW);
 
-    /* pgup um 2 zeilen: viewport rutscht mit */
+    /* pgup um 2 zeilen: viewport rutscht mit, jetzt sind BEIDE
+     * hinweise noetig und kosten zusammen zwei zeilen */
     st.chat_scroll = 2;
     layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
     CHECK(st.chat_scroll == 2);
-    CHECK(lt.chat_first == 30 - 2 - lt.chat_h);
+    CHECK(lt.more_below == 2);
+    CHECK(lt.more_above > 0);
+    CHECK(lt.chat_first == 30 - 2 - (lt.chat_h - 2));
     CHECK(lt.chat_first > 0);
+    CHECK(layout_slot(&lt, 1).kind == SLOT_MORE_ABOVE);
+    CHECK(layout_slot(&lt, lt.input_top - 1).kind == SLOT_MORE_BELOW);
 
     /* verlauf KLEINER als viewport: oben anfangen, kein scroll */
     st.chat_scroll = 5;
@@ -353,6 +376,10 @@ static void test_layout(void)
     layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
     CHECK(st.chat_scroll == 0);
     CHECK(lt.chat_first == 0);
+    /* alles sichtbar: kein hinweis, verlauf beginnt wieder bei 1 */
+    CHECK(lt.more_above == 0);
+    CHECK(lt.more_below == 0);
+    CHECK(lt.chat_top == 1);
     Slot sA = layout_slot(&lt, 1);
     CHECK(sA.kind == SLOT_MSG_USER);
     Slot sB = layout_slot(&lt, 2);
@@ -371,11 +398,80 @@ static void test_layout(void)
     chat_free(&st.chat);
 }
 
+/* die scroll-hinweise an ihren raendern: sie kosten platz, also
+ * muessen sie verschwinden, wenn keiner da ist – und dem thinking-
+ * indikator ausweichen, wenn gerade eine anfrage laeuft. */
+static void test_scroll_hints(void)
+{
+    AppState st = {0};
+    input_init(&st.input);
+    Config cfg = {0};
+    Layout lt;
+
+    for (int i = 1; i <= 40; i++) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "zeile %d", i);
+        CHECK(chat_append(&st.chat, CHAT_ROLE_USER, buf) == 0);
+    }
+
+    /* --- waehrend einer anfrage: der untere hinweis rueckt ueber
+     *     den thinking-indikator --- */
+    st.chat_scroll = 3;
+    st.busy = true;
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    CHECK(lt.busy_row == lt.input_top - 1);
+    CHECK(lt.more_below == 3);
+    CHECK(lt.more_below_row == lt.busy_row - 1);
+    CHECK(layout_slot(&lt, lt.busy_row).kind == SLOT_BUSY);
+    CHECK(layout_slot(&lt, lt.more_below_row).kind == SLOT_MORE_BELOW);
+    /* der verlauf liegt dazwischen, ohne ueberschneidung */
+    CHECK(layout_slot(&lt, lt.chat_top).kind == SLOT_MSG_USER);
+    CHECK(layout_slot(&lt, lt.more_below_row - 1).kind == SLOT_MSG_USER);
+    st.busy = false;
+
+    /* --- winziges terminal: lieber verlauf zeigen als hinweise --- */
+    for (int rows = 5; rows <= 8; rows++) {
+        st.chat_scroll = 3;
+        layout_compute(&lt, rows, 80, MODE_INPUT, &st, &cfg);
+        int hints =
+            (lt.more_above_row > 0 ? 1 : 0) + (lt.more_below_row > 0 ? 1 : 0);
+        /* nie mehr hinweise als platz da ist, und immer mindestens
+         * eine zeile echter verlauf */
+        CHECK(hints <= lt.chat_h - 1 || hints == 0);
+        if (lt.chat_h > 0) {
+            CHECK(lt.chat_top <= lt.chat_h);
+        }
+        /* die hinweis-zeilen ueberschneiden sich nie */
+        if (lt.more_above_row > 0 && lt.more_below_row > 0) {
+            CHECK(lt.more_above_row < lt.more_below_row);
+        }
+    }
+
+    /* --- der zurueckgeschriebene scroll passt zum layout --- */
+    st.chat_scroll = 0;
+    layout_compute(&lt, 24, 80, MODE_INPUT, &st, &cfg);
+    CHECK(st.chat_scroll == 0);
+    CHECK(lt.more_below == 0);
+    /* summe stimmt: oben verdeckt + sichtbar + unten verdeckt */
+    int visible = 0;
+    for (int row = 1; row < lt.input_top; row++) {
+        Slot s = layout_slot(&lt, row);
+        if (s.kind == SLOT_MSG_USER || s.kind == SLOT_MSG_ASSISTANT) {
+            visible++;
+        }
+    }
+    CHECK(lt.more_above + visible + lt.more_below == (int)lt.chat_lines_len);
+
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
 int main(void)
 {
     test_append_pop_clear();
     test_flatten();
     test_wrap();
     test_layout();
+    test_scroll_hints();
     return test_report();
 }

@@ -11,6 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 
+/* marker, an dem sich ablesen laesst, ob das mock-tool wirklich
+ * gelaufen ist (die rueckfrage-tests haengen daran) */
+#define CONFIRM_MARK "/tmp/max-agent-confirm.mark"
+
 #include "chat.h"
 #include "keys.h"
 #include "send.h"
@@ -309,6 +313,10 @@ static void count_redraw(void *ud)
     g_redraws++;
 }
 
+/* standard-haken der tests: nur zeichnen, keine rueckfrage –
+ * confirm_tool bleibt NULL, tools laufen also ungefragt durch */
+static const SendHooks HOOKS = {.redraw = count_redraw};
+
 /* ------------------------------------------------------------------ */
 /* agent-loop: zwei runden gegen einen routing-mock. runde 1 (request */
 /* enthaelt noch kein tool_call_id) antwortet mit einem tool-call,    */
@@ -375,7 +383,8 @@ static pid_t start_tool_server(int *port)
                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
                    "{\"index\":0,\"id\":\"call_1\",\"function\":{"
                    "\"name\":\"bash\",\"arguments\":"
-                   "\"{\\\"command\\\":\\\"echo agent-test\\\"}\"}}]}}]}\n\n"
+                   "\"{\\\"command\\\":\\\"touch " CONFIRM_MARK
+                   " && echo agent-test\\\"}\"}}]}}]}\n\n"
                    "data: [DONE]\n\n";
         }
         (void)write(cfd, resp, strlen(resp));
@@ -438,7 +447,7 @@ static void test_agent(void)
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
 
     g_redraws = 0;
-    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
     CHECK(rc == 0);
 
     /* verlauf: user -> assistant mit tool-call -> tool-ergebnis
@@ -450,7 +459,8 @@ static void test_agent(void)
           strcmp(st.chat.msgs[1].tool_calls[0].name, "bash") == 0);
     CHECK(st.chat.msgs[1].tool_calls[0].arguments != NULL &&
           strcmp(st.chat.msgs[1].tool_calls[0].arguments,
-                 "{\"command\":\"echo agent-test\"}") == 0);
+                 "{\"command\":\"touch " CONFIRM_MARK
+                 " && echo agent-test\"}") == 0);
     CHECK(st.chat.msgs[2].role == CHAT_ROLE_TOOL);
     CHECK(st.chat.msgs[2].text != NULL &&
           strstr(st.chat.msgs[2].text, "agent-test") != NULL);
@@ -503,7 +513,7 @@ static void test_agent_broken_call(void)
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
 
     g_redraws = 0;
-    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
     CHECK(rc == 0);
 
     /* namenloser call verworfen -> keine tool-runde, loop endet */
@@ -557,7 +567,7 @@ static void test_context_trim(void)
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neue frage") == 0);
 
     g_redraws = 0;
-    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
     CHECK(rc == 0);
 
     /* der server hat den alten block NICHT gesehen */
@@ -611,7 +621,7 @@ static void test_context_fits(void)
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "URALTE-NACHRICHT hallo") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neue frage") == 0);
 
-    CHECK(send_stream(&st, &cfg, &dbg, NULL, count_redraw) == 0);
+    CHECK(send_stream(&st, &cfg, &dbg, &HOOKS) == 0);
     ChatMessage *answer = &st.chat.msgs[st.chat.len - 1];
     CHECK(answer->text != NULL && strcmp(answer->text, "JA") == 0);
     CHECK(st.ctx.dropped == 0);
@@ -657,15 +667,15 @@ static void test_stream_abort(void)
     struct timespec t0;
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     CHECK(rc == 0); /* abbruch ist kein fehler */
 
     /* der server pausiert 600ms vor dem rest. sind wir deutlich
      * frueher zurueck, wurde wirklich abgebrochen und nicht nur
      * hinterher ein hinweis gesetzt. */
-    long ms =
-        (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    long ms = ((t1.tv_sec - t0.tv_sec) * 1000) +
+              ((t1.tv_nsec - t0.tv_nsec) / 1000000);
     CHECK(ms < 500);
 
     /* der erste teil steht im verlauf, der zweite kam nie an */
@@ -714,7 +724,7 @@ static void test_stream_no_abort(void)
     DebugState dbg = {0};
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "erzaehl was langes") == 0);
 
-    CHECK(send_stream(&st, &cfg, &dbg, NULL, count_redraw) == 0);
+    CHECK(send_stream(&st, &cfg, &dbg, &HOOKS) == 0);
 
     ChatMessage *answer = &st.chat.msgs[st.chat.len - 1];
     CHECK(answer->role == CHAT_ROLE_ASSISTANT);
@@ -778,34 +788,36 @@ static pid_t start_multitool_server(int *port)
         bool second = strstr(req, "tool_call_id") != NULL;
         free(req);
 
-        const char *resp =
-            second
-                ? "HTTP/1.1 200 OK\r\n"
-                  "Content-Type: text/event-stream\r\n"
-                  "Connection: close\r\n"
-                  "\r\n"
-                  "data: {\"choices\":[{\"delta\":{\"content\":\"fertig\"}}]}"
-                  "\n\n"
-                  "data: [DONE]\n\n"
-                /* runde 1: VIER calls auf einmal */
-                : "HTTP/1.1 200 OK\r\n"
-                  "Content-Type: text/event-stream\r\n"
-                  "Connection: close\r\n"
-                  "\r\n"
-                  "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
-                  "{\"index\":0,\"id\":\"c0\",\"function\":{\"name\":"
-                  "\"bash\",\"arguments\":\"{\\\"command\\\":"
-                  "\\\"echo a\\\"}\"}},"
-                  "{\"index\":1,\"id\":\"c1\",\"function\":{\"name\":"
-                  "\"bash\",\"arguments\":\"{\\\"command\\\":"
-                  "\\\"echo b\\\"}\"}},"
-                  "{\"index\":2,\"id\":\"c2\",\"function\":{\"name\":"
-                  "\"bash\",\"arguments\":\"{\\\"command\\\":"
-                  "\\\"echo c\\\"}\"}},"
-                  "{\"index\":3,\"id\":\"c3\",\"function\":{\"name\":"
-                  "\"bash\",\"arguments\":\"{\\\"command\\\":"
-                  "\\\"echo d\\\"}\"}}]}}]}\n\n"
-                  "data: [DONE]\n\n";
+        const char *resp = NULL;
+        if (second) {
+            resp = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/event-stream\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "data: {\"choices\":[{\"delta\":{\"content\":\"fertig\"}}]}"
+                   "\n\n"
+                   "data: [DONE]\n\n";
+        } else {
+            /* runde 1: VIER calls auf einmal */
+            resp = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/event-stream\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
+                   "{\"index\":0,\"id\":\"c0\",\"function\":{\"name\":"
+                   "\"bash\",\"arguments\":\"{\\\"command\\\":"
+                   "\\\"echo a\\\"}\"}},"
+                   "{\"index\":1,\"id\":\"c1\",\"function\":{\"name\":"
+                   "\"bash\",\"arguments\":\"{\\\"command\\\":"
+                   "\\\"echo b\\\"}\"}},"
+                   "{\"index\":2,\"id\":\"c2\",\"function\":{\"name\":"
+                   "\"bash\",\"arguments\":\"{\\\"command\\\":"
+                   "\\\"echo c\\\"}\"}},"
+                   "{\"index\":3,\"id\":\"c3\",\"function\":{\"name\":"
+                   "\"bash\",\"arguments\":\"{\\\"command\\\":"
+                   "\\\"echo d\\\"}\"}}]}}]}\n\n"
+                   "data: [DONE]\n\n";
+        }
         (void)write(cfd, resp, strlen(resp));
         close(cfd);
     }
@@ -836,7 +848,7 @@ static void test_agent_realloc(void)
     }
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu vier dinge") == 0);
 
-    CHECK(send_stream(&st, &cfg, &dbg, NULL, count_redraw) == 0);
+    CHECK(send_stream(&st, &cfg, &dbg, &HOOKS) == 0);
 
     /* alle vier tool-ergebnisse sind im verlauf gelandet */
     size_t tools = 0;
@@ -853,6 +865,125 @@ static void test_agent_realloc(void)
     input_free(&st.input);
     free_mock_cfg(&cfg);
 
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* rueckfrage vor tools: was abgelehnt wird, laeuft nicht – und das  */
+/* MODELL muss es erfahren, sonst haengt der loop.                    */
+/* ------------------------------------------------------------------ */
+
+static int g_asked = 0;
+static char g_asked_name[64];
+static bool g_answer = false;
+
+static bool answer_hook(const char *name, const char *arguments, void *ud)
+{
+    (void)arguments;
+    (void)ud;
+    g_asked++;
+    snprintf(g_asked_name, sizeof g_asked_name, "%s",
+             (name != NULL) ? name : "");
+    return g_answer;
+}
+
+static void run_confirm_case(bool answer, bool *out_ran, size_t *out_tools)
+{
+    int port = 0;
+    pid_t server = start_tool_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
+
+    /* das mock-tool schreibt eine datei, an der sich ablesen laesst,
+     * ob es wirklich gelaufen ist */
+    (void)unlink(CONFIRM_MARK);
+
+    g_asked = 0;
+    g_asked_name[0] = '\0';
+    g_answer = answer;
+    SendHooks hooks = {
+        .ctx = NULL,
+        .redraw = count_redraw,
+        .confirm_tool = answer_hook,
+    };
+    CHECK(send_stream(&st, &cfg, &dbg, &hooks) == 0);
+
+    /* gefragt wurde genau einmal, und zwar nach dem bash-tool */
+    CHECK(g_asked == 1);
+    CHECK(strcmp(g_asked_name, "bash") == 0);
+
+    *out_ran = (access(CONFIRM_MARK, F_OK) == 0);
+    *out_tools = 0;
+    for (size_t i = 0; i < st.chat.len; i++) {
+        if (st.chat.msgs[i].role == CHAT_ROLE_TOOL) {
+            (*out_tools)++;
+            /* jedes tool-ergebnis MUSS eine call-id tragen, sonst
+             * weist die api die naechste runde zurueck */
+            CHECK(st.chat.msgs[i].tool_call_id != NULL);
+            if (!answer) {
+                CHECK(strstr(st.chat.msgs[i].text, "abgelehnt") != NULL);
+            }
+        }
+    }
+
+    (void)unlink(CONFIRM_MARK);
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+static void test_tool_confirm(void)
+{
+    /* --- abgelehnt: das kommando laeuft NICHT --- */
+    bool ran = true;
+    size_t tools = 0;
+    run_confirm_case(false, &ran, &tools);
+    CHECK(!ran);       /* die datei wurde nie geschrieben */
+    CHECK(tools == 1); /* trotzdem eine antwort auf den call */
+
+    /* --- zugestimmt: es laeuft --- */
+    ran = false;
+    tools = 0;
+    run_confirm_case(true, &ran, &tools);
+    CHECK(ran);
+    CHECK(tools == 1);
+
+    /* --- ohne hook laeuft alles ungefragt (tests, nicht-
+     *     interaktive aufrufer) --- */
+    int port = 0;
+    pid_t server = start_tool_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+    AppState st = {0};
+    input_init(&st.input);
+    DebugState dbg = {0};
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "tu was") == 0);
+    (void)unlink(CONFIRM_MARK);
+    g_asked = 0;
+    CHECK(send_stream(&st, &cfg, &dbg, &HOOKS) == 0);
+    CHECK(g_asked == 0);                    /* niemand wurde gefragt */
+    CHECK(access(CONFIRM_MARK, F_OK) == 0); /* und es lief */
+    (void)unlink(CONFIRM_MARK);
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
     kill(server, SIGKILL);
     waitpid(server, NULL, 0);
 }
@@ -897,7 +1028,7 @@ static void test_stream(void)
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "moin") == 0);
 
     g_redraws = 0;
-    int rc = send_stream(&st, &cfg, &dbg, NULL, count_redraw);
+    int rc = send_stream(&st, &cfg, &dbg, &HOOKS);
     CHECK(rc == 0);
 
     /* verlauf: user, alte antwort, NEUE antwort aus den deltas */
@@ -949,7 +1080,7 @@ static void test_stream(void)
     input_init(&st2.input);
     CHECK(chat_append(&st2.chat, CHAT_ROLE_USER, "hi") == 0);
 
-    rc = send_stream(&st2, &bad, &dbg, NULL, count_redraw);
+    rc = send_stream(&st2, &bad, &dbg, &HOOKS);
     CHECK(rc == -1);
     /* platzhalter ist weg: nur user + fehlermeldung */
     CHECK(st2.chat.len == 2);
@@ -1149,6 +1280,7 @@ int main(void)
     test_stream_abort();
     test_stream_no_abort();
     test_agent_realloc();
+    test_tool_confirm();
 
     chat_free(&chat);
     return test_report();

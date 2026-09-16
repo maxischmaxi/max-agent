@@ -48,17 +48,34 @@ const Model *send_find_model(const Config *cfg, const char *id,
  * fehler landen IMMER als CHAT_ROLE_ERROR im verlauf. */
 int send_message(AppState *state, const Config *cfg, DebugState *dbg);
 
+/* ------------------------------------------------------------------ */
+/* haken, die send_stream in die UI zurueckruft. beide bekommen den  */
+/* gemeinsamen ctx – die streaming-schleife selbst weiss nichts von  */
+/* terminal, tasten oder layout.                                      */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    void *ctx;
+    /* nach chunks aufrufen, damit der aufrufer neu zeichnet.
+     * pflicht: ohne redraw sieht man vom stream nichts. */
+    void (*redraw)(void *ctx);
+    /* rueckfrage vor einem tool, das etwas veraendert (siehe
+     * tool_needs_confirm). true = ausfuehren, false = ablehnen.
+     * NULL heisst: alles laeuft ungefragt durch – das ist der
+     * modus fuer tests und nicht-interaktive aufrufer. */
+    bool (*confirm_tool)(const char *name, const char *arguments, void *ctx);
+} SendHooks;
+
 /* wie send_message, aber als stream: vor dem request entsteht eine
  * leere ASSISTANT-nachricht als platzhalter, jeder chunk haengt an
  * ihren text – die antwort waechst also live im verlauf.
- * redraw wird nach chunks aufgerufen, damit der rufende das UI
- * aktualisieren kann (send selbst drosselt auf SEND_REDRAW_MS;
+ * hooks->redraw wird nach chunks aufgerufen, damit der rufende das
+ * UI aktualisieren kann (send selbst drosselt auf SEND_REDRAW_MS;
  * das erste fragment zeichnet sofort). ein fehler wirft einen
  * leeren platzhalter weg, teil-antworten bleiben im verlauf und
  * bekommen die fehlermeldung hinterher.
  * rueckgabe: 0 wenn der stream durchlief, -1 sonst (fehlermeldung
  * steht als ERROR-nachricht im verlauf). */
 int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
-                void *redraw_ctx, void (*redraw)(void *redraw_ctx));
+                const SendHooks *hooks);
 
 #endif

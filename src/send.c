@@ -560,10 +560,11 @@ static void stream_on_error(long http_status, const char *message, void *ud)
 }
 
 int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
-                void *redraw_ctx, void (*redraw)(void *redraw_ctx))
+                const SendHooks *hooks)
 {
     (void)dbg; /* dbg_log: im release wegkompiliert */
-    if (state == NULL || cfg == NULL || redraw == NULL) {
+    if (state == NULL || cfg == NULL || hooks == NULL ||
+        hooks->redraw == NULL) {
         return -1;
     }
     Chat *chat = &state->chat;
@@ -618,8 +619,8 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
         StreamCtx sc = {
             .chat = chat,
             .dbg = dbg,
-            .redraw_ctx = redraw_ctx,
-            .redraw = redraw,
+            .redraw_ctx = hooks->ctx,
+            .redraw = hooks->redraw,
         };
         OaiStreamCallbacks cbs = {
             .on_chunk = stream_on_chunk,
@@ -708,6 +709,22 @@ int send_stream(AppState *state, const Config *cfg, DebugState *dbg,
         size_t calls_len = last->tool_calls_len;
         for (size_t i = 0; i < calls_len; i++) {
             ChatToolCall *call = &calls[i];
+
+            /* alles, was etwas veraendert, wird vorgelegt. lehnt der
+             * benutzer ab, bekommt das MODELL das als ergebnis: ohne
+             * antwort auf den call wuerde die api die naechste runde
+             * zurueckweisen, und das modell wuesste nicht, warum
+             * nichts passiert ist. */
+            if (hooks->confirm_tool != NULL && tool_needs_confirm(call->name) &&
+                !hooks->confirm_tool(call->name, call->arguments, hooks->ctx)) {
+                dbg_log(dbg, "tool: %s abgelehnt", call->name);
+                if (chat_append_tool(chat, call->id,
+                                     "error: vom benutzer abgelehnt") != 0) {
+                    die("out of memory");
+                }
+                continue;
+            }
+
             dbg_log(dbg, "tool: %s(%s)", call->name, call->arguments);
             char *result = tool_execute(call->name, call->arguments);
             if (result == NULL) {

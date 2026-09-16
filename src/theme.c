@@ -24,6 +24,34 @@ static Theme g_theme = {
     .reset = "\x1b[39m",
 };
 
+/* eingebaute rollen-defaults. sie halten sich an dieselbe regel wie
+ * die match-farbe: palette-indizes statt RGB, damit das terminal
+ * sein eigenes farbschema anwenden kann. ASSISTANT bleibt NULL –
+ * es folgt der match-farbe des themes (siehe theme_role). */
+static const char *const ROLE_DEFAULTS[THEME_ROLE_COUNT] = {
+    [THEME_ROLE_USER] = "\x1b[1m",   /* bold: die eigene stimme */
+    [THEME_ROLE_ASSISTANT] = NULL,   /* = theme->match */
+    [THEME_ROLE_ERROR] = "\x1b[31m", /* rot */
+    [THEME_ROLE_TOOL] = "\x1b[2m",   /* faint: maschinen-output */
+    [THEME_ROLE_SYSTEM] = "",        /* unauffaellig, ohne sequenz */
+    [THEME_ROLE_NOTICE] = "\x1b[2m", /* faint: meldung der app */
+    [THEME_ROLE_DIM] = "\x1b[2m",    /* faint: beiwerk */
+};
+
+const char *theme_role(ThemeRole role)
+{
+    if (role < 0 || role >= THEME_ROLE_COUNT) {
+        return "";
+    }
+    if (g_theme.roles[role] != NULL) {
+        return g_theme.roles[role]; /* das theme weicht ab */
+    }
+    if (role == THEME_ROLE_ASSISTANT) {
+        return g_theme.match; /* folgt der akzentfarbe */
+    }
+    return (ROLE_DEFAULTS[role] != NULL) ? ROLE_DEFAULTS[role] : "";
+}
+
 /* ------------------------------------------------------------------ */
 /* benannte themes: match-farbe als palette-index (0 = normal, 9x =   */
 /* bright). das terminal mappt den index auf sein farbschema – wer z.B. */
@@ -32,12 +60,26 @@ static Theme g_theme = {
 static const struct {
     const char *name;
     const char *match;
+    /* abweichende rollen; alles NULL = eingebaute defaults. die
+     * benannten themes stellen nur die fehler-farbe passend zu
+     * ihrer palette ein, den rest macht das terminal. */
+    const char *roles[THEME_ROLE_COUNT];
 } NAMED_THEMES[] = {
-    {"catppuccin", "\x1b[95m"},  /* bright magenta -> pink */
-    {"tokyo-night", "\x1b[94m"}, /* bright blue */
-    {"github-dark", "\x1b[92m"}, /* bright green */
-    {"dracula", "\x1b[35m"},     /* magenta -> purple */
-    {"gruvbox", "\x1b[93m"},     /* bright yellow */
+    {"catppuccin",
+     "\x1b[95m", /* bright magenta -> pink */
+     {[THEME_ROLE_ERROR] = "\x1b[91m"}},
+    {"tokyo-night",
+     "\x1b[94m", /* bright blue */
+     {[THEME_ROLE_ERROR] = "\x1b[91m"}},
+    {"github-dark",
+     "\x1b[92m", /* bright green */
+     {[THEME_ROLE_ERROR] = "\x1b[91m"}},
+    {"dracula",
+     "\x1b[35m", /* magenta -> purple */
+     {[THEME_ROLE_ERROR] = "\x1b[31m"}},
+    {"gruvbox",
+     "\x1b[93m", /* bright yellow */
+     {[THEME_ROLE_ERROR] = "\x1b[91m"}},
 };
 #define NAMED_THEME_COUNT ((int)(sizeof NAMED_THEMES / sizeof NAMED_THEMES[0]))
 
@@ -76,6 +118,8 @@ bool theme_select(const char *name)
             g_theme.name = NAMED_THEMES[i].name;
             g_theme.match = NAMED_THEMES[i].match;
             g_theme.reset = "\x1b[39m";
+            memcpy((void *)g_theme.roles, (const void *)NAMED_THEMES[i].roles,
+                   sizeof g_theme.roles);
             return true;
         }
     }
@@ -278,15 +322,20 @@ static int luminance(const unsigned rgb[3])
 
 static void pick_auto(void)
 {
+    /* "auto" setzt keine eigenen rollen: es leitet alles aus der
+     * terminal-helligkeit ab */
+    memset((void *)g_theme.roles, 0, sizeof g_theme.roles);
     if (!g_have_bg) {
         return; /* keine antwort: fallback-cyan bleibt */
     }
     if (luminance(g_bg) < 128) {
-        /* dunkles terminal: helle palette-farbe fuer kontrast */
-        g_theme.match = "\x1b[96m"; /* bright cyan */
+        /* dunkles terminal: helle palette-farben fuer kontrast */
+        g_theme.match = "\x1b[96m";                   /* bright cyan */
+        g_theme.roles[THEME_ROLE_ERROR] = "\x1b[91m"; /* bright red */
     } else {
-        /* helles terminal: dunkle palette-farbe */
-        g_theme.match = "\x1b[36m"; /* cyan */
+        /* helles terminal: dunkle palette-farben */
+        g_theme.match = "\x1b[36m";                   /* cyan */
+        g_theme.roles[THEME_ROLE_ERROR] = "\x1b[31m"; /* rot */
     }
 }
 

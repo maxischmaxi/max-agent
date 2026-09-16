@@ -586,6 +586,12 @@ static void handle_settings(AppState *state, Config *cfg, DebugState *dbg,
             state->dialog = (DialogState){0};
             state->dirty = true;
             break;
+        case SET_SYSTEM_PROMPT:
+            /* submenu: default / off / edit, frische suche */
+            state->prompt_sub = true;
+            state->dialog = (DialogState){0};
+            state->dirty = true;
+            break;
         case SET_CONFIRM_QUIT:
             /* boolean: enter schaltet nur um, dialog bleibt offen,
              * damit man den neuen wert direkt sieht */
@@ -646,6 +652,76 @@ static void handle_theme(AppState *state, Config *cfg, DebugState *dbg, Key k)
                 config_persist(cfg, dbg);
                 state->dirty = true; /* farben gelten sofort */
             }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* system-prompt-untermenue. "default" und "off" setzen die config
+ * direkt (der dialog bleibt offen, man sieht den neuen zustand
+ * sofort); "edit" schliesst den dialog und uebergibt an das
+ * eingabefeld, das den vollen zeilen-editor mitbringt. */
+static void handle_prompt(AppState *state, Config *cfg, DebugState *dbg, Key k)
+{
+    if (dialog_navigate(state, k)) {
+        state->dirty = true;
+        return;
+    }
+
+    switch (k.kind) {
+    case KEY_ESCAPE:
+        /* zurueck in die settings-liste, nicht dialog schliessen */
+        state->prompt_sub = false;
+        state->dialog = (DialogState){0};
+        state->confirm_quit = false;
+        state->dirty = true;
+        break;
+    case KEY_ENTER:
+    case KEY_NEWLINE: {
+        int hits[DIALOG_MATCH_MAX];
+        int n = names_match(PROMPT_OPT_NAMES, PROMPT_OPT_COUNT,
+                            state->dialog.search, hits, DIALOG_MATCH_MAX);
+        if (n == 0 || state->dialog.selected >= n) {
+            break; /* kein treffer: nichts zu tun */
+        }
+        switch ((PromptOpt)hits[state->dialog.selected]) {
+        case PROMPT_DEFAULT:
+            free(cfg->system_prompt);
+            cfg->system_prompt = NULL; /* eingebaute vorlage */
+            dbg_log(dbg, "system-prompt: default");
+            config_persist(cfg, dbg);
+            state->dirty = true;
+            break;
+        case PROMPT_OFF:
+            free(cfg->system_prompt);
+            cfg->system_prompt = dup_str(""); /* bewusst keiner */
+            if (cfg->system_prompt == NULL) {
+                die("out of memory");
+            }
+            dbg_log(dbg, "system-prompt: aus");
+            config_persist(cfg, dbg);
+            state->dirty = true;
+            break;
+        case PROMPT_EDIT:
+            /* dialog zu, eingabefeld auf. steht schon ein eigener
+             * text in der config, wird er zum bearbeiten vorgelegt;
+             * bei default/aus faengt man leer an. */
+            state->settings_dialog = false;
+            state->prompt_sub = false;
+            state->dialog = (DialogState){0};
+            state->prompt_edit = true;
+            input_set_text(&state->input, (cfg->system_prompt != NULL &&
+                                           cfg->system_prompt[0] != '\0')
+                                              ? cfg->system_prompt
+                                              : "");
+            state->cmd_active = false;
+            state->dirty = true;
+            break;
+        case PROMPT_OPT_COUNT:
+            break;
         }
         break;
     }
@@ -745,6 +821,55 @@ static void stream_redraw(void *ud)
     draw(rc->rows, rc->cols, rc->state, rc->dbg, rc->cfg);
 }
 
+/* rueckfrage vor einem tool. haelt den agent-loop an, zeichnet die
+ * frage in die zeile des thinking-indikators und wartet auf eine
+ * taste. der aufgerufene tool-call steht schon im verlauf darueber,
+ * man sieht also, worum es geht.
+ *
+ * [j]a fuehrt einmal aus, [n]ein lehnt ab, [a]lle schaltet die
+ * rueckfrage fuer den rest der sitzung ab. escape und ctrl+c
+ * gelten als nein – wer abbricht, will nichts ausfuehren. */
+static bool confirm_tool(const char *name, const char *arguments, void *ud)
+{
+    StreamRedrawCtx *rc = ud;
+    AppState *st = rc->state;
+    (void)arguments; /* steht schon als tool-call im verlauf */
+
+    if (st->tools_always) {
+        return true;
+    }
+
+    snprintf(st->tool_ask, sizeof st->tool_ask, "%s",
+             (name != NULL) ? name : "?");
+    bool allow = false;
+    for (;;) {
+        draw(rc->rows, rc->cols, st, rc->dbg, rc->cfg);
+        Key k = key_read();
+        if (k.kind == KEY_ESCAPE || k.kind == KEY_CTRL_C ||
+            k.kind == KEY_CTRL_Q) {
+            break; /* abbruch = nein */
+        }
+        if (k.kind != KEY_CHAR) {
+            continue; /* alles andere ignorieren, weiter fragen */
+        }
+        if (k.ch == 'j' || k.ch == 'y') {
+            allow = true;
+            break;
+        }
+        if (k.ch == 'a') {
+            st->tools_always = true;
+            allow = true;
+            break;
+        }
+        if (k.ch == 'n') {
+            break;
+        }
+    }
+    st->tool_ask[0] = '\0'; /* frage wieder weg */
+    st->dirty = true;
+    return allow;
+}
+
 static int cmd_list_height(const AppState *st)
 {
     if (!st->cmd_active) {
@@ -807,6 +932,25 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
         char word[64];
         char args[128];
         cmd_parse(state, word, sizeof word, args, sizeof args);
+
+        /* system-prompt bearbeiten: enter speichert und geht zurueck
+         * in den chat. der text landet NICHT in der history – das
+         * ist keine nachricht an das modell. leeres feld heisst
+         * hier "zurueck zur eingebauten vorlage", nicht "aus": wer
+         * den prompt abschalten will, nimmt die option "off". */
+        if (state->prompt_edit) {
+            char *text = chat_flatten_input(input);
+            free(cfg->system_prompt);
+            cfg->system_prompt = text; /* NULL = wieder default */
+            dbg_log(dbg, "system-prompt: %s",
+                    (text != NULL) ? "eigener text" : "default");
+            config_persist(cfg, dbg);
+            input_reset(input);
+            state->prompt_edit = false;
+            state->cmd_active = false;
+            state->dirty = true;
+            break;
+        }
 
         /* alles abgeschickte kommt in die history – auch befehle,
          * die will man genauso wiederholen. muss VOR der
@@ -880,7 +1024,12 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
                     .rows = rows,
                     .cols = cols,
                 };
-                (void)send_stream(state, cfg, dbg, &rc, stream_redraw);
+                SendHooks hooks = {
+                    .ctx = &rc,
+                    .redraw = stream_redraw,
+                    .confirm_tool = confirm_tool,
+                };
+                (void)send_stream(state, cfg, dbg, &hooks);
                 state->busy = false;
             }
             state->dirty = true;
@@ -899,6 +1048,7 @@ static void handle_all(AppState *state, Config *cfg, DebugState *dbg, int rows,
         state->dirty = true;
         break;
     case KEY_ESCAPE:
+        state->prompt_edit = false;     /* bearbeitung verworfen */
         history_reset(&state->history); /* entwurf ist hinfaellig */
         input_reset(input);
         state->cmd_active = input_in_cmd(input);
@@ -1093,6 +1243,8 @@ void handle_key(AppState *state, Config *cfg, DebugState *dbg, int rows,
         handle_settings(state, cfg, dbg, k);
     } else if (ui_mode(state) == MODE_THEME) {
         handle_theme(state, cfg, dbg, k);
+    } else if (ui_mode(state) == MODE_PROMPT) {
+        handle_prompt(state, cfg, dbg, k);
     } else if (ui_mode(state) == MODE_MODELS) {
         handle_models(state, cfg, dbg, k);
     } else {

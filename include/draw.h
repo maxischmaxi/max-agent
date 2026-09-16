@@ -20,13 +20,31 @@ typedef struct {
      * und ist nur bis zum naechsten layout_compute gueltig. */
     ChatLine *chat_lines;
     size_t chat_lines_len;
-    int chat_h;     /* sichtbare zeilen des verlaufs */
+    int chat_h;     /* zeilen, die dem verlauf insgesamt gehoeren */
+    int chat_top;   /* erste zeile mit verlaufs-inhalt (1 oder 2:  */
+                    /* der "weiter oben"-hinweis belegt zeile 1)   */
     int chat_first; /* index der ersten sichtbaren zeile */
     int busy_row;   /* zeile des thinking-indikators, 0 = keiner */
+    /* offene tool-rueckfrage (kopie aus dem state, weil layout_slot
+     * nur das layout sieht). "" = keine frage, dann zeigt busy_row
+     * den thinking-indikator. */
+    char tool_ask[64];
+
+    /* scroll-hinweise: wieviele render-zeilen ausserhalb des
+     * viewports liegen, und in welcher zeile der hinweis steht
+     * (0 = kein hinweis). sie kosten je eine viewport-zeile und
+     * erscheinen nur, wenn dafuer platz bleibt. */
+    int more_above;
+    int more_below;
+    int more_above_row;
+    int more_below_row;
 
     /* befehlsliste direkt unter dem eingabefeld */
     int cmd_top;
     int cmd_h;
+    /* statt der befehlsliste steht dort der hinweis, dass das
+     * eingabefeld gerade den system-prompt bearbeitet */
+    bool prompt_hint;
 
     int quit_row; /* 0 = keine quit-meldung anzeigen */
 
@@ -60,13 +78,18 @@ typedef enum {
     SLOT_MSG_ERROR,     /* chat-verlauf: fehler-meldung */
     SLOT_MSG_TOOL,      /* chat-verlauf: tool-ergebnis */
     SLOT_MSG_SYSTEM,    /* chat-verlauf: system-meldung */
+    SLOT_MORE_ABOVE,    /* hinweis: verlauf geht oberhalb weiter */
+    SLOT_MORE_BELOW,    /* hinweis: verlauf geht unterhalb weiter */
     SLOT_BUSY,          /* thinking-indikator waehrend einer anfrage */
+    SLOT_TOOL_ASK,      /* rueckfrage, ob ein tool laufen darf */
     SLOT_DLG_BORDER,    /* trenn-linie ueber dem dialog */
     SLOT_DLG_SEARCH,    /* such-zeile mit cursor */
     SLOT_DLG_EMPTY,     /* hinweis: kein eintrag passt */
     SLOT_MODEL,         /* eintrag der modell-liste */
     SLOT_SETTING,       /* eintrag der settings-liste */
     SLOT_THEME,         /* eintrag der theme-auswahl */
+    SLOT_PROMPT_OPT,    /* eintrag der system-prompt-auswahl */
+    SLOT_PROMPT_HINT,   /* hinweis: eingabefeld bearbeitet den prompt */
     SLOT_QUIT,          /* quit-bestaetigung */
 } SlotKind;
 

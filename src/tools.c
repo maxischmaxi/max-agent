@@ -75,6 +75,20 @@ const OaiTool *tool_registry(size_t *len)
     return TOOLS;
 }
 
+bool tool_needs_confirm(const char *name)
+{
+    if (name == NULL) {
+        return true;
+    }
+    /* read_file kann nur lesen – dafuer den benutzer zu fragen,
+     * wuerde die rueckfrage entwerten. alles andere veraendert den
+     * rechner und wird vorgelegt. */
+    if (strcmp(name, "read_file") == 0) {
+        return false;
+    }
+    return true;
+}
+
 const OaiTool *tool_find(const char *name)
 {
     if (name == NULL) {
