@@ -3,6 +3,7 @@
 /* session-tests. damit nichts die echte config des benutzers
  * anfasst, zeigt HOME fuer die laufzeit des tests auf ein
  * temporaeres verzeichnis. */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,8 +162,7 @@ static void test_transcript_replay(void)
     /* "crash + neustart": session schliessen und wieder oeffnen.
      * dabei wird die abgerissene zeile mit einem newline abge-
      * schlossen (heal_torn_log), der naechste append verschmilzt
-     * nicht mit ihr, und replay ueberspringt sie als kaputtes
-     * json. */
+     * nicht mit ihr, und replay ueberspringt sie als kaputtes json. */
     session_end(&s);
     CHECK(session_open(&s, id) == 0);
     CHECK(session_log_user(&s, "nochmal") == 0);
@@ -218,13 +218,220 @@ static void test_noop_without_session(void)
     session_free(&s);
 }
 
+/* ------------------------------------------------------------------ */
+/* ordner-bindung: sessionen gehoeren zum verzeichnis, in dem sie    */
+/* gestartet wurden. der resume-dialog zeigt nur die eigenen.        */
+/* ------------------------------------------------------------------ */
+
+/* in ein verzeichnis wechseln (chdir) – rueckgabepuffer gehoert dem
+ * aufrufer, damit der test zurueckwechseln kann */
+static char *enter_dir(const char *dir)
+{
+    char *old = getcwd(NULL, 0);
+    if (chdir(dir) != 0) {
+        free(old);
+        return NULL;
+    }
+    return old;
+}
+
+static void test_cwd_binding(void)
+{
+    test_fresh_home();
+
+    /* ordner A und B im wegwerf-home */
+    char dir_a[4096];
+    char dir_b[4096];
+    (void)snprintf(dir_a, sizeof dir_a, "%s/a", g_home);
+    (void)snprintf(dir_b, sizeof dir_b, "%s/b", g_home);
+    CHECK(mkdir(dir_a, 0755) == 0);
+    CHECK(mkdir(dir_b, 0755) == 0);
+
+    Config cfg = {0};
+    char ids[2][SESSION_ID_MAX];
+
+    /* eine session in A anfangen */
+    char *old = enter_dir(dir_a);
+    CHECK(old != NULL);
+    if (old == NULL) {
+        return;
+    }
+    {
+        Session s = {0};
+        CHECK(session_start(&s, &cfg) == 0);
+        CHECK(session_log_user(&s, "frage aus ordner a") == 0);
+        (void)snprintf(ids[0], SESSION_ID_MAX, "%s", s.id);
+        session_end(&s);
+        CHECK(s.cwd == NULL); /* end gibt die felder frei */
+    }
+    CHECK(chdir(old) == 0);
+
+    /* eine session in B anfangen */
+    CHECK(chdir(dir_b) == 0);
+    {
+        Session s = {0};
+        CHECK(session_start(&s, &cfg) == 0);
+        CHECK(session_log_user(&s, "frage aus ordner b") == 0);
+        (void)snprintf(ids[1], SESSION_ID_MAX, "%s", s.id);
+        session_end(&s);
+    }
+    CHECK(chdir(old) == 0);
+    free(old);
+
+    /* liste in A: nur session A */
+    CHECK(chdir(dir_a) == 0);
+    SessionList list = {0};
+    CHECK(session_list_load(&list, NULL) == 0);
+    CHECK(list.len == 1);
+    if (list.len == 1) {
+        CHECK(strcmp(list.items[0].id, ids[0]) == 0);
+        CHECK(list.items[0].preview != NULL);
+        if (list.items[0].preview != NULL) {
+            CHECK(strcmp(list.items[0].preview, "frage aus ordner a") == 0);
+        }
+    }
+    session_list_free(&list);
+
+    /* liste in B: nur session B */
+    CHECK(chdir(dir_b) == 0);
+    CHECK(session_list_load(&list, NULL) == 0);
+    CHECK(list.len == 1);
+    if (list.len == 1) {
+        CHECK(strcmp(list.items[0].id, ids[1]) == 0);
+    }
+    session_list_free(&list);
+
+    /* expliziter filter statt chdir: dasselbe ergebnis */
+    CHECK(chdir("/") == 0);
+    CHECK(session_list_load(&list, dir_a) == 0);
+    CHECK(list.len == 1);
+    if (list.len == 1) {
+        CHECK(strcmp(list.items[0].id, ids[0]) == 0);
+    }
+    session_list_free(&list);
+    CHECK(session_list_load(&list, dir_b) == 0);
+    CHECK(list.len == 1);
+    session_list_free(&list);
+
+    /* ein pfad, in dem nie eine session lief: leere liste, kein
+     * fehler */
+    CHECK(session_list_load(&list, "/gibts/hoffentlich/nicht") == 0);
+    CHECK(list.len == 0);
+    session_list_free(&list);
+
+    /* resume einer session aus A bleibt moeglich, egal wo man
+     * gerade ist: das oeffnen selbst kennt keinen filter (nur die
+     * liste). die session behaelt ihr cwd. */
+    Session s = {0};
+    CHECK(session_open(&s, ids[0]) == 0);
+    CHECK(s.cwd != NULL);
+    if (s.cwd != NULL) {
+        CHECK(strcmp(s.cwd, dir_a) == 0);
+    }
+    session_free(&s);
+}
+
+/* ------------------------------------------------------------------ */
+/* migration: version-1-metas (ohne "cwd") bekommen beim app-start    */
+/* das aktuelle arbeitsverzeichnis.                                   */
+/* ------------------------------------------------------------------ */
+
+static void test_migration(void)
+{
+    test_fresh_home();
+
+    /* ein version-1-meta von hand bauen: so sahen die dateien vor
+     * der ordner-bindung aus */
+    char path[4096];
+    (void)snprintf(path, sizeof path, "%s/.config/.maxagent/sessions", g_home);
+    CHECK(mkdir_p(path, 0755) == 0);
+    (void)snprintf(path, sizeof path,
+                   "%s/.config/.maxagent/sessions/s-1a2b3c4d5e-000001.json",
+                   g_home);
+    const char *meta1 = "{\"id\":\"s-1a2b3c4d5e-000001\",\"name\":null,"
+                        "\"created_at\":1,\"updated_at\":2,\"worked_ms\":0,"
+                        "\"messages\":0,\"model\":null,\"base_url\":null,"
+                        "\"system_prompt\":null,\"version\":\"1\"}";
+    CHECK(write_file(path, meta1, strlen(meta1)) == 0);
+
+    /* ein zweites, schon migratiertes meta: darf nicht angefasst
+     * werden */
+    char path2[4096];
+    (void)snprintf(path2, sizeof path2,
+                   "%s/.config/.maxagent/sessions/s-1a2b3c4d5e-000002.json",
+                   g_home);
+    const char *meta2 = "{\"id\":\"s-1a2b3c4d5e-000002\",\"name\":\"fertig\","
+                        "\"cwd\":\"/alt\",\"created_at\":1,\"updated_at\":2,"
+                        "\"messages\":0,\"model\":null,\"base_url\":null,"
+                        "\"system_prompt\":null,\"version\":\"2\"}";
+    CHECK(write_file(path2, meta2, strlen(meta2)) == 0);
+
+    /* migration im arbeitsverzeichnis laufen lassen */
+    char cwd[4096];
+    CHECK(getcwd(cwd, sizeof cwd) != NULL);
+    CHECK(sessions_migrate_legacy() == 0);
+
+    /* das erste meta hat jetzt cwd + version 2 */
+    cJSON *meta = parse_json_file(path);
+    CHECK(meta != NULL);
+    if (meta != NULL) {
+        const cJSON *jcwd = cJSON_GetObjectItemCaseSensitive(meta, "cwd");
+        CHECK(cJSON_IsString(jcwd));
+        if (cJSON_IsString(jcwd)) {
+            CHECK(strcmp(jcwd->valuestring, cwd) == 0);
+        }
+        const cJSON *jver = cJSON_GetObjectItemCaseSensitive(meta, "version");
+        CHECK(cJSON_IsString(jver));
+        if (cJSON_IsString(jver)) {
+            CHECK(strcmp(jver->valuestring, SESSION_VERSION) == 0);
+        }
+        cJSON_Delete(meta);
+    }
+
+    /* das zweite bleibt auf /alt – die migration ist idempotent
+     * und ueberschreibt keine echte ordner-bindung */
+    meta = parse_json_file(path2);
+    CHECK(meta != NULL);
+    if (meta != NULL) {
+        const cJSON *jcwd = cJSON_GetObjectItemCaseSensitive(meta, "cwd");
+        CHECK(cJSON_IsString(jcwd));
+        if (cJSON_IsString(jcwd)) {
+            CHECK(strcmp(jcwd->valuestring, "/alt") == 0);
+        }
+        cJSON_Delete(meta);
+    }
+
+    /* nochmal laufen lassen: aendert nichts (idempotenz) */
+    CHECK(sessions_migrate_legacy() == 0);
+    meta = parse_json_file(path);
+    CHECK(meta != NULL);
+    if (meta != NULL) {
+        const cJSON *jcwd = cJSON_GetObjectItemCaseSensitive(meta, "cwd");
+        CHECK(cJSON_IsString(jcwd));
+        if (cJSON_IsString(jcwd)) {
+            CHECK(strcmp(jcwd->valuestring, cwd) == 0);
+        }
+        cJSON_Delete(meta);
+    }
+
+    /* die migratierte session erscheint jetzt in der liste des
+     * ordners, das andere nicht */
+    SessionList list = {0};
+    CHECK(session_list_load(&list, NULL) == 0);
+    CHECK(list.len == 1);
+    if (list.len == 1) {
+        CHECK(strcmp(list.items[0].id, "s-1a2b3c4d5e-000001") == 0);
+    }
+    session_list_free(&list);
+}
+
 static void test_list_and_match(void)
 {
     /* eigenes home: fruehere tests haben hier schon sessionen
      * angelegt, die zaehlen fuer die listen-pruefung nicht mit */
     test_fresh_home();
 
-    /* drei sessionen, die mittlere benannt */
+    /* drei sessionen im aktuellen ordner, die mittlere benannt */
     Session s = {0};
     Config cfg = {0};
 
@@ -250,7 +457,7 @@ static void test_list_and_match(void)
     session_end(&s);
 
     SessionList list = {0};
-    CHECK(session_list_load(&list) == 0);
+    CHECK(session_list_load(&list, NULL) == 0);
     CHECK(list.len == 3);
 
     /* jede session ist in der liste, egal in welcher reihenfolge */
@@ -352,6 +559,8 @@ int main(void)
     test_transcript_replay();
     test_rename();
     test_noop_without_session();
+    test_cwd_binding();
+    test_migration();
     test_list_and_match();
     test_unique_ids();
 

@@ -16,6 +16,7 @@
 #include "config.h"
 #include "debug.h"
 #include "draw.h"
+#include "history.h"
 #include "input.h"
 #include "keys.h"
 #include "session.h"
@@ -138,8 +139,16 @@ int main(int argc, char **argv)
     }
 
     /* sessions-verzeichnis frueh anlegen, damit /resume und das
-     * anlegen der ersten session nichts mehr anlegen muessen */
+     * anlegen der ersten session nichts mehr anlegen muessen.
+     * danach einmal die alten bestaende nachziehen: metas ohne
+     * "cwd" (format version 1) bekommen das aktuelle arbeits-
+     * verzeichnis – nur so erscheinen sie im resume-dialog. */
     (void)session_dir_ensure();
+    (void)sessions_migrate_legacy();
+
+    /* nachrichten-history laden: global (nicht an sessionen oder
+     * ordner gebunden), eine datei pro benutzer */
+    history_load(&state.history);
 
     draw(rows, cols, &state, &cfg);
 

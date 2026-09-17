@@ -4,6 +4,8 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +26,21 @@
 static char *sessions_dir(void)
 {
     return append_to_home(".config/.maxagent/sessions");
+}
+
+/* aktuelles arbeitsverzeichnis als heap-string. NULL = getcwd
+ * scheiterte (geloeschtes verzeichnis, keine rechte): die session
+ * laeuft dann ohne ordner-bindung und taucht in keinem resume-
+ * dialog auf. der puffer ist PATH_MAX, nicht dynamisch – laengere
+ * pfade gibt es praktisch nicht, und realloc-schleifen um ein
+ * getcwd herum lohnen den aufwand nicht. */
+static char *cwd_current(void)
+{
+    char buf[PATH_MAX];
+    if (getcwd(buf, sizeof buf) == NULL) {
+        return NULL;
+    }
+    return dup_str(buf);
 }
 
 static char *meta_path(const char *id)
@@ -119,6 +136,8 @@ static void session_reset_fields(Session *s)
     s->base_url = NULL;
     free(s->system_prompt);
     s->system_prompt = NULL;
+    free(s->cwd);
+    s->cwd = NULL;
     s->id[0] = '\0';
     s->created_at = 0;
     s->updated_at = 0;
@@ -193,6 +212,11 @@ static int meta_write(const Session *s)
     } else {
         cJSON_AddNullToObject(o, "system_prompt");
     }
+    if (s->cwd != NULL) {
+        cJSON_AddStringToObject(o, "cwd", s->cwd);
+    } else {
+        cJSON_AddNullToObject(o, "cwd");
+    }
     cJSON_AddStringToObject(o, "version", SESSION_VERSION);
 
     char *json = cJSON_PrintUnformatted(o);
@@ -208,6 +232,92 @@ static int meta_write(const Session *s)
         free(path);
     }
     cJSON_free(json);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* migration                                                           */
+/* ------------------------------------------------------------------ */
+
+/* version-1-metas kennen kein "cwd"-feld: sie stammen aus der zeit,
+ * als sessionen global sichtbar waren. beim app-start einmal dr-
+ * ueberlaufen und jedem das aktuelle arbeitsverzeichnis ein-
+ * schreiben (version 2). idempotent: ein meta mit "cwd" bleibt
+ * unberuehrt, ein unlesbares meta blockiert die restlichen nicht. */
+int sessions_migrate_legacy(void)
+{
+    if (session_dir_ensure() != 0) {
+        return -1;
+    }
+    char *dir_path = sessions_dir();
+    if (dir_path == NULL) {
+        return -1;
+    }
+    DIR *d = opendir(dir_path);
+    if (d == NULL) {
+        free(dir_path);
+        return -1;
+    }
+
+    char *cwd = cwd_current();
+    struct dirent *e;
+    int rc = 0;
+    while ((e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+        /* nur meta-dateien: ".json" am ende – ".jsonl" endet auf
+         * 'l' und faellt dadurch raus */
+        if (len < strlen(".json") + 1 ||
+            strcmp(e->d_name + len - strlen(".json"), ".json") != 0) {
+            continue;
+        }
+        char *path = malloc(strlen(dir_path) + 1 + len + 1);
+        if (path == NULL) {
+            rc = -1;
+            break;
+        }
+        (void)snprintf(path, strlen(dir_path) + 1 + len + 1, "%s/%s", dir_path,
+                       e->d_name);
+        cJSON *meta = parse_json_file(path);
+        if (meta == NULL) {
+            free(path);
+            continue; /* kaputtes meta: migration der anderen weiter */
+        }
+        /* fehlt "cwd" oder ist es null/leer, bekommt das meta das
+         * aktuelle arbeitsverzeichnis und version 2. ein meta mit
+         * echtem cwd bleibt komplett unberuehrt. */
+        const cJSON *jcwd = cJSON_GetObjectItemCaseSensitive(meta, "cwd");
+        bool needs_cwd = !cJSON_IsString(jcwd) || jcwd->valuestring[0] == '\0';
+        if (needs_cwd && cwd != NULL) {
+            cJSON *item = cJSON_CreateString(cwd);
+            if (item == NULL) {
+                rc = -1; /* OOM: abbrechen, nichts verloren */
+                cJSON_Delete(meta);
+                free(path);
+                break;
+            }
+            if (!cJSON_ReplaceItemInObjectCaseSensitive(meta, "cwd", item)) {
+                /* feld fehlte: neu anlegen (AddItem uebernimmt item) */
+                cJSON_AddItemToObject(meta, "cwd", item);
+            }
+            cJSON_ReplaceItemInObjectCaseSensitive(
+                meta, "version", cJSON_CreateString(SESSION_VERSION));
+            char *json = cJSON_PrintUnformatted(meta);
+            if (json == NULL) {
+                rc = -1;
+            } else if (write_file(path, json, strlen(json)) != 0) {
+                rc = -1;
+            }
+            cJSON_free(json);
+        }
+        cJSON_Delete(meta);
+        free(path);
+        if (rc != 0) {
+            break;
+        }
+    }
+    (void)closedir(d);
+    free(dir_path);
+    free(cwd);
     return rc;
 }
 
@@ -293,6 +403,7 @@ int session_start(Session *s, const Config *cfg)
             s->system_prompt = dup_str(cfg->system_prompt);
         }
     }
+    s->cwd = cwd_current();
 
     char *lp = log_path(s->id);
     if (lp == NULL) {
@@ -352,6 +463,10 @@ static int meta_read(Session *s, cJSON *meta)
         cJSON_GetObjectItemCaseSensitive(meta, "system_prompt");
     if (cJSON_IsString(jprompt)) {
         s->system_prompt = dup_str(jprompt->valuestring);
+    }
+    const cJSON *jcwd = cJSON_GetObjectItemCaseSensitive(meta, "cwd");
+    if (cJSON_IsString(jcwd)) {
+        s->cwd = dup_str(jcwd->valuestring);
     }
     const cJSON *jcreated =
         cJSON_GetObjectItemCaseSensitive(meta, "created_at");
@@ -935,19 +1050,28 @@ static int info_cmp(const void *a, const void *b)
     return strcmp(y->id, x->id);
 }
 
-int session_list_load(SessionList *out)
+int session_list_load(SessionList *out, const char *dir_filter)
 {
     memset(out, 0, sizeof *out);
     if (session_dir_ensure() != 0) {
         return -1;
     }
+    /* NULL = aktuelles verzeichnis; ein leerer filter wuerde nichts
+     * treffen und ist kein sinnvoller zustand */
+    char *want = (dir_filter != NULL) ? dup_str(dir_filter) : cwd_current();
+    if (want == NULL || want[0] == '\0') {
+        free(want);
+        return -1;
+    }
     char *dir = sessions_dir();
     if (dir == NULL) {
+        free(want);
         return -1;
     }
     DIR *d = opendir(dir);
     if (d == NULL) {
         free(dir);
+        free(want);
         return -1;
     }
 
@@ -971,7 +1095,14 @@ int session_list_load(SessionList *out)
         cJSON *meta = parse_json_file(path);
         free(path);
         if (meta != NULL) {
-            if (list_add_meta(out, meta) != 0) {
+            /* ordner-filter: nur metas, deren cwd dem geforderten
+             * verzeichnis entspricht. sessionen ohne cwd (legacy,
+             * noch nicht migratiert) tauchen nicht auf – die
+             * migration beim app-start holt sie nach. */
+            const cJSON *jcwd = cJSON_GetObjectItemCaseSensitive(meta, "cwd");
+            bool in_dir =
+                (cJSON_IsString(jcwd) && strcmp(jcwd->valuestring, want) == 0);
+            if (in_dir && list_add_meta(out, meta) != 0) {
                 rc = -1;
             }
             cJSON_Delete(meta);
@@ -979,6 +1110,7 @@ int session_list_load(SessionList *out)
     }
     (void)closedir(d);
     free(dir);
+    free(want);
 
     if (out->len > 1) {
         qsort(out->items, out->len, sizeof *out->items, info_cmp);

@@ -14,8 +14,15 @@
 /*                                                                    */
 /* format: pro session zwei dateien in                                */
 /*   ~/.config/.maxagent/sessions/                                     */
-/*     <id>.json  – meta (id, name, zeiten, snapshots)                */
+/*     <id>.json  – meta (id, name, zeiten, snapshots, cwd)           */
 /*     <id>.jsonl – transcript, EINE zeile pro ereignis (append-only) */
+/*                                                                    */
+/* jede session gehoert zu dem verzeichnis, in dem sie gestartet      */
+/* wurde (meta-feld "cwd"): der resume-dialog zeigt nur die           */
+/* sessionen des ordners, in dem die app laeuft – wer in einem        */
+/* projekt arbeitet, sieht nur dessen unterhaltungen. metas ohne      */
+/* "cwd" (format version 1) bekommen beim app-start das aktuelle      */
+/* arbeitsverzeichnis zugewiesen (sessions_migrate_legacy).           */
 /*                                                                    */
 /* JSONL statt einer grossen datei oder sqlite: append ist ein   */
 /* einziger fwrite (O(1), nicht O(dateigroesse)), keine externe    */
@@ -25,10 +32,10 @@
 /* scannt nur die kleinen meta-dateien.                            */
 /* ------------------------------------------------------------------ */
 
-/* versions-stempel im meta-file: wenn sich das format je aendert,
- * steht im alten format eine andere zahl und migrationscode kann
- * darauf reagieren. */
-#define SESSION_VERSION "1"
+/* versions-stempel im meta-file: version 1 kannte kein "cwd",
+ * version 2 schreibt es und migratiert alte bestände nach
+ * (sessions_migrate_legacy). */
+#define SESSION_VERSION "2"
 
 /* "s-" + hex(unix-ms) + "-" + 6 hex-zufall + '\0' */
 #define SESSION_ID_MAX 24
@@ -47,6 +54,9 @@ typedef struct {
     char *model;          /* snapshot des modells bei session_start */
     char *base_url;       /* dito provider-url */
     char *system_prompt;  /* NULL = default, "" = aus, text = eigener */
+    char *cwd;            /* verzeichnis, in dem die session gestartet */
+                          /* wurde. bestimmt, wo der resume-dialog    */
+                          /* sie anzeigt. NULL = legacy ohne cwd.     */
     FILE *log;            /* <id>.jsonl, offen solange active */
 } Session;
 
@@ -71,8 +81,16 @@ typedef struct {
  * nochmal. */
 int session_dir_ensure(void);
 
+/* migration alter bestände: metas im sessions-verzeichnis ohne
+ * "cwd"-feld bekommen das aktuelle arbeitsverzeichnis als ordner
+ * und version "2". idempotent (dateien mit cwd bleiben unberührt)
+ * und best effort – ein kaputtes meta bricht die migration der
+ * anderen nicht ab. rueckgabe 0 = alle gelesen und ggf. migrant. */
+int sessions_migrate_legacy(void);
+
 /* neue session: id generieren, meta schreiben, log oeffnen. die
- * snapshots (model, base_url, system_prompt) stammen aus cfg. */
+ * snapshots (model, base_url, system_prompt) stammen aus cfg, das
+ * cwd aus dem aktuellen arbeitsverzeichnis. */
 int session_start(Session *s, const Config *cfg);
 
 /* bestehende session anhaengend oeffnen (resume). meta wird gelesen,
@@ -135,9 +153,11 @@ int session_log_notice(Session *s, const char *text);
 /* session-liste fuer den resume-dialog                               */
 /* ------------------------------------------------------------------ */
 
-/* alle sessionen einlesen (nach updated_at absteigend). 0 auch bei
- * leerem verzeichnis; -1 nur bei harten fehlern (dann ist out leer). */
-int session_list_load(SessionList *out);
+/* die sessionen EINES verzeichnisses einlesen (nach updated_at
+ * absteigend): nur metas, deren "cwd" mit dir uebereinstimmt.
+ * dir == NULL = aktuelles arbeitsverzeichnis. 0 auch bei leerer
+ * liste; -1 nur bei harten fehlern (dann ist out leer). */
+int session_list_load(SessionList *out, const char *dir);
 void session_list_free(SessionList *l);
 
 /* prefix-match auf name, id und preview – dieselbe semantik wie

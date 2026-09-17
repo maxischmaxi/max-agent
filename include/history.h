@@ -5,17 +5,28 @@
 
 /* ------------------------------------------------------------------ */
 /* history: die zuletzt abgeschickten eingaben, zum zurueckholen mit  */
-/* pfeil-hoch (wie in einer shell). gilt fuer die laufende sitzung –  */
-/* nichts wird auf platte geschrieben.                                */
+/* pfeil-hoch (wie in einer shell).                                    */
+/*                                                                    */
+/* sie ist GLOBAL und PERSISTENT: nicht an eine session oder einen    */
+/* ordner gebunden, sondern eine datei pro benutzer –                  */
+/*   ~/.config/.maxagent/history                                       */
+/* mit EINER eingabe pro zeile. beim app-start wird sie geladen,      */
+/* bei jedem abgeschickten text erweitert und geschrieben.             */
 /*                                                                    */
 /* das blaettern merkt sich den text, der beim ersten pfeil-hoch im   */
 /* feld stand: wer sich verirrt, kommt mit pfeil-runter zu seinem     */
-/* entwurf zurueck.                                                   */
+/* entwurf zurueck.                                                    */
 /* ------------------------------------------------------------------ */
 
-/* mehr eintraege braucht in einer sitzung niemand, und der ring
- * bleibt damit ueberschaubar (kein wachsendes array) */
+/* mehr eintraege wird auf platte gehalten; im speicher bleibt der
+ * ring bei HISTORY_MAX, der aelteste faellt raus (kein wachsendes
+ * array). */
 #define HISTORY_MAX 64
+
+/* zeilen mit NUL oder newline landen nicht im file – multi-  */
+/* zeilen-eingaben werden mit "\\n" (backslash-n) statt echtem umbruch  */
+/* kodiert, beim laden zurueckgewandelt. */
+#define HISTORY_LINE_MAX 4096
 
 typedef struct {
     char *entries[HISTORY_MAX]; /* [0] aeltester ... [len-1] juengster */
@@ -26,10 +37,19 @@ typedef struct {
     char *draft; /* eingabe vor dem ersten pfeil-hoch, NULL = leer */
 } History;
 
-/* eine abgeschickte eingabe aufnehmen. leere eingaben und direkte
- * wiederholungen des juengsten eintrags werden ignoriert (sonst
- * steht dieselbe zeile mehrfach im weg). ist der ring voll, faellt
- * der aelteste eintrag raus. beendet ein laufendes blaettern. */
+/* die persistente datei einlesen (app-start). ohne datei startet
+ * die history leer. fehler beim lesen (kaputte zeile, io) sind
+ * nicht fatal: die datei gilt als bis dahin gelesen. */
+void history_load(History *h);
+
+/* eine abgeschickte eingabe aufnehmen und die datei schreiben
+ * (append: eine zeile). leere eingaben und direkte wiederholungen
+ * des juengsten eintrags werden ignoriert (sonst steht dieselbe
+ * zeile mehrfach im weg). ist der ring voll, faellt der aelteste
+ * eintrag raus (aus dem speicher – auf platte bleibt er, bis der
+ * ueberhang beim schreiben abgebaut ist). beendet ein laufendes
+ * blaettern. schreibfehler sind nicht fatal: die eingabe ist weg,
+ * die app laeuft weiter. */
 void history_add(History *h, const char *text);
 
 /* einen eintrag zurueck (aelter). `current` ist der gerade getippte

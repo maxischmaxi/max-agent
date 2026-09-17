@@ -1413,6 +1413,16 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
         state->dirty = true;
         break;
     case KEY_UP:
+        /* history-blaettern NUR im normalen chat-input. das system-
+         * prompt-feld ist ein anderer modus (prompt_edit): dort
+         * sind pfeile nur cursorbewegung, die nachrichten-history
+         * hat dort nichts verloren. (dialoge kommen gar nicht erst
+         * hierher – handle_key leitet sie an dialog_navigate.) */
+        if (state->prompt_edit) {
+            (void)input_screen_up(input, input_field_width(c));
+            state->dirty = true;
+            break;
+        }
         /* in einer mehrzeiligen eingabe erst die zeile wechseln;
          * erst an der obersten zeile geht es in die history. genau
          * so verhalten sich zsh und fish.
@@ -1428,6 +1438,11 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
         history_back(state, input);
         break;
     case KEY_DOWN:
+        if (state->prompt_edit) {
+            (void)input_screen_down(input, input_field_width(c));
+            state->dirty = true;
+            break;
+        }
         if (input_screen_down(input, input_field_width(c))) {
             state->dirty = true;
             break;
@@ -1436,10 +1451,16 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
         break;
     case KEY_CTRL_P:
         /* readline: ctrl+p/n sind immer history, auch mitten in
-         * einer mehrzeiligen eingabe */
+         * einer mehrzeiligen eingabe – aber nie im prompt-feld */
+        if (state->prompt_edit) {
+            break;
+        }
         history_back(state, input);
         break;
     case KEY_CTRL_N:
+        if (state->prompt_edit) {
+            break;
+        }
         history_forward(state, input);
         break;
     case KEY_NONE:

@@ -1,11 +1,43 @@
+#define _POSIX_C_SOURCE 200809L // NOLINT(bugprone-reserved-identifier)
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "history.h"
 #include "test.h"
+#include "utils.h"
+
+/* ------------------------------------------------------------------ */
+/* persistenz braucht ein wegwerf-HOME, sonst wuerde der test die    */
+/* echte history des benutzers anfassen                                */
+/* ------------------------------------------------------------------ */
+static char g_home[512];
+
+static void fresh_home(void)
+{
+    char tmpl[] = "/tmp/maxagent-history-XXXXXX";
+    if (mkdtemp(tmpl) == NULL) {
+        fprintf(stderr, "mkdtemp failed\n");
+        exit(1);
+    }
+    (void)snprintf(g_home, sizeof g_home, "%s", tmpl);
+    (void)setenv("HOME", g_home, 1);
+}
+
+static void history_file_write(const char *content)
+{
+    char dir[512];
+    (void)snprintf(dir, sizeof dir, "%s/.config/.maxagent", g_home);
+    CHECK(mkdir_p(dir, 0755) == 0);
+    char path[600];
+    (void)snprintf(path, sizeof path, "%s/.config/.maxagent/history", g_home);
+    CHECK(write_file(path, content, strlen(content)) == 0);
+}
 
 static void test_add(void)
 {
+    fresh_home();
     History h = {0};
 
     /* leeres und NULL werden nicht aufgenommen */
@@ -146,6 +178,115 @@ static void test_multiline(void)
     history_free(&h);
 }
 
+/* ------------------------------------------------------------------ */
+/* persistenz: file schreiben beim add, file lesen beim load          */
+/* ------------------------------------------------------------------ */
+
+static void test_persist_roundtrip(void)
+{
+    fresh_home();
+    History h = {0};
+    history_load(&h); /* file fehlt noch: leer */
+    CHECK(h.len == 0);
+
+    history_add(&h, "erste frage");
+    history_add(&h, "zweite\nueber mehrere zeilen");
+    history_add(&h, "erste frage"); /* keine DIREKTE wiederholung (s. u.) */
+    history_add(&h, "erste frage"); /* direkte wiederholung: verworfen */
+
+    /* eine "neue app": frisches objekt, file laden. "erste frage"
+     * in der mitte ist keine direkte wiederholung des juengsten
+     * ("zweite...") und bleibt deshalb stehen (shell-semantik);
+     * die vierte eingabe DIREKT auf dem juengsten faellt weg. */
+    History h2 = {0};
+    history_load(&h2);
+    CHECK(h2.len == 3);
+    CHECK(strcmp(h2.entries[0], "erste frage") == 0);
+    CHECK(strcmp(h2.entries[1], "zweite\nueber mehrere zeilen") == 0);
+    CHECK(strcmp(h2.entries[2], "erste frage") == 0);
+
+    /* das file traegt drei zeilen, die \n der mehrzeiligen
+     * eingabe ist kodiert */
+    char path[600];
+    (void)snprintf(path, sizeof path, "%s/.config/.maxagent/history", g_home);
+    char *buf = NULL;
+    size_t size = 0;
+    CHECK(read_file(path, &buf, &size) == 0);
+    if (buf != NULL) {
+        int lines = 0;
+        for (size_t i = 0; i < size; i++) {
+            if (buf[i] == '\n') {
+                lines++;
+            }
+        }
+        CHECK(lines == 3);
+        CHECK(strstr(buf, "zweite\\nueber") != NULL); /* \n kodiert */
+        free(buf);
+    }
+    /* blaettern in der geladenen history funktioniert wie gehabt */
+    const char *e = history_prev(&h2, NULL);
+    CHECK(e != NULL && strcmp(e, "erste frage") == 0);
+    e = history_prev(&h2, NULL);
+    CHECK(e != NULL && strcmp(e, "zweite\nueber mehrere zeilen") == 0);
+    e = history_prev(&h2, NULL);
+    CHECK(e != NULL && strcmp(e, "erste frage") == 0);
+
+    history_free(&h);
+    history_free(&h2);
+}
+
+static void test_load_dedup_and_cap(void)
+{
+    fresh_home();
+    /* file mit einer direkten wiederholung: laden dedupliziert den
+     * juengsten nachbarn */
+    history_file_write("a\na\nb\n");
+
+    History h = {0};
+    history_load(&h);
+    CHECK(h.len == 2);
+    CHECK(strcmp(h.entries[0], "a") == 0);
+    CHECK(strcmp(h.entries[1], "b") == 0);
+    history_free(&h);
+
+    /* mehr als HISTORY_MAX zeilen: ring voll, aelteste raus */
+    char big[(HISTORY_MAX + 16) * 8];
+    size_t w = 0;
+    for (int i = 0; i < HISTORY_MAX + 16; i++) {
+        w += (size_t)snprintf(big + w, sizeof big - w, "z%d\n", i);
+    }
+    history_file_write(big);
+    History h2 = {0};
+    history_load(&h2);
+    CHECK(h2.len == HISTORY_MAX);
+    CHECK(strcmp(h2.entries[0], "z16") == 0);
+    CHECK(strcmp(h2.entries[HISTORY_MAX - 1], "z79") == 0);
+    history_free(&h2);
+}
+
+static void test_load_garbage(void)
+{
+    fresh_home();
+    /* leere zeilen, muell, CRLF: laden darf nicht abstuerzen, die
+     * guenstigsten zeilen ueberleben */
+    history_file_write("\r\n\nkaputte zeile ohne ende");
+    History h = {0};
+    history_load(&h);
+    CHECK(h.len == 1); /* nur die muellzeile ueberlebt */
+    if (h.len == 1) {
+        CHECK(strcmp(h.entries[0], "kaputte zeile ohne ende") == 0);
+    }
+    history_free(&h);
+
+    /* file ohne leserechte/inhalt: leer ist ok, kein fehler */
+    fresh_home();
+    History h2 = {0};
+    history_load(&h2);
+    CHECK(h2.len == 0);
+    history_free(&h2);
+    CHECK(history_prev(&h2, NULL) == NULL);
+}
+
 int main(void)
 {
     test_add();
@@ -154,5 +295,8 @@ int main(void)
     test_draft();
     test_empty();
     test_multiline();
+    test_persist_roundtrip();
+    test_load_dedup_and_cap();
+    test_load_garbage();
     return test_report();
 }

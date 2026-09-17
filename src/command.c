@@ -114,9 +114,11 @@ void cmd_resume(AppState *state)
     state->dialog = (DialogState){0}; /* frisch: leere suche */
     input_reset(&state->input);
     /* liste frisch laden (alte vorher wegwerfen): das dialog liest
-     * sie beim zeichnen aus dem state */
+     * sie beim zeichnen aus dem state. nur die sessionen des
+     * ordners, in dem die app laeuft – sessionen anderer projekte
+     * bleiben dort unsichtbar, wo sie hingehoeren. */
     session_list_free(&state->sessions);
-    (void)session_list_load(&state->sessions);
+    (void)session_list_load(&state->sessions, NULL);
 }
 
 void cmd_rename(AppState *state, const Config *cfg, const char *name)
