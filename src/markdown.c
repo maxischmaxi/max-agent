@@ -641,7 +641,7 @@ static size_t cells_len(const char *text, size_t off, size_t len)
         } else if ((c & 0xF8U) == 0xF0U) {
             n = 4;
         }
-        for (size_t a = 1; a < n; a++) {
+        for (size_t a = 1; a < n && (i + a) < len; a++) {
             if (((unsigned char)text[off + i + a] & 0xC0U) != 0x80U) {
                 n = 1;
                 break;
@@ -690,12 +690,14 @@ char *md_table_display(const char *text, size_t start, size_t end,
     /* spalten je zeile */
     static size_t coff[64][MD_TABLE_COLS_MAX];
     static size_t clen[64][MD_TABLE_COLS_MAX];
+    size_t rowcols[64]; /* zellen-anzahl je zeile: nur dieser
+                        * bereich ist in coff/clen gueltig */
     size_t cols = 0;
     for (size_t r = 0; r < rows; r++) {
-        size_t n = table_row(text, row_off[r], row_end[r], coff[r], clen[r],
-                             MD_TABLE_COLS_MAX);
-        if (n > cols) {
-            cols = n;
+        rowcols[r] = table_row(text, row_off[r], row_end[r], coff[r],
+                              clen[r], MD_TABLE_COLS_MAX);
+        if (rowcols[r] > cols) {
+            cols = rowcols[r];
         }
     }
     if (cols == 0) {
@@ -705,11 +707,9 @@ char *md_table_display(const char *text, size_t start, size_t end,
     /* spaltenbreiten: laengster inhalt, in zellen */
     size_t colw[MD_TABLE_COLS_MAX] = {0};
     for (size_t r = 0; r < rows; r++) {
-        for (size_t c = 0; c < MD_TABLE_COLS_MAX; c++) {
-            size_t w = (c < clen[r][0] || c < MD_TABLE_COLS_MAX)
-                           ? ((coff[r][c] < row_end[r])
-                                  ? cells_len(text, coff[r][c], clen[r][c])
-                                  : 0)
+        for (size_t c = 0; c < rowcols[r]; c++) {
+            size_t w = (coff[r][c] < row_end[r])
+                           ? cells_len(text, coff[r][c], clen[r][c])
                            : 0;
             if (w > colw[c]) {
                 colw[c] = w;
@@ -739,8 +739,29 @@ char *md_table_display(const char *text, size_t start, size_t end,
     }
 
     /* ausgabe-string bauen: je zeile " zelle | zelle ... "
-     * (padding links/rechts wie nachrichten) */
-    size_t cap = ((size_t)full_width + 8) * rows + 64;
+     * (padding links/rechts wie nachrichten).
+     *
+     * ACHTUNG bei der groesse: colw ist in ZELLEN (utf-8:
+     * codepoint = 1 zelle), der zellinhalt wird aber als ROHBYTES
+     * kopiert. jede multibyte-sequenz macht eine zeile also
+     * laenger als full_width — daher exakt in bytes vorab
+     * berechnen, nicht schaetzen. */
+    size_t cap = 1; /* nul-terminator */
+    for (size_t r = 0; r < rows; r++) {
+        cap += 3; /* padding links/rechts + newline */
+        cap += 3 * (cols - 1); /* " | " trenner */
+        for (size_t c = 0; c < cols; c++) {
+            if (c < rowcols[r] && coff[r][c] < row_end[r]) {
+                size_t cells = cells_len(text, coff[r][c], clen[r][c]);
+                cap += clen[r][c]; /* rohbytes der zelle */
+                if (cells < colw[c]) {
+                    cap += colw[c] - cells; /* pad bis spaltenbreite */
+                }
+            } else {
+                cap += colw[c]; /* zelle fehlt: ganze breite pad */
+            }
+        }
+    }
     char *out = malloc(cap);
     if (out == NULL) {
         return NULL;
@@ -754,22 +775,26 @@ char *md_table_display(const char *text, size_t start, size_t end,
                 out[pos++] = '|';
                 out[pos++] = ' ';
             }
-            size_t cell_off = coff[r][c];
-            size_t cell_len = clen[r][c];
-            if (cell_off == 0 && cell_len == 0) {
-                cell_len = 0;
-            }
             /* zellinhalt + pad bis spaltenbreite */
-            size_t cells = 0;
-            if (cell_off < row_end[r] || cell_len > 0) {
+            if (c < rowcols[r] && coff[r][c] < row_end[r]) {
+                size_t cell_off = coff[r][c];
+                size_t cell_len = clen[r][c];
                 for (size_t b = 0; b < cell_len; b++) {
                     out[pos++] = text[cell_off + b];
                 }
-                cells = cells_len(text, cell_off, cell_len);
-            }
-            while (cells < colw[c]) {
-                out[pos++] = ' ';
-                cells++;
+                size_t cells = cells_len(text, cell_off, cell_len);
+                while (cells < colw[c]) {
+                    out[pos++] = ' ';
+                    cells++;
+                }
+            } else {
+                /* zelle fehlt in dieser zeile: ganze breite pad.
+                 * (coff/clen sind static — ohne rowcols-guard
+                 * wuerden hier stale-offsets vom vorherigen
+                 * tabellen-render landen.) */
+                for (size_t b = 0; b < colw[c]; b++) {
+                    out[pos++] = ' ';
+                }
             }
         }
         out[pos++] = ' '; /* rechtes padding */
