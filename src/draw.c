@@ -43,6 +43,17 @@ static const char GLYPH_BLOCK[] = "\xE2\x96\x88";
  * status – der dock klemmt ohnehin am terminal */
 #define DOCK_ROWS_MAX 96
 
+/* die KLEMME: eine nachricht, die (nach wrap, inkl. der von \n
+ * erzeugten echten zeilen) mehr als 75% der fensterhoehe belegt,
+ * verliert ihre UEBERSCHUSS-ZEILEN unten – sichtbar bleiben die
+ * ersten, dahinter der graue hinweis "... und X weitere zeilen",
+ * und als letzte zeile die letzte der nachricht (der exit-code
+ * eines tool-outputs haengt dort, das stream-ende waechst dort).
+ * die klemme wird JE FRAME neu berechnet – ein resize wirkt
+ * sofort; was schon committet ist, bleibt unveraendert im
+ * scrollback (nur neue frames klemmen den neuen schwanz). */
+#define MSG_MAX_PCT 75
+
 /* ------------------------------------------------------------------ */
 /* ausgabe-primitive: alles laeuft ueber g_out (stdout oder ein      */
 /* test-FILE*). der frame-buffer gilt je ZEILE, nicht mehr wie im   */
@@ -206,6 +217,8 @@ static void row_status_tokens(Row *r, const AppState *st, int sub);
 static void row_quit(Row *r);
 static void row_msg(Row *r, const ChatLine *ln, const char *text);
 static void row_tool_call(Row *r, const ChatToolCall *call, const ChatLine *ln);
+static void row_inline(Row *r, const char *text, size_t off, size_t len,
+                       bool assistant);
 static void row_busy_border(Row *r, long long busy_ms);
 static void row_tool_spinner(Row *r, long long busy_ms);
 static int exit_marker_of(const char *text, const ChatLine *ln);
@@ -884,7 +897,11 @@ static bool g_msg_blocks_valid = false;
  * umbruch-folgezeile weiterlaeuft, wird neu klassifiziert – der
  * tokenizer laeuft ab zeilenanfang, denn nur dort ist der
  * kontext (kommentar offen? string offen?) eindeutig genug fuer
- * ein streaming-sicheres bild. rudimentaer, aber stabil. */
+ * ein streaming-sicheres bild. rudimentaer, aber stabil.
+ *
+ * text ist die ANZEIGE-KOPIE (chat_disp_text) – alle off/len der
+ * ChatLines zeigen hinein. md_code_token bekommt sie inklusive
+ * des terminators: strlen(text) endet an der kopie-grenze. */
 static void row_code(Row *r, const ChatLine *ln, const char *text,
                      const char *lang)
 {
@@ -945,8 +962,99 @@ static void row_code(Row *r, const ChatLine *ln, const char *text,
     row_sgr(r, THEME_ROLE_RESET);
 }
 
+/* eine zeile [off,off+len) mit inline-markup drucken: **bold**
+ * und `code`, auch verschachtelt (**`code`** = fett+hintergrund).
+ *
+ * die marker (ticks, stern-paare) werden NICHT gedruckt – die
+ * anzeige zeigt nur den gerenderten inhalt, die rohdaten (chat,
+ * session-log, api) bleiben unveraendert. die zeile wird dadurch
+ * um die marker-bytes schmaler als die wrap-breite; chat_wrap
+ * hat die marker bei der umbruchplanung mitgezaehlt, eine zeile
+ * endet also evtl. ein paar zellen frueher. akzeptiert: die
+ * alternative (marker mitdrucken) ist das kaputte bild, das
+ * gemeldet wurde.
+ *
+ * stil je byte: die stile ALLER spans, die das byte enthalten,
+ * kombiniert (bold + code = \x1b[1m + hintergrund). rueckstell-
+ * ung paarweise: beim verlust eines stils nur DER stil off (22
+ * fuer bold, 49 fuer hintergrund), damit laufende farben
+ * ueberleben.
+ *
+ * streaming-sicher: unpaarige marker oeffnen kein span, ein
+ * halber markup bleibt plain und stabilisiert sich mit dem
+ * naechsten chunk. */
+static void row_inline(Row *r, const char *text, size_t off, size_t len,
+                       bool assistant)
+{
+    if (!assistant) {
+        /* user-nachrichten: kein inline-markup (der benutzer tippt
+         * literale backticks/sterne – die sollen nicht ploetzlich
+         * als markup erscheinen) */
+        row_putn(r, text + off, (int)len);
+        return;
+    }
+    MdInline inl;
+    md_inline_scan(text, off, len, &inl);
+
+    bool in_bold = false; /* SGR 1 aktiv? */
+    bool in_code = false; /* hintergrund aktiv? */
+    size_t i = 0;
+    while (i < len) {
+        /* byte in bold-span? (irgendeine tiefe) */
+        bool b = false;
+        bool c = false;
+        bool marker = false;
+        for (int k = 0; k < inl.n; k++) {
+            if (i >= inl.start[k] && i < inl.end[k]) {
+                if (inl.kinds[k] == MD_INL_BOLD) {
+                    b = true;
+                } else {
+                    c = true;
+                }
+            }
+        }
+        marker = md_inline_marker(&inl, i);
+        if (marker) {
+            /* marker-bytes verschwinden aus der anzeige – sie
+             * zaehlen nicht als zelle, kein putc */
+            i++;
+            continue;
+        }
+        if (b != in_bold) {
+            row_sgr(r, b ? theme_role(THEME_ROLE_MD_BOLD) : "\x1b[22m");
+            in_bold = b;
+        }
+        if (c != in_code) {
+            row_sgr(r, c ? theme_role(THEME_ROLE_MD_CODE) : THEME_ROLE_BG_OFF);
+            in_code = c;
+        }
+        row_putc(r, text[off + i]);
+        i++;
+    }
+    if (in_bold) {
+        row_sgr(r, "\x1b[22m");
+    }
+    if (in_code) {
+        row_sgr(r, THEME_ROLE_BG_OFF);
+    }
+}
+
+/* eine zeile [off,off+len) mit inline-markup drucken (**bold**,
+ * `code`). die marker werden DIM mitgedruckt (chat_wrap hat sie
+ * bei der breitenplanung mitgezaehlt – weg lassen wuerde die zeile
+ * gegenueber dem wrap verschieben), der inhalt bekommt seinen stil.
+ * spans ohne schliesser auf der zeile sind plain (streaming:
+ * stabilisiert sich mit dem naechsten chunk).
+ *
+ * die stil-rueckstellung ist absichtlich kleinteilig: BOLD wird
+ * mit SGR 22 (nur bold off) zurueckgestellt, die farbe bleibt –
+ * sonst wuerde bold in einer farbigen zeile die farbe fressen.
+ * CODE (hintergrund) wird mit BG_OFF (49) beendet. */
+
 static void row_msg(Row *r, const ChatLine *ln, const char *text)
 {
+    /* text = die anzeige-kopie (chat_disp_text): die dekodierten
+     * texte, in die die off/len von ln zeigen */
     bool user = (ln->role == CHAT_ROLE_USER);
 
     if (user) {
@@ -981,8 +1089,8 @@ static void row_msg(Row *r, const ChatLine *ln, const char *text)
             row_sgr(r, theme_current()->match);
             row_putn(r, text + md.marker, (int)md.marker_len);
             row_sgr(r, THEME_ROLE_RESET);
-            row_putn(r, text + ln->off + md.marker_len,
-                     (int)(ln->len - md.marker_len));
+            row_inline(r, text, ln->off + md.marker_len,
+                       ln->len - md.marker_len, true);
             break;
         }
         case MD_LIST:
@@ -991,17 +1099,17 @@ static void row_msg(Row *r, const ChatLine *ln, const char *text)
             row_sgr(r, theme_role(THEME_ROLE_MD_MARKER));
             row_putn(r, text + md.marker, (int)md.marker_len);
             row_sgr(r, THEME_ROLE_RESET);
-            row_putn(r, text + ln->off + md.marker_len,
-                     (int)(ln->len - md.marker_len));
+            row_inline(r, text, ln->off + md.marker_len,
+                       ln->len - md.marker_len, true);
             break;
         }
         case MD_NONE:
         default:
-            row_putn(r, text + ln->off, (int)ln->len);
+            row_inline(r, text, ln->off, ln->len, true);
             break;
         }
     } else {
-        row_putn(r, text + ln->off, (int)ln->len);
+        row_inline(r, text, ln->off, ln->len, ln->role == CHAT_ROLE_ASSISTANT);
     }
 
     /* rechtes padding: bei user-nachrichten gehoert es mit zum
@@ -1075,26 +1183,23 @@ static void row_tool_spinner(Row *r, long long busy_ms)
     row_sgr(r, THEME_ROLE_RESET);
 }
 
-/* "[exit: N]": der bash-anhang. rueckgabe: N, oder -1 wenn dieser
+/* "exit: N": der bash-anhang. rueckgabe: N, oder -1 wenn dieser
  * zeilenabschnitt KEIN exit-marker ist. die faerbung geschieht im
- * renderer (gruen/rot); das model und das session-log sehen den
- * text weiterhin unfaerbt. */
+ * renderer (gruen/rot ueber die theme-rollen MD_OK/MD_ERR); das
+ * model und das session-log sehen den text weiterhin unfaerbt. */
 static int exit_marker_of(const char *text, const ChatLine *ln)
 {
-    const char *s = text + ln->off;
+    const char *s = text + ln->off; /* text = anzeige-kopie */
     size_t len = ln->len;
-    /* "[exit: N]": 7 zeichen rahmen + 1..3 ziffern */
-    if (len < 8 || len > 10) {
+    /* "exit: N": 6 zeichen praefix + 1..8 ziffern */
+    if (len < 7 || len > 14) {
         return -1;
     }
-    if (s[0] != '[' || s[6] != ' ' || s[len - 1] != ']') {
-        return -1;
-    }
-    if (strncmp(s, "[exit", 5) != 0) {
+    if (strncmp(s, "exit: ", 6) != 0) {
         return -1;
     }
     int code = 0;
-    for (size_t i = 7; i + 1 < len; i++) {
+    for (size_t i = 6; i < len; i++) {
         if (s[i] < '0' || s[i] > '9') {
             return -1;
         }
@@ -1646,7 +1751,16 @@ static void wrap_tail(const Chat *chat, size_t from, int text_w)
     for (size_t m = chat->len; m > from; m--) {
         const ChatMessage *msg = &chat->msgs[m - 1];
         if (msg->role == CHAT_ROLE_ASSISTANT && msg->text != NULL) {
-            md_block_scan(msg->text, &g_msg_blocks);
+            /* der block-scan laeuft ueber die ANZEIGE-KOPIE: die
+             * ChatLines zeigen hinein, die block-grenzen muessen im
+             * selben koordinatensystem liegen */
+            const char *disp = chat_disp_text();
+            size_t doff = chat_disp_off(m - 1 - from);
+            md_block_scan(disp + doff, &g_msg_blocks);
+            for (int b = 0; b < g_msg_blocks.n; b++) {
+                g_msg_blocks.blocks[b].start += doff;
+                g_msg_blocks.blocks[b].end += doff;
+            }
             g_msg_blocks_valid = true;
             break;
         }
@@ -1833,27 +1947,13 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
          * frames. mit dem vorframes-stand feuerte er einen
          * frame zu spaet und committete in den oeffnenden
          * block hinein (doppelte zeilen im scrollback). */
-        const char *lt = chat->msgs[live_idx].text;
-        if (lt != NULL) {
-            md_block_scan(lt, &g_msg_blocks);
-            g_msg_blocks_valid = true;
-            for (int b = g_msg_blocks.n - 1; b >= 0; b--) {
-                const MdBlock *blk = &g_msg_blocks.blocks[b];
-                /* offen = der letzte block reicht bis ans
-                 * text-ende (end == tlen) – der scanner
-                 * schliesst dort immer, ob mit echtem
-                 * schliesser oder streaming-offen. beim
-                 * committen wuerden halbfertige tabellen-
-                 * breiten bzw. der wachsende fence eingefroren;
-                 * die nachricht bleibt deshalb (budgetiert) live. */
-                if (blk->end == strlen(lt) && blk->end > blk->start) {
-                    if (blk->kind == MD_BLK_CODE || blk->kind == MD_BLK_TABLE) {
-                        live_open_block = true;
-                    }
-                }
-                break; /* nur der letzte block zaehlt */
-            }
-        }
+        /* KEIN block-scan hier mehr: die anzeige-kopie des
+         * VORframes hat stale offsets (nach einem resize passt
+         * chat_disp_off nicht mehr zur neuen tail-grenze), und
+         * wrap_tail fuellt g_msg_blocks ohnehin frisch fuer den
+         * frame. der offene-block-entscheid (live_open_block)
+         * trifft der scan NACH wrap_tail weiter unten – autorita-
+         * tiv und mit den grenzen DIESES frames. */
     }
 
     /* platzhalter wurde entfernt (fehler/abbruch): frontier
@@ -1869,6 +1969,36 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
 
     /* ---- wrap des schwanzes ---- */
     wrap_tail(chat, from, text_w);
+
+    /* die anzeige-kopie des schwanzes: alle texte dekodiert (\n
+     * echte newlines, \t spacen, \uXXXX zeichen), die off/len der
+     * g_lines zeigen hinein. ab hier liest der frame nachricht-
+     * texte NIE mehr direkt aus ChatMessage. */
+    const char *disp = chat_disp_text();
+
+    /* offener block: nochmal mit den FRISCHEN block-grenzen pruefen
+     * (wrap_tail hat die tabelle gerade auf die kopie umgerechnet).
+     * live_open_block wird hier endgueltig festgelegt, BEVOR das
+     * committen anfaengt; die erkennung weiter oben ist nur die
+     * fruehe vorstufe fuer die g_msg_blocks-gueltigkeit. */
+    if (live_idx != SIZE_MAX && from <= live_idx) {
+        const char *lt = disp + chat_disp_off(live_idx - from);
+        if (lt[0] != '\0') {
+            MdBlocks fresh;
+            md_block_scan(lt, &fresh);
+            bool open = false;
+            for (int b = fresh.n - 1; b >= 0; b--) {
+                const MdBlock *blk = &fresh.blocks[b];
+                /* offen = der letzte block reicht bis ans kopie-ende */
+                if (blk->end == strlen(lt) && blk->end > blk->start &&
+                    (blk->kind == MD_BLK_CODE || blk->kind == MD_BLK_TABLE)) {
+                    open = true;
+                }
+                break; /* nur der letzte block zaehlt */
+            }
+            live_open_block = open;
+        }
+    }
 
     /* offener block: budget fuer die live-region. msg_line_range
      * braucht die FRISCHEN g_lines – deshalb erst nach dem wrap.
@@ -1994,7 +2124,35 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
             msg_first = s + 1;
         }
 
-        for (size_t li = s + start; li < s + stop; li++) {
+        /* die KLEMME: ist die nachricht hoeher als 75% des fensters,
+         * fallen die unteren zeilen weg. sichtbar bleiben die ersten
+         * `limit` zeilen plus die LETZTE (exit-code / stream-ende);
+         * dazwischen steht der graue hinweis. live-nachrichten
+         * klemmen genauso – die wachsende zeile ist die letzte und
+         * bleibt. die klemme wird je frame neu berechnet, ein
+         * resize wirkt sofort. */
+        size_t clamped = 0; /* zeilen, die wegfallen (inkl. der
+                             * letzten, die separat gezeigt wird) */
+        {
+            /* budget = 75% der fensterhoehe. gerendert: budget-1
+             * content-zeilen oben (head), der hinweis, die letzte
+             * zeile. clamped = alles zwischen head und der letzten
+             * (exklusiv) – die loop rendert head zeilen, der
+             * hinweis zeigt clamped-1 "weitere" + die letzte zeile
+             * als bonus. mindest-budget 3 (2 content + hinweis),
+             * damit winzige fenster die nachricht nicht fressen. */
+            int budget = (rows * MSG_MAX_PCT) / 100;
+            if (budget < 3) {
+                budget = 3;
+            }
+            size_t head = (size_t)budget - 1;
+            size_t visible = stop - start;
+            if (visible > head + 1) {
+                clamped = visible - head;
+            }
+        }
+
+        for (size_t li = s + start; li + clamped < s + stop; li++) {
             /* leerzeile zwischen den nachrichten: sie gehoert zum
              * FERTIGEN content (druckt einmal, scrollt dann mit).
              * `li == msg_first` feuert nur bei der ersten GEDRUCK-
@@ -2021,15 +2179,19 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                 {
                     /* display-string fuer diese tabelle neu bauen
                      * (gleicher algorithmus wie chat_wrap: die
-                     * zeilen MUessen identisch sein) */
-                    char *disp = md_table_display(lm->text, ln->blk_start,
-                                                  ln->blk_end, main_w);
-                    if (disp != NULL) {
-                        size_t dl = strlen(disp);
+                     * zeilen MUessen identisch sein). blk_start/end
+                     * sind KOMPIE-offsets, md_table_display will
+                     * sie relativ zum text der nachricht */
+                    size_t toff = chat_disp_off(ln->msg);
+                    char *tbl =
+                        md_table_display(disp + toff, ln->blk_start - toff,
+                                         ln->blk_end - toff, main_w);
+                    if (tbl != NULL) {
+                        size_t dl = strlen(tbl);
                         size_t off = ln->off;
                         if (off < dl) {
                             for (size_t b = 0; b < ln->len; b++) {
-                                char c = disp[off + b];
+                                char c = tbl[off + b];
                                 if (c == '|') {
                                     row_sgr(&g_row, theme_current()->match);
                                     row_putc(&g_row, c);
@@ -2039,7 +2201,7 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                                 }
                             }
                         }
-                        free(disp);
+                        free(tbl);
                     }
                 }
                 row_sgr(&g_row, THEME_ROLE_RESET);
@@ -2059,7 +2221,10 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
             } else if (lm->role == CHAT_ROLE_TOOL) {
                 /* tool-ergebnis: "output:" vor der ersten zeile,
                  * dahinter der echte output, am ende der (von
-                 * bash angehaengte) exit-code gruen/rot */
+                 * bash angehaengte) exit-code gruen/rot. leer-
+                 * zeilen VOR dem exit-code ueberliest der wrap-
+                 * pass (chat_wrap) – der code klebt direkt am
+                 * letzten output */
                 if (ln->first) {
                     row_start(main_w);
                     row_sgr(&g_row, theme_role(THEME_ROLE_DIM));
@@ -2068,15 +2233,17 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                     row_finish(true);
                 }
                 row_start(main_w);
-                int code = exit_marker_of(lm->text, ln);
+                int code = exit_marker_of(disp, ln);
                 if (code >= 0) {
                     row_puts(&g_row, " ");
-                    row_sgr(&g_row, (code == 0) ? "\x1b[32m" : "\x1b[31m");
-                    row_putn(&g_row, lm->text + ln->off, (int)ln->len);
+                    row_sgr(&g_row,
+                            theme_role((code == 0) ? THEME_ROLE_MD_OK
+                                                   : THEME_ROLE_MD_ERR));
+                    row_putn(&g_row, disp + ln->off, (int)ln->len);
                     row_sgr(&g_row, THEME_ROLE_RESET);
                 } else {
                     row_puts(&g_row, " ");
-                    row_putn(&g_row, lm->text + ln->off, (int)ln->len);
+                    row_putn(&g_row, disp + ln->off, (int)ln->len);
                 }
                 row_sgr(&g_row, THEME_ROLE_RESET);
                 row_finish(true);
@@ -2087,11 +2254,51 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                 continue;
             } else {
                 row_start(main_w);
-                row_msg(&g_row, ln, lm->text);
+                row_msg(&g_row, ln, disp);
                 row_finish(true);
             }
             g_printed_any = true;
         }
+
+        /* klemmen-hinweis: unter den sichtbaren zeilen, in grau
+         * (THEME_ROLE_MORE), mit dem 1er-padding links wie alle
+         * nachrichtenzeilen */
+        if (clamped > 0) {
+            row_start(main_w);
+            row_sgr(&g_row, theme_role(THEME_ROLE_MORE));
+            char more[64];
+            (void)snprintf(more, sizeof more,
+                           " \xE2\x80\xA6 und %zu weitere zeilen", clamped - 1);
+            row_puts(&g_row, more);
+            row_sgr(&g_row, THEME_ROLE_RESET);
+            row_finish(true);
+            g_printed_any = true;
+        }
+
+        /* die weggeklemmte LETZTE zeile bleibt immer sichtbar:
+         * der exit-code eines tool-outputs haengt dort, das
+         * stream-ende waechst dort */
+        if (clamped > 0 && stop > start) {
+            const ChatLine *ln = &g_lines[s + stop - 1];
+            const ChatMessage *lm = &chat->msgs[ln->msg + from];
+            row_start(main_w);
+            if (lm->role == CHAT_ROLE_TOOL) {
+                int code = exit_marker_of(disp, ln);
+                row_puts(&g_row, " ");
+                if (code >= 0) {
+                    row_sgr(&g_row,
+                            theme_role((code == 0) ? THEME_ROLE_MD_OK
+                                                   : THEME_ROLE_MD_ERR));
+                }
+                row_putn(&g_row, disp + ln->off, (int)ln->len);
+                row_sgr(&g_row, THEME_ROLE_RESET);
+            } else {
+                row_msg(&g_row, ln, disp);
+            }
+            row_finish(true);
+            g_printed_any = true;
+        }
+
         if (is_live) {
             g_live_msg = mi;
             g_live_msg_valid = true;
@@ -2120,8 +2327,8 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
      *      gezeichnet (breiten wachsen mit), gemaess der
      *      live_open_block-regel weiter oben committet nichts. */
     bool live_text = false;
-    if (state->busy && live_idx != SIZE_MAX &&
-        chat->msgs[live_idx].text[0] != '\0') {
+    if (state->busy && live_idx != SIZE_MAX && from <= live_idx &&
+        disp[chat_disp_off(live_idx - from)] != '\0') {
         size_t s = 0;
         size_t e = 0;
         msg_line_range(live_idx - from, &s, &e);
@@ -2146,15 +2353,17 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                     }
                     row_start(main_w);
                     if (ln->tool == -2) {
-                        /* tabelle: wie im content-loop (pipes farbig) */
-                        char *disp = md_table_display(chat->msgs[live_idx].text,
-                                                      ln->blk_start,
-                                                      ln->blk_end, main_w);
-                        if (disp != NULL) {
-                            size_t dl = strlen(disp);
+                        /* tabelle: wie im content-loop (pipes farbig).
+                         * blk_start/end sind kopie-offsets */
+                        size_t toff = chat_disp_off(ln->msg);
+                        char *tbl =
+                            md_table_display(disp + toff, ln->blk_start - toff,
+                                             ln->blk_end - toff, main_w);
+                        if (tbl != NULL) {
+                            size_t dl = strlen(tbl);
                             if (ln->off < dl) {
                                 for (size_t b = 0; b < ln->len; b++) {
-                                    char c = disp[ln->off + b];
+                                    char c = tbl[ln->off + b];
                                     if (c == '|') {
                                         row_sgr(&g_row, theme_current()->match);
                                         row_putc(&g_row, c);
@@ -2164,10 +2373,10 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                                     }
                                 }
                             }
-                            free(disp);
+                            free(tbl);
                         }
                     } else {
-                        row_msg(&g_row, ln, chat->msgs[live_idx].text);
+                        row_msg(&g_row, ln, disp);
                     }
                     row_finish(true);
                 }
@@ -2176,7 +2385,7 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                 const ChatLine *ln = &g_lines[e - 1];
                 if (ln->tool < 0) {
                     row_start(main_w);
-                    row_msg(&g_row, ln, chat->msgs[live_idx].text);
+                    row_msg(&g_row, ln, disp);
                     row_finish(true);
                     live_text = true;
                 }

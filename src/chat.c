@@ -241,6 +241,109 @@ char *chat_flatten_input(const Input *in)
     return buf;
 }
 /* ------------------------------------------------------------------ */
+/* display-kopie: chat_wrap zerlegt nicht mehr den rohen nachricht-   */
+/* text, sondern eine dekodierte anzeige-kopie (\n -> echte newline,  */
+/* \t -> spacen, \uXXXX -> zeichen; siehe chat_decode_escapes).      */
+/* alle texte des gewrappten bereichs haengen hintereinander in EINEM */
+/* string; die ChatLine.off zeigen hinein. die ChatLine.msg zaehlen  */
+/* weiterhin nachrichten relativ zum bereich; chat_disp_off(mi)      */
+/* liefert den start der nachricht mi in der kopie (fuer block-scan, */
+/* tabellen und den fence-highlight im renderer). roh bleibt roh:    */
+/* api-round-trip und session-log sehen immer den original-text.     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char *buf;  /* NULL solange nie benutzt */
+    size_t len; /* fuellung ohne terminator */
+    size_t cap; /* allokierung inkl. terminator */
+} DispText;
+
+static DispText g_disp;
+static size_t *g_disp_offs; /* start je nachricht in g_disp.buf */
+static size_t g_disp_offs_n;
+
+const char *chat_disp_text(void)
+{
+    return (g_disp.buf != NULL) ? g_disp.buf : "";
+}
+
+size_t chat_disp_off(size_t mi)
+{
+    return (mi < g_disp_offs_n) ? g_disp_offs[mi] : 0;
+}
+
+void chat_free_disp(void)
+{
+    free(g_disp.buf);
+    g_disp.buf = NULL;
+    g_disp.len = 0;
+    g_disp.cap = 0;
+    free(g_disp_offs);
+    g_disp_offs = NULL;
+    g_disp_offs_n = 0;
+}
+
+static void disp_reset(size_t msgs)
+{
+    g_disp.len = 0;
+    if (g_disp.buf != NULL) {
+        g_disp.buf[0] = '\0';
+    }
+    if (g_disp_offs_n < msgs) {
+        size_t n = (g_disp_offs_n > 0) ? g_disp_offs_n : 16;
+        while (n < msgs) {
+            if (n > SIZE_MAX / 2) {
+                die("out of memory");
+            }
+            n *= 2;
+        }
+        size_t *grown = realloc(g_disp_offs, n * sizeof *grown);
+        if (grown == NULL) {
+            die("out of memory");
+        }
+        g_disp_offs = grown;
+        g_disp_offs_n = n;
+    }
+}
+
+static void disp_append(const char *text, size_t *off)
+{
+    *off = g_disp.len;
+    if (text == NULL) {
+        return;
+    }
+    /* text + '\0'-sentinel: alle texte liegen in EINEM puffer,
+     * ohne trenner wuerde strlen()/md_block_scan() ueber das
+     * nachricht-ende in die naechste hineinlaufen (ein offener
+     * fence wuerde folgenachrichten verschlucken). das '\0'
+     * gehoert NICHT zum text – die ChatLine.len enden davor, kein
+     * off/len zeigt je ueber die grenze. */
+    size_t n = strlen(text);
+    if (n > SIZE_MAX - g_disp.len - 2) {
+        die("out of memory"); /* rein theoretisch */
+    }
+    if (g_disp.cap < g_disp.len + n + 2) {
+        size_t cap = (g_disp.cap > 0) ? g_disp.cap : 256;
+        while (cap < g_disp.len + n + 2) {
+            if (cap > SIZE_MAX / 2) {
+                die("out of memory");
+            }
+            cap *= 2;
+        }
+        char *grown = realloc(g_disp.buf, cap);
+        if (grown == NULL) {
+            die("out of memory");
+        }
+        g_disp.buf = grown;
+        g_disp.cap = cap;
+    }
+    memcpy(g_disp.buf + g_disp.len, text, n);
+    g_disp.len += n;
+    g_disp.buf[g_disp.len++] = '\0'; /* nachricht-terminator */
+    g_disp.buf[g_disp.len] = '\0';
+}
+
+/* ------------------------------------------------------------------ */
 /* word-wrap                                                          */
 /*                                                                    */
 /* ein codepoint zaehlt als 1 sichtbare zelle. eine wcwidth-tabelle   */
@@ -413,46 +516,115 @@ static size_t utf8_encode(long cp, char *dst)
     return 4;
 }
 
-/* json-unicode-escapes (\uXXXX) in s IN-PLACE dekodieren: manche
- * modelle schicken "&" oder umlaute als \u0026/\u00e4 – in der
- * anzeige soll das lesbar sein. nur die DARSTELLUNG wird beruehrt,
- * die rohen argumente (api-round-trip, session-log) bleiben wie
- * sie sind. steuerzeichen-escapes (\u000a) bleiben stehen: ein
- * echter zeilenumbruch mitten in der darstellungs-zeile wuerde
- * das rendering kaputt machen. kaputte escapes bleiben literal. */
-static void decode_unicode_escapes(char *s)
+/* json-artige escapes (\uXXXX, \n, \\, ...) dekodieren – NUR fuer
+ * die darstellung, die rohen texte (api-round-trip, session-log)
+ * bleiben immer wie sie sind. dekodiert wird je frame die anzeige-
+ * kopie (draw.c haelt sie vor), hier liegt das gemeinsame wissen:
+ *
+ * ESC_DECODE_TOOLS (argument-zeile eines tool-calls): nur DRUCKBARE
+ * \uXXXX-escapes werden zeichen. steuerzeichen-escapes (\u000a, ...)
+ * bleiben literal – der call ist EINE zeile, ein echter umbruch
+ * mitten darin zerstoere das layout. "\\" bleibt "\\" (zwei byte).
+ *
+ * ESC_DECODE_TEXT (nachrichtentext): vollstaendig. \n und \r werden
+ * echte newlines (chat_wrap bricht danach), \t vier leerzeichen (ein
+ * rohes tab-byte wuerde die zellen-zaehlung des renderers und die
+ * cursor-position im terminal kaputt machen), \" \' \/ \\ werden ihre
+ * zeichen, \uXXXX auch fuer steuerzeichen (0009 -> spaces,
+ * 000a/000d -> newline). kaputte escapes, unbekannte (\x, \b, ...)
+ * und lone backslashes bleiben literal. */
+char *chat_decode_escapes(const char *s, EscDecodePolicy policy)
 {
+    if (s == NULL) {
+        return NULL;
+    }
+    size_t len = strlen(s);
+    if (len > (SIZE_MAX - 1) / 4) {
+        return NULL; /* laengen-ueberlauf: rein theoretisch */
+    }
+    /* worst case: jedes "\t" (2 byte) wird zu 4 leerzeichen */
+    char *out = malloc(len * 4 + 1);
+    if (out == NULL) {
+        return NULL;
+    }
     size_t r = 0; /* lese-position */
     size_t w = 0; /* schreib-position */
     while (s[r] != '\0') {
-        if (s[r] == '\\') {
-            if (s[r + 1] == '\\') {
-                /* doppelter backslash: im rohen json ein ESCAPTER
-                 * backslash – das folgende \u0026 gehoert nicht
-                 * uns. beide zeichen unangetastet lassen */
-                s[w++] = s[r++];
-                s[w++] = s[r++];
-                continue;
+        if (s[r] != '\\') {
+            out[w++] = s[r++];
+            continue;
+        }
+        char next = s[r + 1]; /* '\0' wenn der backslash alleine steht */
+        if (next == '\\') {
+            /* doppelter backslash: im rohen json ein ESCAPTER
+             * backslash. nachricht-text zeigt ihn als EIN zeichen,
+             * die tool-argumente lassen beide stehen (sie sind json) */
+            out[w++] = '\\';
+            if (policy == ESC_DECODE_TOOLS) {
+                out[w++] = '\\';
             }
+            r += 2;
+            continue;
+        }
+        if (policy == ESC_DECODE_TEXT) {
+            switch (next) {
+            case 'n':
+            case 'r':
+                out[w++] = '\n';
+                r += 2;
+                continue;
+            case 't':
+                out[w++] = ' ';
+                out[w++] = ' ';
+                out[w++] = ' ';
+                out[w++] = ' ';
+                r += 2;
+                continue;
+            case '"':
+            case '\'':
+            case '/':
+                out[w++] = next;
+                r += 2;
+                continue;
+            default:
+                break; /* \u und unbekannte: weiter unten */
+            }
+        }
+        if (next == 'u') {
             size_t consumed = 0;
             long cp = parse_unicode_escape(s + r, &consumed);
             if (cp > 0x1F && cp != 0x7F) {
-                /* invariante: w <= r, und dekodieren liest mindestens
-                 * 6 byte (bzw. 12), schreibt aber hoechstens 4 – der
-                 * schreibzeiger kann den lesezeiger nie ueberholen,
-                 * jedes geschriebene byte bleibt im string */
                 char enc[4];
                 size_t n = utf8_encode(cp, enc);
-                for (size_t k = 0; k < n; k++) {
-                    s[w++] = enc[k];
-                }
+                memcpy(out + w, enc, n);
+                w += n;
                 r += consumed;
                 continue;
             }
+            if (policy == ESC_DECODE_TEXT && cp >= 0) {
+                /* steuerzeichen nur im nachrichtentext: tab und
+                 * newline sind sinnvoll darstellbar, der rest
+                 * (\u0000, \b, ...) bleibt literal */
+                if (cp == 0x09) {
+                    out[w++] = ' ';
+                    out[w++] = ' ';
+                    out[w++] = ' ';
+                    out[w++] = ' ';
+                    r += consumed;
+                    continue;
+                }
+                if (cp == 0x0A || cp == 0x0D) {
+                    out[w++] = '\n';
+                    r += consumed;
+                    continue;
+                }
+            }
         }
-        s[w++] = s[r++];
+        /* alles andere bleibt literal stehen (auch das backslash) */
+        out[w++] = s[r++];
     }
-    s[w] = '\0';
+    out[w] = '\0';
+    return out;
 }
 
 char *chat_tool_display(const ChatToolCall *call)
@@ -481,8 +653,12 @@ char *chat_tool_display(const ChatToolCall *call)
     s[pos++] = ')';
     s[pos] = '\0';
     /* anzeige entschaerfen: \u0026 -> & usw. (nur darstellung!) */
-    decode_unicode_escapes(s);
-    return s;
+    char *dec = chat_decode_escapes(s, ESC_DECODE_TOOLS);
+    if (dec != NULL) {
+        free(s);
+        return dec;
+    }
+    return s; /* dekodieren schlug fehl: roh zeigen (OOM-pfad) */
 }
 
 /* tool-call in darstellungs-zeilen zerlegen: die erste beginnt mit
@@ -551,6 +727,17 @@ static void wrap_tool_call(ChatRole role, size_t msg, int tool,
     free(s);
 }
 
+/* ist [off,len) nur leerzeichen? (fuer die blank-haltung) */
+static bool is_blank_len(const char *s, size_t len)
+{
+    for (size_t k = 0; k < len; k++) {
+        if (s[k] != ' ') {
+            return false;
+        }
+    }
+    return true;
+}
+
 size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
 {
     if (chat == NULL || width < 1) {
@@ -559,12 +746,33 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
     size_t w = (size_t)width;
     size_t count = 0;
 
+    /* anzeige-kopie neu aufbauen: jeder text einmal durch den
+     * escape-dekodierer (policy TEXT – \n wird echte newline, \t
+     * spacen, \uXXXX zeichen), dann alles hintereinander in den
+     * einen puffer. die ChatLines zeigen mit off/len in die kopie;
+     * die offsets je nachricht merkt g_disp_offs fuer den renderer */
+    disp_reset(chat->len);
+
     for (size_t mi = 0; mi < chat->len; mi++) {
-        const char *text = chat->msgs[mi].text;
-        if (text == NULL) {
+        const char *raw = chat->msgs[mi].text;
+        if (raw == NULL) {
             continue;
         }
         ChatRole role = chat->msgs[mi].role;
+        size_t count_before = count;
+
+        /* anzeige-kopie: roh -> dekodiert. schlaegt das dekodieren
+         * fehl (OOM), faellt die anzeige auf den rohen text zurueck
+         * (die app stirbt eh) */
+        char *dec = chat_decode_escapes(raw, ESC_DECODE_TEXT);
+        const char *text = (dec != NULL) ? dec : raw;
+        size_t text_off = 0;
+        disp_append(text, &text_off);
+        if (mi < g_disp_offs_n) {
+            g_disp_offs[mi] = text_off;
+        }
+        /* dec bleibt bis zum ende der iteration am leben: alle
+         * off/len verweisen ueber `text` auf dec (bzw. die kopie) */
 
         /* markdown-bloecke NUR fuer ki-antworten: tabellen werden
          * als ausgerichtete darstellung emittiert (volle breite),
@@ -583,6 +791,12 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
         size_t cells = 0;      /* zellen seit dem zeilenanfang */
         size_t brk = SIZE_MAX; /* offset des letzten passenden leerzeichens */
         size_t i = 0;
+        size_t pending_blank = 0; /* >= 1: N ausstehende leerzeilen. eine
+                                   * leerzeile wird erst mit dem NAeCHSTEN
+                                   * inhalt emittiert: bleibt am ende der
+                                   * nachricht nur blank-gefolge vor dem
+                                   * exit-code, faellt es einfach weg und
+                                   * der code klebt direkt am output */
 
         while (text[i] != '\0') {
             /* tabelle? an jedem originalen zeilenanfang (lstart)
@@ -618,9 +832,29 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
                 continue;
             }
             if (text[i] == '\n') { /* erzwungener umbruch */
-                wrap_emit(role, mi, off, i - off, first, lstart, -1, out,
-                          out_max, &count);
-                first = false;
+                bool blank = is_blank_len(text + off, i - off);
+                /* blanks NICHT sofort emittieren: erst mit dem naechsten
+                 * inhalt – AUSSER der inhalt ist der exit-code, dann
+                 * faellt das blank-gefolge ganz weg und der code klebt
+                 * direkt am letzten output. zaehl- und fuell-durchlauf
+                 * sehen denselben entscheid (kein arena-verbiegen) */
+                if (!blank) {
+                    if (pending_blank > 0 && i - off >= 7 &&
+                        strncmp(text + off, "[exit: ", 7) == 0) {
+                        /* exit-code: blanks davor verfallen */
+                        pending_blank = 0;
+                    }
+                    for (size_t b = 0; b < pending_blank; b++) {
+                        wrap_emit(role, mi, off, 0, false, true, -1, out,
+                                  out_max, &count);
+                    }
+                    pending_blank = 0;
+                    wrap_emit(role, mi, off, i - off, first, lstart, -1, out,
+                              out_max, &count);
+                    first = false;
+                } else {
+                    pending_blank++;
+                }
                 lstart = true; /* neue logische zeile */
                 i++;
                 off = i;
@@ -668,10 +902,30 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
         /* rest der nachricht. endet der text auf '\n', entsteht dahinter
          * KEINE leere zeile (off == i); eine nachricht ohne jede zeile
          * (leerer text, z.B. streaming-platzhalter) bekommt genau eine
-         * leere erste zeile, damit der label alleine steht. */
+         * leere erste zeile, damit der label alleine steht. der rest
+         * hat hier IMMER inhalt: pending blanks werden real, ein
+         * leerer rest (nur blanks bis zum ende) laesst sie fallen. */
         if (off < i || first) {
-            wrap_emit(role, mi, off, i - off, first, lstart, -1, out, out_max,
-                      &count);
+            bool blank_rest = is_blank_len(text + off, i - off);
+            bool is_exit =
+                (i - off >= 7 && strncmp(text + off, "[exit: ", 7) == 0);
+            if (blank_rest && !first) {
+                /* nur blanks uebrig: weg (z.B. vor "exit: ", das die
+                 * tool-zeile schon emittiert hat) */
+            } else {
+                if (is_exit) {
+                    /* exit-code: pending blanks verfallen, der code
+                     * klebt direkt am letzten output */
+                    pending_blank = 0;
+                }
+                for (size_t b = 0; b < pending_blank; b++) {
+                    wrap_emit(role, mi, off, 0, false, true, -1, out, out_max,
+                              &count);
+                }
+                pending_blank = 0;
+                wrap_emit(role, mi, off, i - off, first, lstart, -1, out,
+                          out_max, &count);
+            }
         }
 
         /* tool-calls der nachricht: darstellungs-zeilen nach dem
@@ -682,6 +936,39 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
             wrap_tool_call(role, mi, (int)t, &chat->msgs[mi].tool_calls[t],
                            width, out, out_max, &count);
         }
+
+        /* tool-ergebnis: bash haengt "[exit: N]" an. die leerzeilen
+         * davor haelt die blank-logik oben schon zurueck, hier
+         * streichen nur noch die eckigen klammern: die ANZEIGE zeigt
+         * "exit: N", das model und das session-log sehen weiter-
+         * hin "[exit: N]" (roh bleibt roh). die letzte ChatLine der
+         * nachricht ist der code (blank-gefolge faellt weg, s.o.) */
+        if (role == CHAT_ROLE_TOOL && out != NULL && count > count_before &&
+            count <= out_max) {
+            ChatLine *last = &out[count - 1];
+            if (last->len >= 8 &&
+                strncmp(text + last->off, "[exit: ", 7) == 0 &&
+                text[last->off + last->len - 1] == ']') {
+                last->off += 1; /* klammern weg: "[exit: N]" -> "exit: N" */
+                last->len -= 2;
+            }
+        }
+
+        /* offs dieser nachricht in die kopie verschieben: die
+         * zeilen wurden relativ zum nachricht-text geplant, die
+         * kopie enthaelt ihn aber ab text_off. NUR textzeilen
+         * (tool == -1) zeigen in den nachricht-text – tabellen-
+         * zeilen (tool == -2) in den tabellen-display-string,
+         * tool-call-zeilen (tool >= 0) in den call-display-string,
+         * die bleiben wie sie sind. */
+        if (text_off > 0) {
+            for (size_t k = count_before; k < count && k < out_max; k++) {
+                if (out[k].tool == -1) {
+                    out[k].off += text_off;
+                }
+            }
+        }
+        free(dec); /* jetzt erst: die zeilen zeigen in die kopie */
     }
     return count;
 }

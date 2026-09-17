@@ -319,6 +319,11 @@ static char *tool_bash(const cJSON *args)
         free(buf);
         return NULL;
     }
+    /* exit-code hinten dran: das model soll erkennen koennen, ob
+     * das kommando erfolgreich war. format "[exit: N]" – die eckigen
+     * klammern markieren den code als maschinenlesbares feld; die
+     * ANZEIGE streicht sie (draw.c faerbt "exit: N" gruen/rot, der
+     * wrap-pass ueberliest die leerzeile davor) */
     (void)snprintf(out + got, 32, "\n[exit: %d]", exit_code);
     return cap_result(out);
 }

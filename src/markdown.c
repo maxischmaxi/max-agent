@@ -118,6 +118,149 @@ void md_scan(const char *text, size_t off, size_t len, bool line_start,
 }
 
 /* ------------------------------------------------------------------ */
+/* inline-scan: **bold** und `code`                                    */
+/* ------------------------------------------------------------------ */
+
+/* ein inline-span mit kind + tiefe. die marker (** __ `) gehoeren
+ * zum span (start/end INKLUSIVE marker), der renderer blendet sie
+ * aus. tiefe > 0 = der span liegt in einem bold: code in bold
+ * bekommt fett + hintergrund zusammen. */
+#define MD_INLINE_MAX 16 /* spans je zeile – ueberzaehlig = plain */
+
+/* spans sammeln (rekursiv): [i, end) relativ zur zeile. depth =
+ * verschachtelungstiefe (bold kann code enthalten). plain-bytes
+ * zwischen den spans werden nicht als span gelistet; der renderer
+ * iteriert byteweise und fragt, in welchem span (tiefe sortiert)
+ * das byte liegt. */
+static void inline_parse(const char *s, size_t i, size_t end, int depth,
+                         MdInline *out)
+{
+    while (i < end && out->n < MD_INLINE_MAX) {
+        if (s[i] == '`') {
+            /* code-span: einzelner tick oeffnet, schliessender
+             * einzelner tick schliesst. mehrere ticks am stueck
+             * sind KEIN code (fence-marker: doppel/triple). */
+            size_t ticks = 0;
+            while (i + ticks < end && s[i + ticks] == '`') {
+                ticks++;
+            }
+            if (ticks != 1) {
+                i += ticks; /* plain, skippen */
+                continue;
+            }
+            size_t j = i + 1;
+            while (j < end && s[j] != '`') {
+                j++;
+            }
+            if (j >= end) {
+                i++; /* kein schliesser: literaler tick */
+                continue;
+            }
+            out->kinds[out->n] = MD_INL_CODE;
+            out->start[out->n] = i;
+            out->end[out->n] = j + 1; /* inkl. schliessender tick */
+            out->depth[out->n] = depth;
+            out->n++;
+            i = j + 1;
+            continue;
+        }
+        if ((s[i] == '*' && i + 1 < end && s[i + 1] == '*') ||
+            (s[i] == '_' && i + 1 < end && s[i + 1] == '_')) {
+            char c = s[i];
+            /* schliesser-suche: code-spans (`x`) haben VORRANG –
+             * ihr inhalt ist literal, auch wenn er ** enthaelt.
+             * wir scannen ab i+2, ueberspringen tick-spans und
+             * finden das erste stern-paar DANACH. so wird
+             * **`**bold**`** korrekt: code um `...`, bold drum-
+             * herum (wie commonmark). */
+            size_t j = i + 2;
+            size_t close = (size_t)-1;
+            while (j < end) {
+                if (s[j] == '`') {
+                    /* tick-span ueberspringen (inhalt literal) */
+                    size_t k = j + 1;
+                    while (k < end && s[k] != '`') {
+                        k++;
+                    }
+                    if (k >= end) {
+                        break; /* unpaariger tick: abbruch der suche */
+                    }
+                    j = k + 1;
+                    continue;
+                }
+                if (s[j] == c && j + 1 < end && s[j + 1] == c) {
+                    close = j;
+                    break;
+                }
+                j++;
+            }
+            if (close == (size_t)-1) {
+                i += 2; /* kein schliesser: plain */
+                continue;
+            }
+            /* bold-span [i, close+2): inhalt rekursiv weiterparsen,
+             * code im inhalt erlaubt (fett+hintergrund) */
+            out->kinds[out->n] = MD_INL_BOLD;
+            out->start[out->n] = i;
+            out->end[out->n] = close + 2; /* inkl. schliessender marker */
+            out->depth[out->n] = depth;
+            out->n++;
+            inline_parse(s, i + 2, close, depth + 1, out);
+            i = close + 2;
+            continue;
+        }
+        i++;
+    }
+}
+
+/* die inline-spans der zeile [off,off+len) sammeln. zeilenlokal
+ * und streaming-sicher: unpaarige marker bleiben plain. */
+void md_inline_scan(const char *text, size_t off, size_t len, MdInline *out)
+{
+    out->n = 0;
+    if (len == 0) {
+        return;
+    }
+    inline_parse(text + off, 0, len, 0, out);
+}
+
+/* span-index mit der HOECHSTEN tiefe, der rel enthaelt; -1 keiner.
+ * tiefe sortiert: verschachtelte spans ueberlagern die aeusseren. */
+int md_inline_at(const MdInline *inl, size_t rel)
+{
+    int best = -1;
+    int best_depth = -1;
+    for (int i = 0; i < inl->n; i++) {
+        if (rel >= inl->start[i] && rel < inl->end[i] &&
+            inl->depth[i] > best_depth) {
+            best = i;
+            best_depth = inl->depth[i];
+        }
+    }
+    return best;
+}
+
+/* ist rel ein MARKER-byte (tick, stern- oder unterstrich-paar)?
+ * die marker werden vom renderer NICHT gedruckt – die anzeige
+ * zeigt nur den inhalt. die pruefung ist einfach: das byte liegt
+ * im span und ist einer der 1 (code) bzw. 2 (bold) rand-bytes. */
+bool md_inline_marker(const MdInline *inl, size_t rel)
+{
+    for (int i = 0; i < inl->n; i++) {
+        if (rel < inl->start[i] || rel >= inl->end[i]) {
+            continue; /* nicht in diesem span */
+        }
+        size_t m = (inl->kinds[i] == MD_INL_CODE) ? 1 : 2;
+        size_t rel_in = rel - inl->start[i];
+        size_t span_len = inl->end[i] - inl->start[i];
+        if (rel_in < m || rel_in >= span_len - m) {
+            return true; /* oeffner oder schliesser */
+        }
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
 /* block-scan: fences + tabellen                                      */
 /* ------------------------------------------------------------------ */
 

@@ -65,6 +65,25 @@ typedef struct {
  * OOM (dann stirbt die app eh). */
 char *chat_tool_display(const ChatToolCall *call);
 
+/* wie weit die escape-dekodierung der ANZEIGE geht (roh bleibt immer):
+ * TOOLS = nur druckbare \uXXXX-escapes – die argument-zeile eines
+ * tool-calls ist EINE zeile, steuerzeichen wuerden das layout
+ * zerstoeren; TEXT = vollstaendig (\n -> newline, \t -> 4 spacen,
+ * \" \' \\ \/ -> zeichen, \uXXXX auch fuer steuerzeichen) –
+ * nachrichtentext wird erst dekodiert und dann von chat_wrap in
+ * zeilen zerlegt. */
+typedef enum {
+    ESC_DECODE_TOOLS = 0,
+    ESC_DECODE_TEXT,
+} EscDecodePolicy;
+
+/* json-artige escapes (\n, \t, \u00e4, \\, ...) im string NUR fuer
+ * die darstellung dekodieren: liefert eine frische heap-kopie (NULL
+ * bei NULL-eingang oder allocation-fehler), der eingang bleibt
+ * unangetastet. unbekannte escapes, kaputte \uXXXX und lone
+ * backslashes bleiben literal stehen. */
+char *chat_decode_escapes(const char *s, EscDecodePolicy policy);
+
 typedef struct {
     ChatRole role;
     char *text; /* heap-kopie, utf-8, mehrzeilig ('\n'-getrennt) */
@@ -162,5 +181,15 @@ typedef struct {
  * der aufrufer mit groesserer arena erneut aufrufen. breite je
  * codepoint: 1 zelle (keine wcwidth-tabelle). */
 size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max);
+
+/* die anzeige-kopie des LETZTEN chat_wrap-aufrufs: alle texte des
+ * gewrappten bereichs dekodiert hintereinander. die ChatLine.off
+ * (tool == -1) zeigen hinein – der renderer liest texte NIE mehr
+ * direkt aus ChatMessage. chat_disp_off(mi) = start der nachricht
+ * mi in der kopie (fuer block-scan, tabellen, fence-highlight).
+ * gueltig bis zum naechsten chat_wrap (je frame neu). */
+const char *chat_disp_text(void);
+size_t chat_disp_off(size_t mi);
+void chat_free_disp(void);
 
 #endif

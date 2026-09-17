@@ -59,6 +59,47 @@ void md_scan(const char *text, size_t off, size_t len, bool line_start,
              MdLine *out);
 
 /* ------------------------------------------------------------------ */
+/* inline: **bold** und `code`                                        */
+/* ------------------------------------------------------------------ */
+
+/* span-typ eines inline-markup */
+typedef enum {
+    MD_INL_NONE = 0, /* kein span hier (plain) */
+    MD_INL_BOLD,     /* **text** oder __text__ */
+    MD_INL_CODE,     /* `text` */
+} MdInlineKind;
+
+/* inline-spans EINER zeile, geschachtelt: bold kann code
+ * enthalten (**`code`** = fett + hintergrund), code enthaelt nie
+ * markup (in ticks ist alles literal). die span-ranges umfassen
+ * die MARKER (die ticks/sterne) – der renderer blendet sie aus
+ * (md_inline_marker). streaming-sicher: ein marker ohne
+ * schliesser auf derselben zeile bleibt plain. */
+#define MD_INLINE_MAX 16 /* spans je zeile – ueberzaehlig = plain */
+
+typedef struct {
+    MdInlineKind kinds[MD_INLINE_MAX];
+    size_t start[MD_INLINE_MAX]; /* relativ zum zeilenanfang, INKL. marker */
+    size_t end[MD_INLINE_MAX];   /* exklusiv, INKL. marker */
+    int depth[MD_INLINE_MAX];    /* verschachtelungstiefe (0 = top) */
+    int n;
+} MdInline;
+
+/* die inline-spans der zeile [off,off+len) im text sammeln.
+ * rekursiv: in bold-spaenen wird nach code weitergesucht. ein
+ * span ohne schliesser auf der zeile bleibt plain. */
+void md_inline_scan(const char *text, size_t off, size_t len, MdInline *out);
+
+/* span-index mit der HOECHSTEN tiefe, der rel enthaelt; -1 =
+ * kein span. verschachtelte spans gewinnen (code in bold). */
+int md_inline_at(const MdInline *inl, size_t rel);
+
+/* ist rel ein marker-byte (tick / stern-paar / unterstrich-paar)?
+ * die marker werden vom renderer NICHT gedruckt; die anzeige
+ * zeigt nur den inhalt (rohdaten bleiben unveraendert). */
+bool md_inline_marker(const MdInline *inl, size_t rel);
+
+/* ------------------------------------------------------------------ */
 /* block-zustand                                                      */
 /* ------------------------------------------------------------------ */
 typedef enum {

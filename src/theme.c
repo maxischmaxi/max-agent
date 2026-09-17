@@ -62,6 +62,26 @@ const char *theme_role(ThemeRole role)
         role == THEME_ROLE_MD_KW) {
         return g_theme.match; /* folgt der akzentfarbe */
     }
+    if (role == THEME_ROLE_MD_BOLD) {
+        /* **bold**: nur die strichdicke, die farbe laeuft weiter
+         * (SGR 22 = bold off, nicht 39 – farbe bleibt) */
+        return "\x1b[1m";
+    }
+    if (role == THEME_ROLE_MD_CODE) {
+        /* `code`: leichter palette-hintergrund wie der der
+         * user-nachricht – auf hellen und dunklen terminals
+         * lesbar. die ticks selbst sind dim, der inhalt normal. */
+        return theme_role(THEME_ROLE_USER_BG);
+    }
+    if (role == THEME_ROLE_MD_OK || role == THEME_ROLE_MD_ERR) {
+        /* exit-codes des bash-tools: 0 ist gruen, != 0 rot – die
+         * palette-farben sind auf hellen UND dunklen terminals
+         * lesbar (wie die string-farbe des tokenizers) */
+        return (role == THEME_ROLE_MD_OK) ? "\x1b[32m" : "\x1b[31m";
+    }
+    if (role == THEME_ROLE_MORE) {
+        return theme_role(THEME_ROLE_DIM); /* der klemmen-hinweis */
+    }
     if (role == THEME_ROLE_MD_COMMENT) {
         return theme_role(THEME_ROLE_DIM); /* faint, wie beiwerk */
     }

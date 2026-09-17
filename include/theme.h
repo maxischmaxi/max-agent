@@ -32,6 +32,11 @@ typedef enum {
     THEME_ROLE_MD_STR,     /* string-literale                        */
     THEME_ROLE_MD_NUM,     /* zahlen                                 */
     THEME_ROLE_MD_COMMENT, /* kommentare (NULL = faint wie DIM)       */
+    THEME_ROLE_MD_OK,      /* erfolgreicher exit: code 0, gruen      */
+    THEME_ROLE_MD_ERR,     /* fehlgeschlagener exit: code != 0       */
+    THEME_ROLE_MD_BOLD,    /* **bold**: SGR bold, inhalt normal        */
+    THEME_ROLE_MD_CODE,    /* `code`: leichter hintergrund             */
+    THEME_ROLE_MORE,       /* "... und X weitere zeilen": klemme     */
     /* hintergrund der eigenen nachrichten: ein bisschen heller
      * (dunkles terminal) bzw. etwas abgesetzt (helles terminal)
      * als der normale hintergrund – so erkennt man eigene

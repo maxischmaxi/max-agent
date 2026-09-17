@@ -112,6 +112,31 @@ static void cap_free(Capture *c)
     c->text = NULL;
 }
 
+/* zeilenindex eines textes in der ausgabe; -1 wenn nicht da.
+ * die zeilen sind auf 80 zellen gepaddet, deshalb wird jede
+ * zeile einzeln geprueft: leerzeichen + inhalt + leerzeichen. */
+static int line_index_of(const char *text, const char *needle)
+{
+    int idx = 0;
+    const char *p = text;
+    size_t nl = strlen(needle);
+    while (*p != '\0') {
+        const char *eol = strchr(p, '\n');
+        size_t len = (eol != NULL) ? (size_t)(eol - p) : strlen(p);
+        size_t lead = strspn(p, " ");
+        if (lead + nl <= len && strncmp(p + lead, needle, nl) == 0 &&
+            strspn(p + lead + nl, " ") == len - lead - nl) {
+            return idx;
+        }
+        if (eol == NULL) {
+            break;
+        }
+        p = eol + 1;
+        idx++;
+    }
+    return -1;
+}
+
 /* anzahl der Zeilen, die nur aus leerzeichen bestehen (trenner) */
 static int count_blank_lines(const char *text)
 {
@@ -344,6 +369,8 @@ static void test_tool_rows(void)
     call->name = dup_str("bash");
     call->arguments = dup_str("{\"command\":\"echo hi\"}");
     CHECK(chat_set_tool_calls(&st.chat, call, 1) == 0);
+    /* der wrap-pass ueberliest die leerzeile vor dem exit-code:
+     * der code klebt direkt am output */
     CHECK(chat_append_tool(&st.chat, "call_1", "hi\n\n[exit: 0]") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "fertig") == 0);
 
@@ -359,7 +386,12 @@ static void test_tool_rows(void)
     /* ergebnis: "output:" vor dem inhalt, exit-code am ende */
     CHECK(strstr(c.text, "output:") != NULL);
     CHECK(strstr(c.text, "hi") != NULL);
-    CHECK(strstr(c.raw, "\x1b[32m[exit: 0]") != NULL); /* gruen bei 0 */
+    CHECK(strstr(c.raw, "\x1b[32mexit: 0") != NULL); /* gruen bei 0 */
+    CHECK(strstr(c.raw, "[exit: 0]") == NULL);       /* keine klammern */
+    /* direkt am output: der code ist die zeile DIREKT nach " hi",
+     * keine leerzeile dazwischen */
+    CHECK(line_index_of(c.text, "hi") != -1);
+    CHECK(line_index_of(c.text, "exit: 0") == line_index_of(c.text, "hi") + 1);
 
     /* exit-code != 0: rot */
     chat_clear(&st.chat);
@@ -379,7 +411,12 @@ static void test_tool_rows(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(strstr(c.raw, "\x1b[31m[exit: 3]") != NULL); /* rot bei != 0 */
+    CHECK(strstr(c.raw, "\x1b[31mexit: 3") != NULL); /* rot bei != 0 */
+    CHECK(strstr(c.raw, "[exit: 3]") == NULL);       /* keine klammern */
+    /* direkt am output: code = zeile direkt nach "boese" */
+    CHECK(line_index_of(c.text, "boese") != -1);
+    CHECK(line_index_of(c.text, "exit: 3") ==
+          line_index_of(c.text, "boese") + 1);
 
     cap_free(&c);
     input_free(&st.input);
@@ -698,6 +735,107 @@ static void test_tool_spinner(void)
  * zeile ueber dem eingabefeld die warnung; jede andere taste hebt
  * sie auf und die zeile ist wieder leer */
 /* ------------------------------------------------------------------ */
+/* inline-markup: **bold** und `code` – sgr-bold an/aus, hintergrund  */
+/* ------------------------------------------------------------------ */
+static void test_inline_markup(void)
+{
+    AppState st;
+    state_setup(&st);
+    Config cfg = {0};
+    Capture c = {0};
+
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT,
+                      "normal **fett** normal\n"
+                      "code: `max --help` ende\n"
+                      "unpaarig **kein schliesser\n"
+                      "leerer `` und nur `tick") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+
+    /* bold: inhalt zwischen SGR 1 (an) und 22 (aus, farbe bleibt) */
+    CHECK(strstr(c.raw, "\x1b[1mfett\x1b[22m") != NULL);
+    /* die sterne-marker sind NICHT in der anzeige */
+    CHECK(strstr(c.text, "**fett**") == NULL);
+    CHECK(strstr(c.text, "fett") != NULL);
+    /* inline-code: hintergrund um den inhalt, danach BG off */
+    CHECK(strstr(c.raw, "\x1b[48;5;") != NULL);
+    CHECK(strstr(c.raw, "max --help\x1b[22;39;49m") != NULL);
+    /* die ticks um den code sind NICHT in der anzeige */
+    CHECK(strstr(c.text, "`max --help`") == NULL);
+    CHECK(strstr(c.text, "max --help") != NULL);
+    /* unpaariger bold: KEIN \x1b[1m davor an dieser stelle */
+    CHECK(strstr(c.raw, "\x1b[1mkein schliesser") == NULL);
+    CHECK(strstr(c.text, "**kein schliesser") != NULL); /* literal da */
+    /* doppeltick: kein leeres code-span, kein bold */
+    CHECK(strstr(c.raw, "\x1b[48;5;``") == NULL);
+
+    /* user-nachricht: KEIN markup (literal bleiben) */
+    chat_clear(&st.chat);
+    draw_content_reset();
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "ich tippe `dollar`") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    /* die user-zeile hat ihren eigenen hintergrund – markup waere
+     * aber: BG-OFF mitten in der zeile (code-span-ende) plus dim
+     * tick um das wort. beides darf es NICHT geben */
+    CHECK(strstr(c.raw, "dollar\x1b[22;39;49m") == NULL);
+    /* die ticks bleiben literal (kein markup bei user) */
+    CHECK(strstr(c.text, "`dollar`") != NULL);
+
+    /* bold in listen und headline */
+    chat_clear(&st.chat);
+    draw_content_reset();
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT,
+                      "- punkt mit **fett**\n# ueber `tick`") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.raw, "\x1b[1mfett\x1b[22m") != NULL);
+    CHECK(strstr(c.raw, "tick\x1b[22;39;49m") != NULL);
+
+    cap_free(&c);
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
+/* verschachteltes markup: **`code`** (fett+hintergrund) und
+ * **`**bold**`** (code-schliesser uebersteuert bold-sterne) */
+static void test_inline_nested(void)
+{
+    AppState st;
+    state_setup(&st);
+    Config cfg = {0};
+    Capture c = {0};
+
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT,
+                      "fett-code: **`x`**\n"
+                      "versteckt: **`**bold**`**\n"
+                      "gemischt: **fett `code` weiter**\n") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+
+    /* fett+bg zusammen in einem byte-bereich */
+    CHECK(strstr(c.raw, "\x1b[1m\x1b[48;5;") != NULL);
+    /* die ticks/sterne-marker fehlen in der anzeige */
+    CHECK(strstr(c.text, "**`x`**") == NULL);
+    CHECK(strstr(c.text, "**`**bold**`**") == NULL);
+    CHECK(strstr(c.text, "x") != NULL);
+    /* code-inhalt: sterne literal, kein weiteres fett */
+    CHECK(strstr(c.raw, "**bold**\x1b[22;39;49m") != NULL ||
+          strstr(c.raw, "**bold**") != NULL);
+    /* gemischt: fett an, code-bg im fett, fett aus */
+    CHECK(strstr(c.raw, "\x1b[1mfett ") != NULL);
+    CHECK(strstr(c.raw, "code\x1b[22;39;49m weiter\x1b[22m") != NULL);
+
+    cap_free(&c);
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
+/* ------------------------------------------------------------------ */
 /* markdown: ueberschriften, listen, zitate am originalen zeilenanfang  */
 /* ------------------------------------------------------------------ */
 static void test_markdown(void)
@@ -770,6 +908,146 @@ static void test_quit_warning(void)
     chat_free(&st.chat);
 }
 
+/* ------------------------------------------------------------------ */
+/* escape-dekodierung: \n wird echte newline, \t spacen, \uXXXX zeichen  */
+/* ------------------------------------------------------------------ */
+static void test_escapes_rendered(void)
+{
+    AppState st;
+    state_setup(&st);
+    Config cfg = {0};
+    Capture c = {0};
+
+    /* das gemeldete szenario: die ki antwortet mit literalen escapes */
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT,
+                      "zeile 1\\nzeile 2\\n\\nabsatz") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.text, " zeile 1") != NULL);
+    CHECK(strstr(c.text, " zeile 2") != NULL); /* echte newlines */
+    CHECK(strstr(c.text, " absatz") != NULL);
+    CHECK(strstr(c.text, "\\n") == NULL);      /* escapes weg */
+    CHECK(count_str(c.text, " zeile 1") == 1); /* einmal, nicht doppelt */
+
+    chat_clear(&st.chat);
+    draw_content_reset();
+
+    /* tabs + quotes + umlaute */
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT,
+                      "a\\tb \\\"q\\\" \\u00e4\\u00f6 \\u2713") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.text, "a    b") != NULL);           /* tab -> 4 spacen */
+    CHECK(strstr(c.text, "\"q\"") != NULL);            /* quote dekodiert */
+    CHECK(strstr(c.text, "\xC3\xA4\xC3\xB6") != NULL); /* umlaute */
+    CHECK(strstr(c.text, "\xE2\x9C\x93") != NULL);     /* haekchen */
+
+    chat_clear(&st.chat);
+    draw_content_reset();
+
+    /* user-nachrichten genauso */
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "u1\\nu2") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.text, " u1") != NULL);
+    CHECK(strstr(c.text, " u2") != NULL);
+
+    /* kaputte escapes bleiben literal (kein crash, kein datenverlust) */
+    chat_clear(&st.chat);
+    draw_content_reset();
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "\\u00zz \\ \\x") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.text, "\\u00zz") != NULL);
+
+    cap_free(&c);
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
+/* ------------------------------------------------------------------ */
+/* klemme: nachricht > 75% fensterhoehe -> unten zeilen weg, grauer    */
+/* hinweis + letzte zeile bleibt (resize-sicher, je frame neu)         */
+/* ------------------------------------------------------------------ */
+static void test_clamp(void)
+{
+    AppState st;
+    state_setup(&st);
+    Config cfg = {0};
+    Capture c = {0};
+
+    /* 30 zeilen in einer nachricht, fenster 24 zeilen:
+     * (24*75)/100 = 18 zeilen budget, d.h. 17 content-zeilen
+     * sichtbar, dann der hinweis, dann die letzte zeile */
+    char buf[512];
+    buf[0] = '\0';
+    for (int i = 1; i <= 30; i++) {
+        char ln[32];
+        snprintf(ln, sizeof ln, "zeile %02d\\n", i);
+        strcat(buf, ln);
+    }
+    strcat(buf, "letzte zeile");
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, buf) == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(line_index_of(c.text, "zeile 01") != -1);     /* anfang da */
+    CHECK(line_index_of(c.text, "zeile 17") != -1);     /* head voll */
+    CHECK(line_index_of(c.text, "zeile 18") == -1);     /* weggeklemmt */
+    CHECK(strstr(c.text, "weitere zeilen") != NULL);    /* hinweis grau */
+    CHECK(line_index_of(c.text, "letzte zeile") != -1); /* letzte bleibt */
+    /* hinweis zaehlt zeilen 18..30 = 13 zeilen (die 31. zeile
+     * "letzte zeile" wird ja als letzte gezeigt) */
+    CHECK(strstr(c.text, "13 weitere zeilen") != NULL);
+
+    /* resize hoeher: wie nach einem echten resize (draw_reset mit
+     * full_reprint) wird der ganze chat neu gedruckt – jetzt ohne
+     * klemme, alle 30 zeilen passen locker ins 48-zeilen-fenster */
+    draw_content_reset();
+    cap_open(&c);
+    draw(48, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(line_index_of(c.text, "letzte zeile") != -1);
+    CHECK(line_index_of(c.text, "zeile 18") != -1);
+    CHECK(line_index_of(c.text, "zeile 30") != -1);
+    CHECK(strstr(c.text, "weitere zeilen") == NULL);
+
+    /* resize schmaler zurueck: klemmt wieder (glecher voller frame) */
+    draw_content_reset();
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.text, "weitere zeilen") != NULL);
+    CHECK(line_index_of(c.text, "letzte zeile") != -1);
+
+    /* exit-code bleibt: tool-ergebnis klemmt, code sichtbar */
+    chat_clear(&st.chat);
+    draw_content_reset();
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "mach") == 0);
+    buf[0] = '\0';
+    for (int i = 1; i <= 30; i++) {
+        char ln[32];
+        snprintf(ln, sizeof ln, "out %02d\\n", i);
+        strcat(buf, ln);
+    }
+    strcat(buf, "[exit: 0]");
+    CHECK(chat_append_tool(&st.chat, "c", buf) == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.text, " out 01") != NULL); /* anfang da */
+    CHECK(strstr(c.text, "weitere zeilen") != NULL);
+    CHECK(strstr(c.raw, "\x1b[32mexit: 0") != NULL); /* code bleibt gruen */
+
+    cap_free(&c);
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
 int main(void)
 {
     test_print_once();
@@ -785,5 +1063,9 @@ int main(void)
     test_tool_spinner();
     test_quit_warning();
     test_markdown();
+    test_inline_markup();
+    test_inline_nested();
+    test_escapes_rendered();
+    test_clamp();
     return test_report();
 }

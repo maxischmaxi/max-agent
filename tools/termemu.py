@@ -92,11 +92,33 @@ class Term:
                 continue
             if self.cur_row >= self.rows:
                 self.cur_row = self.rows - 1
+            if self.cur_col >= self.cols:
+                self.cur_col = self.cols - 1
             line = self.screen[self.cur_row]
             if self.cur_col < self.cols:
                 line[self.cur_col] = c
             self.cur_col += 1
             i += 1
+
+    def resize(self, rows, cols):
+        """fenster neue groesse: screen-array anpassen, cursor
+        einklemmen. scrollback-zeilen fallen einfach weg (wie im
+        echten terminal)."""
+        self.rows = rows
+        self.cols = cols
+        while len(self.screen) > rows:
+            self.screen.pop(0)
+        while len(self.screen) < rows:
+            self.screen.insert(0, list(" " * cols))
+        for ln in self.screen:
+            if len(ln) < cols:
+                ln.extend(" " * (cols - len(ln)))
+            else:
+                del ln[cols:]
+        if self.cur_row >= rows:
+            self.cur_row = rows - 1
+        if self.cur_col >= cols:
+            self.cur_col = 0
 
     def text(self):
         return "\n".join("".join(l).rstrip() for l in self.screen)
