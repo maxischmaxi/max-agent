@@ -153,7 +153,7 @@ static void state_setup(AppState *st)
     FILE *devnull = fopen("/dev/null", "w");
     if (devnull != NULL) {
         draw_set_out(devnull);
-        draw_reset(24);
+        draw_reset(24, false);
         fclose(devnull);
         draw_set_out(NULL);
     }

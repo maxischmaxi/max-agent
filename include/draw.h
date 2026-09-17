@@ -23,7 +23,7 @@
 /*    wort bzw. der thinking-hinweis) und der dock: eingabefeld,      */
 /*    befehlsliste, dialoge und die zwei statuszeilen                */
 /*  - der renderer ist rein relativ: der cursor parkt nach jedem     */
-/*    frame auf der letzten dock-zeile, im naechsten frame werden     */
+/*    frame auf der letzten dock-zeile, im naechsten frame werden    */
 /*    genau die vorherigen live+dock-zeilen geraeumt, der neue block  */
 /*    gedruckt und die zwischenzeilen-\n scrollen am bildschirm-     */
 /*    rand ganz von selbst – eine absolute cursor-position wird       */
@@ -37,8 +37,12 @@ void draw(int rows, int cols, AppState *state, const Config *cfg);
 
 /* nach SIGWINCH: das terminal hat umgebrochen, der relative
  * cursor-zustand ist unbrauchbar – bis zum boden scrollen und den
- * dock frisch aufsetzen. */
-void draw_reset(int rows);
+ * dock frisch aufsetzen. draw_tail_only=true druckt danach noch
+ * den schwanz des chats, der auf EINEN bildschirm passt (nach dem
+ * umbrechen ist der alte content im scrollback unbraeuchlich
+ * zerlegt): der benutzer sieht sofort wieder unterhaltung UND
+ * dock, ohne erst eine taste drucken zu muessen. */
+void draw_reset(int rows, bool draw_tail_only);
 
 /* leichter frame waehrend die ki arbeitet: nur die spinner-zeile(n)
  * werden in ort und stelle ueberschrieben, der rest des docks

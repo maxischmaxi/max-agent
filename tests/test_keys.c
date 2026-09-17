@@ -15,6 +15,12 @@
 #include "test.h"
 #include "utils.h"
 
+/* handle_key will rows/cols als zeiger (resize-synchronisation).
+ * die tests interessieren sich nicht dafuer: zwei globale paare
+ * genuegen, zurueckschreiben ist egal. */
+static int g_rows = 24;
+static int g_cols_80 = 80;
+
 static void test_key_from_byte(void)
 {
     CHECK(key_from_byte('a').kind == KEY_CHAR);
@@ -330,25 +336,25 @@ static void test_history_keys(void)
 
     /* --- leeres feld: hoch holt den juengsten eintrag --- */
     keys_unread("\x1b[A", 3); /* pfeil hoch */
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.count == 1);
     CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
 
     keys_unread("\x1b[A", 3);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(strcmp(st.input.lines[0], "alte frage") == 0);
 
     /* am aeltesten ende bleibt die eingabe stehen */
     keys_unread("\x1b[A", 3);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(strcmp(st.input.lines[0], "alte frage") == 0);
 
     /* runter fuehrt zurueck bis zum leeren entwurf */
     keys_unread("\x1b[B", 3); /* pfeil runter */
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
     keys_unread("\x1b[B", 3);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.lines[0][0] == '\0'); /* entwurf war leer */
 
     /* --- mehrzeilig: die pfeile wechseln erst die zeile --- */
@@ -356,24 +362,24 @@ static void test_history_keys(void)
     CHECK(st.input.cursor_line == 2);
 
     keys_unread("\x1b[A", 3);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.cursor_line == 1); /* nur cursor, text bleibt */
     CHECK(st.input.count == 3);
 
     keys_unread("\x1b[A", 3);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.cursor_line == 0);
     CHECK(st.input.count == 3);
 
     /* erst OBEN angekommen geht es in die history */
     keys_unread("\x1b[A", 3);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.count == 1);
     CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
 
     /* der mehrzeilige entwurf kommt vollstaendig zurueck */
     keys_unread("\x1b[B", 3);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.count == 3);
     CHECK(strcmp(st.input.lines[0], "zeile1") == 0);
     CHECK(strcmp(st.input.lines[2], "zeile3") == 0);
@@ -382,20 +388,20 @@ static void test_history_keys(void)
     input_set_text(&st.input, "a\nb");
     CHECK(st.input.cursor_line == 1);
     keys_unread("\x10", 1); /* ctrl+p, mitten in der eingabe */
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.count == 1);
     CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
     keys_unread("\x0e", 1); /* ctrl+n */
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.count == 2);
     CHECK(strcmp(st.input.lines[0], "a") == 0);
 
     /* --- escape verwirft den entwurf --- */
     keys_unread("\x10", 1); /* ctrl+p: history, egal welche zeile */
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(strcmp(st.input.lines[0], "neue frage") == 0);
     keys_unread("\x1b", 1); /* escape */
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.input.lines[0][0] == '\0');
     CHECK(st.history.pos == 0);
     CHECK(st.history.draft == NULL);
@@ -443,27 +449,27 @@ static void test_prompt_setting(void)
     snprintf(st.dialog.search, sizeof st.dialog.search, "system");
     CHECK(ui_mode(&st) == MODE_SETTINGS);
     keys_unread("\r", 1);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.prompt_sub);
     CHECK(ui_mode(&st) == MODE_PROMPT);
 
     /* --- "off" setzt den leeren string --- */
     snprintf(st.dialog.search, sizeof st.dialog.search, "off");
     keys_unread("\r", 1);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(cfg.system_prompt != NULL && cfg.system_prompt[0] == '\0');
     CHECK(st.prompt_sub); /* dialog bleibt offen */
 
     /* --- "default" setzt zurueck auf NULL --- */
     snprintf(st.dialog.search, sizeof st.dialog.search, "default");
     keys_unread("\r", 1);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(cfg.system_prompt == NULL);
 
     /* --- "edit" schliesst den dialog und oeffnet das feld --- */
     snprintf(st.dialog.search, sizeof st.dialog.search, "edit");
     keys_unread("\r", 1);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.prompt_edit);
     CHECK(!st.settings_dialog);
     CHECK(!st.prompt_sub);
@@ -472,9 +478,9 @@ static void test_prompt_setting(void)
 
     /* tippen und speichern */
     keys_unread("du bist knapp\r", 14);
-    handle_key(&st, &cfg, 24, 80); /* 'd' */
+    handle_key(&st, &cfg, &g_rows, &g_cols_80); /* 'd' */
     for (int i = 0; i < 13; i++) {
-        handle_key(&st, &cfg, 24, 80);
+        handle_key(&st, &cfg, &g_rows, &g_cols_80);
     }
     CHECK(!st.prompt_edit); /* enter hat gespeichert */
     CHECK(cfg.system_prompt != NULL &&
@@ -490,15 +496,15 @@ static void test_prompt_setting(void)
     st.dialog = (DialogState){0};
     snprintf(st.dialog.search, sizeof st.dialog.search, "edit");
     keys_unread("\r", 1);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(st.prompt_edit);
     CHECK(strcmp(st.input.lines[0], "du bist knapp") == 0);
 
     /* --- escape verwirft die bearbeitung --- */
     keys_unread("x", 1);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     keys_unread("\x1b", 1);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(!st.prompt_edit);
     CHECK(cfg.system_prompt != NULL &&
           strcmp(cfg.system_prompt, "du bist knapp") == 0); /* unveraendert */
@@ -507,7 +513,7 @@ static void test_prompt_setting(void)
     st.prompt_edit = true;
     input_set_text(&st.input, "");
     keys_unread("\r", 1);
-    handle_key(&st, &cfg, 24, 80);
+    handle_key(&st, &cfg, &g_rows, &g_cols_80);
     CHECK(cfg.system_prompt == NULL);
     CHECK(!st.prompt_edit);
 
@@ -575,7 +581,7 @@ static void test_wrapped_arrows(void)
     /* zweimal hoch: bleibt im text, history unberuehrt */
     for (int i = 0; i < 2; i++) {
         keys_unread("\x1b[A", 3);
-        handle_key(&st, &cfg, 24, cols);
+        handle_key(&st, &cfg, &g_rows, (int *)&cols);
         CHECK(st.input.count == 1);
         CHECK(strcmp(st.input.lines[0], lang) == 0);
     }
@@ -584,7 +590,7 @@ static void test_wrapped_arrows(void)
 
     /* erst JETZT greift die history */
     keys_unread("\x1b[A", 3);
-    handle_key(&st, &cfg, 24, cols);
+    handle_key(&st, &cfg, &g_rows, (int *)&cols);
     CHECK(strcmp(st.input.lines[0], "alter eintrag") == 0);
 
     free(lang);

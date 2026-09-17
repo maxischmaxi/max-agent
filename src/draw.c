@@ -882,9 +882,9 @@ void draw_content_reset(void)
     g_tail_only = true;
 }
 
-void draw_reset(int rows)
+void draw_reset(int rows, bool tail_only)
 {
-    dbg("draw: reset (%d zeilen scrollen)", rows);
+    dbg("draw: reset (%d zeilen scrollen, tail=%d)", rows, (int)tail_only);
     /* nach einem resize hat das terminal umgebrochen – der
      * relative cursor-zustand ist unbrauchbar. bis zum boden
      * scrollen (der cursor sitzt danach garantiert unten) und den
@@ -896,6 +896,15 @@ void draw_reset(int rows)
     g_prev_rows = 0;
     g_busy_up = 0; /* layout ungueltig: nur volle frames */
     g_tool_spin_up = 0;
+    /* der alte content ist im scrollback falsch umbrochen – dort
+     * steht er zerlegt und unlesbar. nur der schwanz, der auf
+     * EINEN bildschirm passt, wird im naechsten frame neu
+     * gedruckt (dasselbe verfahren wie bei /new und resume). die
+     * frontier (g_printed) faellt zurueck und der renderer
+     * druckt ab dem berechneten start neu. */
+    if (tail_only) {
+        g_tail_only = true;
+    }
 }
 
 /* ------------------------------------------------------------------ */

@@ -991,9 +991,40 @@ typedef struct {
     int cols;
 } StreamRedrawCtx;
 
+/* rows/cols im kontext sind die groesse beim turn-beginn. waehrend
+ * die ki arbeitet kann das fenster resized werden – der
+ * watchdog-tick bemerkt das flag, vermesst das terminal neu,
+ * verankert den renderer und aktualisiert den kontext: danach
+ * zeichnen alle weiteren redraws/ticks mit den echten werten.
+ * rueckgabe: true, wenn neu verankert wurde (der aufrufer sollte
+ * sofort voll zeichnen). */
+static bool stream_sync_size(StreamRedrawCtx *rc)
+{
+    if (!rc->state->resized) {
+        return false;
+    }
+    rc->state->resized = 0;
+    int rows = rc->rows;
+    int cols = rc->cols;
+    if (term_size(&rows, &cols) == 0) {
+        rc->rows = rows;
+        rc->cols = cols;
+    }
+    dbg("resize (busy): %dx%d", rc->rows, rc->cols);
+    draw_reset(rc->rows, true);
+    return true;
+}
+
 static void stream_redraw(void *ud)
 {
     StreamRedrawCtx *rc = ud;
+    if (stream_sync_size(rc)) {
+        /* nach dem resize den schwanz sofort voll drucken – ein
+         * leichter tick wuerde nur die spinner zeichnen und der
+         * bildschirm bliebe bis zum naechsten chunk leer */
+        draw(rc->rows, rc->cols, rc->state, rc->cfg);
+        return;
+    }
     draw(rc->rows, rc->cols, rc->state, rc->cfg);
 }
 
@@ -1001,6 +1032,10 @@ static void stream_redraw(void *ud)
 static void stream_tick(void *ud)
 {
     StreamRedrawCtx *rc = ud;
+    if (stream_sync_size(rc)) {
+        draw(rc->rows, rc->cols, rc->state, rc->cfg);
+        return;
+    }
     draw_busy_tick(rc->rows, rc->cols, rc->state, rc->cfg);
 }
 
@@ -1034,10 +1069,18 @@ static void cmd_parse(const AppState *st, char *word, size_t word_sz,
     }
 }
 
-static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
+static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
+                       Key k)
 {
     /* kurzform: die chat-eingabe liegt als member im state */
     Input *input = &state->input;
+    /* lokale kopie: waehrend eines turns kann das fenster resized
+     * werden (stream_sync_size aktualisiert den StreamRedrawCtx,
+     * nicht die variablen des main-loops). nach dem turn steht
+     * die echte groesse im kontext – der rufenden schleife wird
+     * sie per zeiger mitgeteilt */
+    int r = *rows;
+    int c = *cols;
 
     if (state->confirm_quit) {
         state->confirm_quit = false;
@@ -1046,7 +1089,7 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
 
     switch (k.kind) {
     case KEY_NEWLINE:
-        input_newline(input, rows, cmd_list_height(state), state->confirm_quit);
+        input_newline(input, r, cmd_list_height(state), state->confirm_quit);
         state->dirty = true;
         break;
     case KEY_ENTER: {
@@ -1171,12 +1214,12 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
 
                 state->busy = true;
                 state->busy_start_ms = mono_ms();
-                draw(rows, cols, state, cfg);
+                draw(r, c, state, cfg);
                 StreamRedrawCtx rc = {
                     .state = state,
                     .cfg = cfg,
-                    .rows = rows,
-                    .cols = cols,
+                    .rows = r,
+                    .cols = c,
                 };
                 SendHooks hooks = {
                     .ctx = &rc,
@@ -1185,6 +1228,17 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
                 };
                 (void)send_stream(state, cfg, &hooks);
                 state->busy = false;
+                /* hat der watchdog ein resize bemerkt, kennt nur der
+                 * kontext die neue groesse – sie gehoert auch in die
+                 * variablen des main-loops, sonst zeichnet das erste
+                 * frame nach dem turn mit der alten breite */
+                if (rc.rows != r || rc.cols != c) {
+                    r = rc.rows;
+                    c = rc.cols;
+                    if (state->resized) {
+                        state->resized = 0;
+                    }
+                }
                 /* turn vorbei: die arbeitszeit in die gesamt-
                  * buchhaltung und die session schreiben. gescheiterter
                  * turn zaehlt nicht (kein busy_start gesetzt) */
@@ -1228,7 +1282,7 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
             cmd_prefix(input, prefix, sizeof(prefix));
             int m = cmd_match(prefix, idx, COMMAND_COUNT);
             if (m > 0) {
-                autocomplete_command(input, idx[0], main_width(cols));
+                autocomplete_command(input, idx[0], main_width(c));
             }
         }
         state->dirty =
@@ -1349,14 +1403,14 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
          * der zweiten haelfte einer umgebrochenen zeile, soll pfeil-
          * hoch sichtbar eine zeile hoch gehen und nicht die history
          * aufrufen. */
-        if (input_screen_up(input, input_field_width(cols))) {
+        if (input_screen_up(input, input_field_width(c))) {
             state->dirty = true;
             break;
         }
         history_back(state, input);
         break;
     case KEY_DOWN:
-        if (input_screen_down(input, input_field_width(cols))) {
+        if (input_screen_down(input, input_field_width(c))) {
             state->dirty = true;
             break;
         }
@@ -1380,9 +1434,12 @@ static void handle_all(AppState *state, Config *cfg, int rows, int cols, Key k)
          * mehr, der verlauf lebt im scrollback */
         break;
     }
+
+    *rows = r;
+    *cols = c;
 }
 
-void handle_key(AppState *state, Config *cfg, int rows, int cols)
+void handle_key(AppState *state, Config *cfg, int *rows, int *cols)
 {
     Key k = key_read();
 
