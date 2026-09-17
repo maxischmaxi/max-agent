@@ -19,7 +19,7 @@ import fcntl
 import termios
 import time
 
-BIN = "./build/debug/max-agent"
+BIN = "./build/debug/max"
 ROWS, COLS = 24, 80
 
 

@@ -4,13 +4,18 @@
 #   make BUILD=release     release build
 #   make run ARGS="a b"    build and run with arguments
 #   make test              build and run all tests
+#   make install           build release and install to /usr/local/bin/max
+#   make uninstall         remove the installed binary
 #   make CC=clang          use a different compiler
 #   make V=1               show full compiler commands
 #   make help              list all targets
 # ---------------------------------------------------------------------------
 
-BIN      ?= $(notdir $(CURDIR))
+BIN      := max
 BUILD    ?= debug
+PREFIX   ?= /usr/local
+BINDIR   ?= $(PREFIX)/bin
+DESTDIR  ?=
 STD      ?= c17
 SANITIZE ?= 1
 V        ?= 0
@@ -22,6 +27,9 @@ BUILD_DIR := build
 OUT_DIR   := $(BUILD_DIR)/$(BUILD)
 OBJ_DIR   := $(OUT_DIR)/obj
 TARGET    := $(OUT_DIR)/$(BIN)
+# what 'make install' builds and copies, independent of BUILD
+RELEASE_BIN := $(BUILD_DIR)/release/$(BIN)
+INSTALLED   := $(DESTDIR)$(BINDIR)/$(BIN)
 
 # --- flags -----------------------------------------------------------------
 
@@ -69,7 +77,7 @@ LIB_OBJS  := $(filter-out %/main.o,$(OBJS))
 # --- targets ---------------------------------------------------------------
 
 .DEFAULT_GOAL := all
-.PHONY: all release run test clean format format-check lint help
+.PHONY: all release run test install uninstall clean format format-check lint help
 
 all: $(TARGET) compile_commands.json ## build (default, BUILD=debug)
 
@@ -82,6 +90,20 @@ run: $(TARGET) ## build and run, pass arguments with ARGS="..."
 test: $(TEST_BINS) ## build and run all tests
 	@for t in $(TEST_BINS); do echo "  RUN     $$t"; ./$$t || exit 1; done
 	@echo "all tests passed"
+
+install: ## build release and install to BINDIR (default /usr/local/bin/max)
+	@$(MAKE) --no-print-directory BUILD=release $(RELEASE_BIN)
+	@mkdir -p $(DESTDIR)$(BINDIR)
+	@echo "  INSTALL $(INSTALLED)"
+	$(Q)install -m 755 $(RELEASE_BIN) $(INSTALLED)
+
+uninstall: ## remove the installed binary
+	@if [ -e "$(INSTALLED)" ]; then \
+	   echo "  RM      $(INSTALLED)"; \
+	   rm -f "$(INSTALLED)"; \
+	 else \
+	   echo "  nothing installed at $(INSTALLED)"; \
+	 fi
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
