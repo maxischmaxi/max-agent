@@ -299,8 +299,8 @@ static void wrap_emit(ChatRole role, size_t msg, size_t off, size_t len,
  * im ORIGINAL-text, damit der renderer sie (fuer die farbe)
  * identifizieren kann. */
 static void wrap_table(ChatRole role, size_t msg, const char *text,
-                       size_t start, size_t end, int full_width,
-                       ChatLine *out, size_t out_max, size_t *count)
+                       size_t start, size_t end, int full_width, ChatLine *out,
+                       size_t out_max, size_t *count)
 {
     char *disp = md_table_display(text, start, end, full_width);
     if (disp == NULL) {
@@ -523,8 +523,8 @@ static void wrap_tool_call(ChatRole role, size_t msg, int tool,
                           tool, out, out_max, count);
                 next = brk + 1;
             } else {
-                wrap_emit(role, msg, off, i - off, first_line, first_line,
-                          tool, out, out_max, count);
+                wrap_emit(role, msg, off, i - off, first_line, first_line, tool,
+                          out, out_max, count);
                 next = i;
             }
             first_line = false;
@@ -654,8 +654,8 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
                               out_max, &count);
                     first = false;
                     lstart = false; /* umbruch, kein original-\n */
-                    off = i; /* i bleibt: das ueberlaufende zeichen */
-                             /* startet die naechste zeile         */
+                    off = i;        /* i bleibt: das ueberlaufende zeichen */
+                                    /* startet die naechste zeile         */
                 }
                 cells = 0;
                 brk = SIZE_MAX;

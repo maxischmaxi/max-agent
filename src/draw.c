@@ -174,8 +174,8 @@ static void row_no_match(Row *r, const char *prefix);
 /* mehr nicht (sehr schmale terminals schneiden dann ab).            */
 /* ------------------------------------------------------------------ */
 #define STATUS_MAX_LINES 3
-#define STATUS_SEG_MAX 24
-#define STATUS_LABEL_W 9 /* "model   " / "tokens  " + leerzeichen */
+#define STATUS_SEG_MAX   24
+#define STATUS_LABEL_W   9 /* "model   " / "tokens  " + leerzeichen */
 
 /* segment-text inline: die zahlen/dauern entstehen in lokalen
  * puffern der seg-builder – ein pointer darauf waere nach deren
@@ -186,7 +186,7 @@ static void row_no_match(Row *r, const char *prefix);
 typedef struct {
     char text[STATUS_SEG_TEXT]; /* utf-8, '\0'-terminiert */
     const char *sgr;            /* farbsequenz oder NULL = dim */
-    bool sep_before;  /* "  \xC2\xB7  " gehoert zu diesem segment */
+    bool sep_before;            /* "  \xC2\xB7  " gehoert zu diesem segment */
 } StatusSeg;
 
 typedef struct {
@@ -676,8 +676,8 @@ static int st_fill(const StatusLine *l, int *idx, int width, int *cell,
                     * abgeschnitten statt umgebrochen */
         }
         if (!dry) {
-            const char *sgr = (s->sgr != NULL) ? s->sgr
-                                               : theme_role(THEME_ROLE_DIM);
+            const char *sgr =
+                (s->sgr != NULL) ? s->sgr : theme_role(THEME_ROLE_DIM);
             if (s->sep_before) {
                 /* trenner + segment teilen sich die farbe: der
                  * trenner ist immer DIM, das segment kann farbig
@@ -727,8 +727,8 @@ static int st_lines(const StatusLine *l, int width)
     int lines = 0;
     while (lines < STATUS_MAX_LINES) {
         int cell = 0;
-        if (!st_fill(l, &idx, width, &cell, lines, STATUS_MAX_LINES - 1,
-                     true, NULL)) {
+        if (!st_fill(l, &idx, width, &cell, lines, STATUS_MAX_LINES - 1, true,
+                     NULL)) {
             break;
         }
         lines++;
@@ -773,15 +773,14 @@ static void row_status_model(Row *r, const Config *cfg, int sub)
     int idx = 0;
     for (int i = 0; i < sub; i++) {
         int cell = 0;
-        if (!st_fill(&l, &idx, width, &cell, i, STATUS_MAX_LINES - 1,
-                     true, NULL)) {
+        if (!st_fill(&l, &idx, width, &cell, i, STATUS_MAX_LINES - 1, true,
+                     NULL)) {
             return; /* sub jenseits des inhalts: leer bleibt leer */
         }
     }
     status_label(r, (sub == 0) ? "model   " : "        ");
     int cell = 0;
-    (void)st_fill(&l, &idx, width, &cell, sub, STATUS_MAX_LINES - 1,
-                  false, r);
+    (void)st_fill(&l, &idx, width, &cell, sub, STATUS_MAX_LINES - 1, false, r);
 }
 
 /* segmente der token-zeile: verbrauch, arbeitszeit, session und –
@@ -814,8 +813,8 @@ static void status_token_segs(StatusLine *l, const AppState *st)
             /* name farbig, dahinter die id: der trenner zwischen
              * beiden gehoert zur id (sep_before) */
             st_add(l, "session", NULL, true);
-            st_add(l, st->session.name,
-                   theme_role(THEME_ROLE_ASSISTANT), false);
+            st_add(l, st->session.name, theme_role(THEME_ROLE_ASSISTANT),
+                   false);
             st_add(l, st->session.id, NULL, true);
         } else {
             /* ohne namen: "session ID" als EIN segment (das alte
@@ -826,8 +825,7 @@ static void status_token_segs(StatusLine *l, const AppState *st)
     }
     if (dbg_active()) {
         char dbg[STATUS_SEG_TEXT];
-        (void)snprintf(dbg, sizeof dbg, "debug mode, log file: %s",
-                       dbg_path());
+        (void)snprintf(dbg, sizeof dbg, "debug mode, log file: %s", dbg_path());
         st_add(l, dbg, NULL, true);
     }
 }
@@ -844,15 +842,14 @@ static void row_status_tokens(Row *r, const AppState *st, int sub)
     int idx = 0;
     for (int i = 0; i < sub; i++) {
         int cell = 0;
-        if (!st_fill(&l, &idx, width, &cell, i, STATUS_MAX_LINES - 1,
-                     true, NULL)) {
+        if (!st_fill(&l, &idx, width, &cell, i, STATUS_MAX_LINES - 1, true,
+                     NULL)) {
             return;
         }
     }
     status_label(r, (sub == 0) ? "tokens  " : "        ");
     int cell = 0;
-    (void)st_fill(&l, &idx, width, &cell, sub, STATUS_MAX_LINES - 1,
-                  false, r);
+    (void)st_fill(&l, &idx, width, &cell, sub, STATUS_MAX_LINES - 1, false, r);
 }
 
 static void row_quit(Row *r)
@@ -891,9 +888,8 @@ static bool g_msg_blocks_valid = false;
 static void row_code(Row *r, const ChatLine *ln, const char *text,
                      const char *lang)
 {
-    bool fence_line =
-        (ln->lstart && ln->len >= 3 && text[ln->off] == '`' &&
-         text[ln->off + 1] == '`' && text[ln->off + 2] == '`');
+    bool fence_line = (ln->lstart && ln->len >= 3 && text[ln->off] == '`' &&
+                       text[ln->off + 1] == '`' && text[ln->off + 2] == '`');
 
     if (fence_line) {
         row_sgr(r, theme_role(THEME_ROLE_DIM));
@@ -1209,8 +1205,7 @@ void draw_content_reset(void)
 
 void draw_reset(int rows, bool full_reprint)
 {
-    dbg("draw: reset (%d zeilen scrollen, full=%d)", rows,
-        (int)full_reprint);
+    dbg("draw: reset (%d zeilen scrollen, full=%d)", rows, (int)full_reprint);
     /* nach einem resize hat das terminal umgebrochen – der
      * relative cursor-zustand ist unbrauchbar. bis zum boden
      * scrollen (der cursor sitzt danach garantiert unten) und den
@@ -1292,10 +1287,10 @@ typedef struct {
     int match_count;
     int id_col;
     int name_col;
-    int sel_idx;       /* flacher index des angewaehlten eintrags */
-    long long busy_ms; /* laufende arbeitszeit des turns (spinner) */
-    int busy_row_up;   /* spinner-rahmen: zeilen ueber dem geparkten
-                        * cursor (anker fuer den leichten tick) */
+    int sel_idx;            /* flacher index des angewaehlten eintrags */
+    long long busy_ms;      /* laufende arbeitszeit des turns (spinner) */
+    int busy_row_up;        /* spinner-rahmen: zeilen ueber dem geparkten
+                             * cursor (anker fuer den leichten tick) */
     int status_model_lines; /* belegte zeilen der model-statuszeile */
     int status_token_lines; /* belegte zeilen der token-statuszeile */
 } DockCtx;
@@ -1820,9 +1815,9 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
     size_t live_idx = SIZE_MAX;
     bool live_open_block = false; /* live-nachricht enthaelt einen
                                    * block, der noch waechst */
-    size_t live_keep = 0; /* offener block: so viele zeilen von
-                           * unten bleiben live (budget), der rest
-                           * committet in den scrollback */
+    size_t live_keep = 0;         /* offener block: so viele zeilen von
+                                   * unten bleiben live (budget), der rest
+                                   * committet in den scrollback */
     if (state->busy && chat->len > 0 &&
         chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT &&
         chat->msgs[chat->len - 1].tool_calls_len == 0) {
@@ -1852,8 +1847,7 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                  * breiten bzw. der wachsende fence eingefroren;
                  * die nachricht bleibt deshalb (budgetiert) live. */
                 if (blk->end == strlen(lt) && blk->end > blk->start) {
-                    if (blk->kind == MD_BLK_CODE ||
-                        blk->kind == MD_BLK_TABLE) {
+                    if (blk->kind == MD_BLK_CODE || blk->kind == MD_BLK_TABLE) {
                         live_open_block = true;
                     }
                 }
@@ -1948,12 +1942,10 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
              * die live-region umfasst block + budget. */
             size_t blk_first = total; /* erste zeile des blocks */
             if (g_msg_blocks_valid && g_msg_blocks.n > 0) {
-                const MdBlock *blk =
-                    &g_msg_blocks.blocks[g_msg_blocks.n - 1];
+                const MdBlock *blk = &g_msg_blocks.blocks[g_msg_blocks.n - 1];
                 for (size_t li = s; li < e; li++) {
                     if (g_lines[li].tool == -2 ||
-                        (g_lines[li].lstart &&
-                         g_lines[li].off >= blk->start &&
+                        (g_lines[li].lstart && g_lines[li].off >= blk->start &&
                          g_lines[li].off < blk->end)) {
                         blk_first = li - s;
                         break;
@@ -2030,8 +2022,8 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                     /* display-string fuer diese tabelle neu bauen
                      * (gleicher algorithmus wie chat_wrap: die
                      * zeilen MUessen identisch sein) */
-                    char *disp = md_table_display(
-                        lm->text, ln->blk_start, ln->blk_end, main_w);
+                    char *disp = md_table_display(lm->text, ln->blk_start,
+                                                  ln->blk_end, main_w);
                     if (disp != NULL) {
                         size_t dl = strlen(disp);
                         size_t off = ln->off;
@@ -2039,8 +2031,7 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                             for (size_t b = 0; b < ln->len; b++) {
                                 char c = disp[off + b];
                                 if (c == '|') {
-                                    row_sgr(&g_row,
-                                            theme_current()->match);
+                                    row_sgr(&g_row, theme_current()->match);
                                     row_putc(&g_row, c);
                                     row_sgr(&g_row, THEME_ROLE_RESET);
                                 } else {
@@ -2156,20 +2147,18 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                     row_start(main_w);
                     if (ln->tool == -2) {
                         /* tabelle: wie im content-loop (pipes farbig) */
-                        char *disp = md_table_display(
-                            chat->msgs[live_idx].text, ln->blk_start,
-                            ln->blk_end, main_w);
+                        char *disp = md_table_display(chat->msgs[live_idx].text,
+                                                      ln->blk_start,
+                                                      ln->blk_end, main_w);
                         if (disp != NULL) {
                             size_t dl = strlen(disp);
                             if (ln->off < dl) {
                                 for (size_t b = 0; b < ln->len; b++) {
                                     char c = disp[ln->off + b];
                                     if (c == '|') {
-                                        row_sgr(&g_row,
-                                                theme_current()->match);
+                                        row_sgr(&g_row, theme_current()->match);
                                         row_putc(&g_row, c);
-                                        row_sgr(&g_row,
-                                                THEME_ROLE_RESET);
+                                        row_sgr(&g_row, THEME_ROLE_RESET);
                                     } else {
                                         row_putc(&g_row, c);
                                     }

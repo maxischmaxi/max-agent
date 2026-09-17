@@ -134,23 +134,23 @@ char *chat_flatten_input(const Input *in);
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    size_t msg;    /* index der nachricht in msgs      */
-    size_t off;    /* byte-offset des zeilenanfangs im text */
-    size_t len;    /* byte-laenge dieser render-zeile  */
-    bool first;    /* erste zeile der nachricht         */
-    bool lstart;   /* beginnt am originalen zeilenan-  */
-                   /* fang (nach '\n'): nur dann darf  */
-                   /* der markdown-scanner ansetzen    */
-                   /* (siehe markdown.h). bei 'first'  */
-                   /* implizit true                    */
-    ChatRole role; /* kopie der nachrichten-rolle: die   */
-                   /* slot-mapping braucht sie ohne state-pointer */
-    int tool;      /* -1 = textzeile; -2 = tabellen-zeile */
-                   /* (off/len im tabellen-display-string, */
-                   /* blk_start/blk_end = block-grenzen   */
-                   /* im originaltext); sonst index in    */
-                   /* msgs[msg].tool_calls: render-zeile  */
-                   /* des calls (off/len unbenutzt)       */
+    size_t msg;       /* index der nachricht in msgs      */
+    size_t off;       /* byte-offset des zeilenanfangs im text */
+    size_t len;       /* byte-laenge dieser render-zeile  */
+    bool first;       /* erste zeile der nachricht         */
+    bool lstart;      /* beginnt am originalen zeilenan-  */
+                      /* fang (nach '\n'): nur dann darf  */
+                      /* der markdown-scanner ansetzen    */
+                      /* (siehe markdown.h). bei 'first'  */
+                      /* implizit true                    */
+    ChatRole role;    /* kopie der nachrichten-rolle: die   */
+                      /* slot-mapping braucht sie ohne state-pointer */
+    int tool;         /* -1 = textzeile; -2 = tabellen-zeile */
+                      /* (off/len im tabellen-display-string, */
+                      /* blk_start/blk_end = block-grenzen   */
+                      /* im originaltext); sonst index in    */
+                      /* msgs[msg].tool_calls: render-zeile  */
+                      /* des calls (off/len unbenutzt)       */
     size_t blk_start; /* tool==-2: tabelle im originaltext  */
     size_t blk_end;   /* (beide byte-offsets, end exklusiv) */
 } ChatLine;

@@ -710,8 +710,7 @@ static void test_markdown(void)
     /* ki-antwort mit markdown: die erste zeile jeder logischen
      * zeile (nach \n) wird gescannt, wrap-folgezeilen nicht */
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT,
-                      "# Titel\n- punkt\n1. nummer\n> zitat\ntext") ==
-          0);
+                      "# Titel\n- punkt\n1. nummer\n> zitat\ntext") == 0);
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
@@ -735,8 +734,8 @@ static void test_markdown(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(strstr(c.raw, "48;5;") != NULL);   /* palette-hintergrund */
-    CHECK(strstr(c.raw, "49m") != NULL);    /* hintergrund wieder aus */
+    CHECK(strstr(c.raw, "48;5;") != NULL); /* palette-hintergrund */
+    CHECK(strstr(c.raw, "49m") != NULL);   /* hintergrund wieder aus */
 
     cap_free(&c);
     input_free(&st.input);

@@ -29,20 +29,20 @@ static Theme g_theme = {
  * sein eigenes farbschema anwenden kann. ASSISTANT bleibt NULL –
  * es folgt der match-farbe des themes (siehe theme_role). */
 static const char *const ROLE_DEFAULTS[THEME_ROLE_COUNT] = {
-    [THEME_ROLE_USER] = "\x1b[1m",   /* bold: die eigene stimme */
-    [THEME_ROLE_ASSISTANT] = NULL,   /* = theme->match */
-    [THEME_ROLE_ERROR] = "\x1b[31m", /* rot */
-    [THEME_ROLE_TOOL] = "\x1b[2m",   /* faint: maschinen-output */
-    [THEME_ROLE_SYSTEM] = "",        /* unauffaellig, ohne sequenz */
-    [THEME_ROLE_NOTICE] = "\x1b[2m", /* faint: meldung der app */
-    [THEME_ROLE_DIM] = "\x1b[2m",    /* faint: beiwerk */
-    [THEME_ROLE_MD_HEAD] = NULL,   /* = match-farbe + bold, theme_role() */
-    [THEME_ROLE_MD_MARKER] = NULL, /* dito, ohne bold */
-    [THEME_ROLE_MD_KW] = NULL,      /* = match (akzent), fett via caller */
-    [THEME_ROLE_MD_STR] = "\x1b[32m",  /* gruen: strings, auf beiden
-                                      * paletten lesbar */
-    [THEME_ROLE_MD_NUM] = "\x1b[33m",  /* gelb: zahlen */
-    [THEME_ROLE_MD_COMMENT] = NULL, /* = faint (DIM) */
+    [THEME_ROLE_USER] = "\x1b[1m",    /* bold: die eigene stimme */
+    [THEME_ROLE_ASSISTANT] = NULL,    /* = theme->match */
+    [THEME_ROLE_ERROR] = "\x1b[31m",  /* rot */
+    [THEME_ROLE_TOOL] = "\x1b[2m",    /* faint: maschinen-output */
+    [THEME_ROLE_SYSTEM] = "",         /* unauffaellig, ohne sequenz */
+    [THEME_ROLE_NOTICE] = "\x1b[2m",  /* faint: meldung der app */
+    [THEME_ROLE_DIM] = "\x1b[2m",     /* faint: beiwerk */
+    [THEME_ROLE_MD_HEAD] = NULL,      /* = match-farbe + bold, theme_role() */
+    [THEME_ROLE_MD_MARKER] = NULL,    /* dito, ohne bold */
+    [THEME_ROLE_MD_KW] = NULL,        /* = match (akzent), fett via caller */
+    [THEME_ROLE_MD_STR] = "\x1b[32m", /* gruen: strings, auf beiden
+                                       * paletten lesbar */
+    [THEME_ROLE_MD_NUM] = "\x1b[33m", /* gelb: zahlen */
+    [THEME_ROLE_MD_COMMENT] = NULL,   /* = faint (DIM) */
     /* user-bg: ein palette-grau, das auf hellen UND dunklen
      * terminals funktioniert. pick_auto waelt nach der OSC-11-
      * antwort ein passenderes (238 dunkel / 250 hell); ohne

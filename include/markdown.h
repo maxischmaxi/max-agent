@@ -49,9 +49,9 @@ typedef enum {
 } MdKind;
 
 typedef struct {
-    MdKind kind;   /* was diese zeile ist                         */
-    int level;     /* MD_HEAD: anzahl der '#' (1..)               */
-    size_t marker; /* byte-offset des ersten marker-zeichens (>=off) */
+    MdKind kind;       /* was diese zeile ist                         */
+    int level;         /* MD_HEAD: anzahl der '#' (1..)               */
+    size_t marker;     /* byte-offset des ersten marker-zeichens (>=off) */
     size_t marker_len; /* byte-laenge des markers ("- ", "1.", "### ") */
 } MdLine;
 

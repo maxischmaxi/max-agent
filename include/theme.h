@@ -24,8 +24,8 @@ typedef enum {
     /* markdown-highlight der ki-antworten (markdown.c): headline
      * = fette akzentfarbe, marker = listen-punkte/-zahlen. die
      * defaults stehen in theme.c, themes koennen abweichen. */
-    THEME_ROLE_MD_HEAD,    /* # ## ### ueberschriften (fett+akzent)   */
-    THEME_ROLE_MD_MARKER,  /* "- ", "* ", "1." listen-marker          */
+    THEME_ROLE_MD_HEAD,   /* # ## ### ueberschriften (fett+akzent)   */
+    THEME_ROLE_MD_MARKER, /* "- ", "* ", "1." listen-marker          */
     /* code-highlighting in ```-bloecken (markdown.c tokenisiert,
      * draw.c faerbt nach diesen rollen) */
     THEME_ROLE_MD_KW,      /* schluesselwoerter: akzent + fett        */
@@ -46,7 +46,7 @@ typedef enum {
  * THEME_ROLE_BG_OFF raeumt ZUSAETZLICH den hintergrund: fuer
  * zeilen mit user-hintergrund am zeilenende (das padding rechts
  * gehoert wieder zum normalen bild). */
-#define THEME_ROLE_RESET "\x1b[22;39m"
+#define THEME_ROLE_RESET  "\x1b[22;39m"
 #define THEME_ROLE_BG_OFF "\x1b[22;39;49m"
 
 typedef struct {

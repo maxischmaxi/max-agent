@@ -308,65 +308,66 @@ typedef struct {
 } MdLang;
 
 static const char *const KW_C[] = {
-    "int", "char", "long", "short", "unsigned", "signed", "float",
-    "double", "void", "const", "static", "extern", "inline", "struct",
-    "enum", "union", "typedef", "sizeof", "return", "if", "else",
-    "for", "while", "do", "switch", "case", "default", "break",
-    "continue", "goto", "true", "false", "NULL", "include", "define",
-    NULL,
+    "int",    "char",   "long",    "short",   "unsigned", "signed",
+    "float",  "double", "void",    "const",   "static",   "extern",
+    "inline", "struct", "enum",    "union",   "typedef",  "sizeof",
+    "return", "if",     "else",    "for",     "while",    "do",
+    "switch", "case",   "default", "break",   "continue", "goto",
+    "true",   "false",  "NULL",    "include", "define",   NULL,
 };
 static const char *const KW_BASH[] = {
-    "if", "then", "else", "elif", "fi", "for", "while", "until", "do",
-    "done", "case", "esac", "in", "function", "return", "local",
-    "export", "readonly", "echo", "printf", "read", "cd", "ls", "cat",
-    "grep", "sed", "awk", "find", "xargs", "chmod", "chown", "mkdir",
-    "rm", "cp", "mv", "ln", "touch", "true", "false", "test", "set",
-    "source", "exit", "sudo", "make", "git", "curl", "tar", "which",
+    "if",     "then",  "else",   "elif",     "fi",   "for",    "while",
+    "until",  "do",    "done",   "case",     "esac", "in",     "function",
+    "return", "local", "export", "readonly", "echo", "printf", "read",
+    "cd",     "ls",    "cat",    "grep",     "sed",  "awk",    "find",
+    "xargs",  "chmod", "chown",  "mkdir",    "rm",   "cp",     "mv",
+    "ln",     "touch", "true",   "false",    "test", "set",    "source",
+    "exit",   "sudo",  "make",   "git",      "curl", "tar",    "which",
     NULL,
 };
 static const char *const KW_PY[] = {
-    "def", "return", "if", "elif", "else", "for", "while", "in", "not",
-    "and", "or", "is", "None", "True", "False", "class", "import",
-    "from", "as", "try", "except", "finally", "raise", "with", "lambda",
-    "pass", "break", "continue", "global", "nonlocal", "yield", "del",
-    "assert", "async", "await", "self", "print", "len", "range", "str",
-    "int", "float", "list", "dict", "set", "tuple",
-    NULL,
+    "def",     "return",   "if",     "elif",   "else",   "for",   "while",
+    "in",      "not",      "and",    "or",     "is",     "None",  "True",
+    "False",   "class",    "import", "from",   "as",     "try",   "except",
+    "finally", "raise",    "with",   "lambda", "pass",   "break", "continue",
+    "global",  "nonlocal", "yield",  "del",    "assert", "async", "await",
+    "self",    "print",    "len",    "range",  "str",    "int",   "float",
+    "list",    "dict",     "set",    "tuple",  NULL,
 };
 static const char *const KW_JS[] = {
-    "function", "return", "if", "else", "for", "while", "do", "switch",
-    "case", "default", "break", "continue", "const", "let", "var",
-    "class", "extends", "new", "this", "super", "import", "export",
-    "from", "async", "await", "try", "catch", "finally", "throw",
-    "typeof", "instanceof", "in", "of", "delete", "void", "yield",
-    "true", "false", "null", "undefined", "console",
-    NULL,
+    "function",   "return", "if",     "else",      "for",     "while",
+    "do",         "switch", "case",   "default",   "break",   "continue",
+    "const",      "let",    "var",    "class",     "extends", "new",
+    "this",       "super",  "import", "export",    "from",    "async",
+    "await",      "try",    "catch",  "finally",   "throw",   "typeof",
+    "instanceof", "in",     "of",     "delete",    "void",    "yield",
+    "true",       "false",  "null",   "undefined", "console", NULL,
 };
 static const char *const KW_GO[] = {
-    "func", "package", "import", "return", "if", "else", "for", "range",
-    "switch", "case", "default", "break", "continue", "type", "struct",
-    "interface", "map", "chan", "go", "defer", "select", "var", "const",
-    "nil", "true", "false", "string", "int", "int64", "uint", "float64",
-    "byte", "rune", "error", "make", "new", "append", "len", "cap",
-    "panic", "recover",
-    NULL,
+    "func",   "package",   "import",  "return",  "if",    "else",     "for",
+    "range",  "switch",    "case",    "default", "break", "continue", "type",
+    "struct", "interface", "map",     "chan",    "go",    "defer",    "select",
+    "var",    "const",     "nil",     "true",    "false", "string",   "int",
+    "int64",  "uint",      "float64", "byte",    "rune",  "error",    "make",
+    "new",    "append",    "len",     "cap",     "panic", "recover",  NULL,
 };
 static const char *const KW_RS[] = {
-    "fn", "let", "mut", "const", "static", "if", "else", "match", "for",
-    "while", "loop", "break", "continue", "return", "struct", "enum",
-    "trait", "impl", "pub", "use", "mod", "crate", "self", "super",
-    "where", "as", "in", "ref", "move", "async", "await", "dyn", "box",
-    "true", "false", "Some", "None", "Ok", "Err", "unsafe",
-    NULL,
+    "fn",     "let",   "mut",   "const", "static", "if",       "else",
+    "match",  "for",   "while", "loop",  "break",  "continue", "return",
+    "struct", "enum",  "trait", "impl",  "pub",    "use",      "mod",
+    "crate",  "self",  "super", "where", "as",     "in",       "ref",
+    "move",   "async", "await", "dyn",   "box",    "true",     "false",
+    "Some",   "None",  "Ok",    "Err",   "unsafe", NULL,
 };
 static const char *const KW_SQL[] = {
-    "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE",
-    "SET", "DELETE", "CREATE", "TABLE", "DROP", "ALTER", "ADD", "JOIN",
-    "LEFT", "RIGHT", "INNER", "OUTER", "ON", "AS", "AND", "OR", "NOT",
-    "NULL", "IS", "IN", "LIKE", "BETWEEN", "ORDER", "BY", "GROUP",
-    "HAVING", "LIMIT", "OFFSET", "DISTINCT", "COUNT", "SUM", "AVG",
-    "MIN", "MAX", "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "INDEX",
-    NULL,
+    "SELECT", "FROM",    "WHERE",      "INSERT", "INTO",    "VALUES",
+    "UPDATE", "SET",     "DELETE",     "CREATE", "TABLE",   "DROP",
+    "ALTER",  "ADD",     "JOIN",       "LEFT",   "RIGHT",   "INNER",
+    "OUTER",  "ON",      "AS",         "AND",    "OR",      "NOT",
+    "NULL",   "IS",      "IN",         "LIKE",   "BETWEEN", "ORDER",
+    "BY",     "GROUP",   "HAVING",     "LIMIT",  "OFFSET",  "DISTINCT",
+    "COUNT",  "SUM",     "AVG",        "MIN",    "MAX",     "PRIMARY",
+    "KEY",    "FOREIGN", "REFERENCES", "INDEX",  NULL,
 };
 
 /* sprach-alias: prefix-match reicht ("c++" haengt an "c" fest),
@@ -395,10 +396,10 @@ static const MdLang *lang_of(const char *lang)
          NULL},
         {"js", false, KW_JS, sizeof KW_JS / sizeof KW_JS[0], "//", "/*", "*/"},
         {"ts", false, KW_JS, sizeof KW_JS / sizeof KW_JS[0], "//", "/*", "*/"},
-        {"javascript", false, KW_JS, sizeof KW_JS / sizeof KW_JS[0], "//",
-         "/*", "*/"},
-        {"typescript", false, KW_JS, sizeof KW_JS / sizeof KW_JS[0], "//",
-         "/*", "*/"},
+        {"javascript", false, KW_JS, sizeof KW_JS / sizeof KW_JS[0], "//", "/*",
+         "*/"},
+        {"typescript", false, KW_JS, sizeof KW_JS / sizeof KW_JS[0], "//", "/*",
+         "*/"},
         {"go", false, KW_GO, sizeof KW_GO / sizeof KW_GO[0], "//", "/*", "*/"},
         {"rs", false, KW_RS, sizeof KW_RS / sizeof KW_RS[0], "//", "/*", "*/"},
         {"rust", false, KW_RS, sizeof KW_RS / sizeof KW_RS[0], "//", "/*",
@@ -537,9 +538,8 @@ size_t md_code_token(const char *text, size_t i, const char *lang, MdTok *tok)
     }
 
     /* zahl: ziffern (hex 0x auch) */
-    if ((c >= '0' && c <= '9') ||
-        (c == '-' && i + 1 < tlen && text[i + 1] >= '0' &&
-         text[i + 1] <= '9')) {
+    if ((c >= '0' && c <= '9') || (c == '-' && i + 1 < tlen &&
+                                   text[i + 1] >= '0' && text[i + 1] <= '9')) {
         size_t j = i + 1;
         if (text[i] == '0' && j < tlen && (text[j] == 'x' || text[j] == 'X')) {
             j++;
@@ -588,8 +588,8 @@ size_t md_code_token(const char *text, size_t i, const char *lang, MdTok *tok)
  * die tabelle col_off/col_len (max MD_TABLE_COLS_MAX spalten). */
 #define MD_TABLE_COLS_MAX 32
 
-static size_t table_row(const char *text, size_t ls, size_t le,
-                        size_t *col_off, size_t *col_len, size_t max_cols)
+static size_t table_row(const char *text, size_t ls, size_t le, size_t *col_off,
+                        size_t *col_len, size_t max_cols)
 {
     /* randpipes ueberspringen */
     size_t i = ls;
@@ -677,7 +677,7 @@ char *md_table_display(const char *text, size_t start, size_t end,
             row_end[rows] = le;
             rows++;
             sep_next = (rows == 1); /* die zeile nach dem kopf ist
-                                    * der trenner (|---|---|) */
+                                     * der trenner (|---|---|) */
         } else {
             sep_next = false; /* genau diese eine zeile ueberspringen */
         }
@@ -691,11 +691,11 @@ char *md_table_display(const char *text, size_t start, size_t end,
     static size_t coff[64][MD_TABLE_COLS_MAX];
     static size_t clen[64][MD_TABLE_COLS_MAX];
     size_t rowcols[64]; /* zellen-anzahl je zeile: nur dieser
-                        * bereich ist in coff/clen gueltig */
+                         * bereich ist in coff/clen gueltig */
     size_t cols = 0;
     for (size_t r = 0; r < rows; r++) {
-        rowcols[r] = table_row(text, row_off[r], row_end[r], coff[r],
-                              clen[r], MD_TABLE_COLS_MAX);
+        rowcols[r] = table_row(text, row_off[r], row_end[r], coff[r], clen[r],
+                               MD_TABLE_COLS_MAX);
         if (rowcols[r] > cols) {
             cols = rowcols[r];
         }
@@ -748,7 +748,7 @@ char *md_table_display(const char *text, size_t start, size_t end,
      * berechnen, nicht schaetzen. */
     size_t cap = 1; /* nul-terminator */
     for (size_t r = 0; r < rows; r++) {
-        cap += 3; /* padding links/rechts + newline */
+        cap += 3;              /* padding links/rechts + newline */
         cap += 3 * (cols - 1); /* " | " trenner */
         for (size_t c = 0; c < cols; c++) {
             if (c < rowcols[r] && coff[r][c] < row_end[r]) {
