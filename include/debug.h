@@ -28,6 +28,11 @@ void dbg_rename(const char *session_id);
 /* ereignis ins log. ohne dbg_init ein no-op (fast-path). */
 void dbg(const char *fmt, ...);
 
+/* --debug gesetzt? (fuer den hinweis in der statuszeile) */
 bool dbg_active(void);
+
+/* aktueller pfad der log-datei ("" ohne --debug). aktualisiert
+ * sich mit dbg_rename – draw schreibt ihn in die statuszeile */
+const char *dbg_path(void);
 
 #endif

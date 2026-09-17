@@ -60,6 +60,16 @@ bool dbg_active(void)
     return g_log != NULL;
 }
 
+/* aktueller name der log-datei ("" ohne --debug): nach dem umbenennen
+ * auf die session-id zeigt die statuszeile sofort den neuen namen */
+const char *dbg_path(void)
+{
+    if (g_log == NULL) {
+        return "";
+    }
+    return g_path;
+}
+
 void dbg(const char *fmt, ...)
 {
     if (g_log == NULL) {

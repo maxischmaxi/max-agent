@@ -634,6 +634,16 @@ static void row_status_tokens(Row *r, const AppState *st)
         }
         row_puts(r, st->session.id);
     }
+
+    /* --debug: der trace landet in einer datei unter /tmp – deren
+     * name steht hier, damit mensch und agent ihn finden. dbg_path
+     * ist erst nach dem start gesetzt und aendert sich, sobald die
+     * erste nachricht die session (und damit den umbenannten log)
+     * oeffnet: die zeile aktualisiert sich von selbst */
+    if (dbg_active()) {
+        row_puts(r, "  \xC2\xB7  debug mode, log file: ");
+        row_puts(r, dbg_path());
+    }
     row_sgr(r, THEME_ROLE_RESET);
 }
 
