@@ -167,7 +167,7 @@ static void test_print_once(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     /* erster frame: leerer chat, nur der dock */
     cap_open(&c);
@@ -204,7 +204,7 @@ static void test_multiline_user(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "erste zeile\nzweite zeile") ==
           0);
@@ -228,7 +228,7 @@ static void test_assistant_label(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "frage") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "erste antwort zeile") ==
@@ -268,7 +268,7 @@ static void test_streaming(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "frage") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "") == 0); /* platzh. */
@@ -331,7 +331,7 @@ static void test_tool_rows(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "mach was") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "") == 0);
@@ -395,7 +395,7 @@ static void test_frame_relative(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     /* frame 1: dock = abstand + 2 rahmen + 1 eingabe + 2 status
      * = 6 zeilen */
@@ -458,7 +458,7 @@ static void test_content_reset(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     /* 40 kurze nachrichten */
     for (int i = 1; i <= 40; i++) {
@@ -496,7 +496,7 @@ static void test_dock_lists(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     /* "/" tippen: die befehlsliste erscheint im dock */
     input_char(&st.input, '/');
@@ -551,7 +551,7 @@ static void test_separator(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "erste nachricht") == 0);
     cap_open(&c);
@@ -592,7 +592,7 @@ static void test_tool_call_multiline(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "mach") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "") == 0);
@@ -642,7 +642,7 @@ static void test_tool_spinner(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "mach") == 0);
     CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT, "") == 0);
@@ -705,7 +705,7 @@ static void test_markdown(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     /* ki-antwort mit markdown: die erste zeile jeder logischen
      * zeile (nach \n) wird gescannt, wrap-folgezeilen nicht */
@@ -747,7 +747,7 @@ static void test_quit_warning(void)
     AppState st;
     state_setup(&st);
     Config cfg = {0};
-    Capture c;
+    Capture c = {0};
 
     st.confirm_quit = true;
     cap_open(&c);
