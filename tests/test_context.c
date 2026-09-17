@@ -63,13 +63,14 @@ static void test_tokens(void)
     CHECK(ctx_tokens_tools() == ctx_tokens_tools()); /* deterministisch */
 
     /* --- request-schaetzung: tools + system + nachrichten ab from --- */
-    size_t all = ctx_tokens_request(&chat, 0, NULL);
+    size_t all = ctx_tokens_request(&chat, 0, NULL, NULL);
     CHECK(all > ctx_tokens_tools());
-    CHECK(ctx_tokens_request(&chat, chat.len, NULL) == ctx_tokens_tools());
-    CHECK(ctx_tokens_request(&chat, 0, "du bist ein test-agent") > all);
-    CHECK(ctx_tokens_request(NULL, 0, NULL) == ctx_tokens_tools());
+    CHECK(ctx_tokens_request(&chat, chat.len, NULL, NULL) ==
+          ctx_tokens_tools());
+    CHECK(ctx_tokens_request(&chat, 0, "du bist ein test-agent", NULL) > all);
+    CHECK(ctx_tokens_request(NULL, 0, NULL, NULL) == ctx_tokens_tools());
     /* from waechst -> schaetzung faellt monoton */
-    CHECK(ctx_tokens_request(&chat, 1, NULL) <= all);
+    CHECK(ctx_tokens_request(&chat, 1, NULL, NULL) <= all);
 
     chat_free(&chat);
 }
@@ -77,37 +78,38 @@ static void test_tokens(void)
 static void test_budget(void)
 {
     /* --- kein fenster bekannt: nicht kuerzen --- */
-    CHECK(ctx_budget(NULL, NULL, NULL) == CTX_NO_LIMIT);
+    CHECK(ctx_budget(NULL, NULL, NULL, NULL) == CTX_NO_LIMIT);
     Model unknown = {0};
-    CHECK(ctx_budget(&unknown, NULL, NULL) == CTX_NO_LIMIT);
+    CHECK(ctx_budget(&unknown, NULL, NULL, NULL) == CTX_NO_LIMIT);
 
     /* --- normales fenster: platz fuer antwort und tools geht ab --- */
     Model big = {0};
     big.context_window = 128000;
-    size_t budget = ctx_budget(&big, NULL, NULL);
+    size_t budget = ctx_budget(&big, NULL, NULL, NULL);
     CHECK(budget != CTX_NO_LIMIT);
     CHECK(budget > 0);
     CHECK(budget < big.context_window);
     CHECK(budget + ctx_tokens_tools() < big.context_window);
 
     /* der system-prompt geht ebenfalls ab */
-    size_t with_sys = ctx_budget(&big, "du bist ein sehr langer prompt", NULL);
+    size_t with_sys =
+        ctx_budget(&big, "du bist ein sehr langer prompt", NULL, NULL);
     CHECK(with_sys < budget);
 
     /* --- winziges fenster: nichts uebrig, aber kein unterlauf --- */
     Model tiny = {0};
     tiny.context_window = 64;
-    CHECK(ctx_budget(&tiny, NULL, NULL) == 0);
+    CHECK(ctx_budget(&tiny, NULL, NULL, NULL) == 0);
 
     /* --- kalibrierung schrumpft das budget, wenn wir unterschaetzen --- */
     CtxUsage low = {.scale = CTX_SCALE_ONE / 2};  /* wir ueberschaetzen */
     CtxUsage high = {.scale = CTX_SCALE_ONE * 2}; /* wir unterschaetzen */
-    CHECK(ctx_budget(&big, NULL, &low) > budget);
-    CHECK(ctx_budget(&big, NULL, &high) < budget);
+    CHECK(ctx_budget(&big, NULL, NULL, &low) > budget);
+    CHECK(ctx_budget(&big, NULL, NULL, &high) < budget);
 
     /* ungeeicht (scale 0) aendert nichts */
     CtxUsage fresh = {0};
-    CHECK(ctx_budget(&big, NULL, &fresh) == budget);
+    CHECK(ctx_budget(&big, NULL, NULL, &fresh) == budget);
 }
 
 static void test_trim(void)
@@ -201,6 +203,133 @@ static void test_trim_local_only(void)
     chat_free(&mixed);
 }
 
+static void test_summary(void)
+{
+    /* --- wrap: praefix + tags, und zurueck messbar --- */
+    CHECK(ctx_summary_wrap(NULL) == NULL);
+    CHECK(ctx_summary_wrap("") == NULL);
+    char *w = ctx_summary_wrap("aufgabe: test");
+    CHECK(w != NULL);
+    CHECK(strstr(w, "<summary>") != NULL);
+    CHECK(strstr(w, "aufgabe: test") != NULL);
+    CHECK(strstr(w, "compacted into") != NULL);
+    CHECK(ctx_summary_tokens("aufgabe: test") > strlen("aufgabe: test") / 4);
+    CHECK(ctx_summary_tokens(NULL) == 0);
+    free(w);
+
+    /* summary geht vom budget und der request-schaetzung ab */
+    Model big = {0};
+    big.context_window = 128000;
+    size_t plain = ctx_budget(&big, NULL, NULL, NULL);
+    CHECK(ctx_budget(&big, NULL, "grosse zusammenfassung", NULL) < plain);
+    CHECK(ctx_summary_tokens("grosse zusammenfassung") > 0);
+    CHECK(ctx_budget(&big, NULL, "", NULL) == plain); /* leer = keine */
+
+    Chat chat = {0};
+    CHECK(chat_append(&chat, CHAT_ROLE_USER, "frage") == 0);
+    size_t all = ctx_tokens_request(&chat, 0, NULL, NULL);
+    CHECK(ctx_tokens_request(&chat, 0, NULL, "zusammenfassung") > all);
+    chat_free(&chat);
+
+    /* --- reset: summary/watermark weg, eichung + gesamtzaehler bleiben --- */
+    CtxUsage ctx = {0};
+    ctx_calibrate(&ctx, 1000, 1100);
+    ctx_account(&ctx, 1000, 200);
+    ctx.summary = dup_str("alte summary");
+    ctx.covered = 7;
+    ctx.compact_failed = true;
+    ctx.dropped = 5;
+    ctx_reset(&ctx);
+    CHECK(ctx.summary == NULL);
+    CHECK(ctx.covered == 0);
+    CHECK(ctx.compact_failed == false);
+    CHECK(ctx.scale == 1100); /* 1100 echte / 1000 geschaetzt */
+    CHECK(ctx.total_prompt == 1000);
+    CHECK(ctx.total_completion == 200);
+    /* dropped bleibt (es zaehlt den trim, nicht die summary) */
+    CHECK(ctx.dropped == 5);
+    ctx_reset(&ctx);
+    CHECK(ctx.summary == NULL); /* idempotent */
+    ctx_reset(NULL);            /* no-op */
+}
+
+static void test_cut_point(void)
+{
+    /* --- randfaelle --- */
+    CHECK(ctx_cut_point(NULL, 0, 100) == 0);
+    Chat empty = {0};
+    CHECK(ctx_cut_point(&empty, 0, 100) == 0);
+
+    Chat chat = {0};
+    CHECK(chat_append(&chat, CHAT_ROLE_USER, "alte frage eins") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_ASSISTANT, "antwort eins") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_USER, "frage zwei") == 0);
+
+    /* keep 0: die letzte gruppe bleibt trotzdem draussen – der
+     * request braucht sie immer */
+    CHECK(ctx_cut_point(&chat, 0, 0) == 2);
+
+    /* riesiges keep: alles bis (ausschliesslich) floor bleibt */
+    CHECK(ctx_cut_point(&chat, 2, 100000) == 2);
+
+    /* mittleres keep: frage-zwei-gruppe bleibt, der rest wird
+     * summary-seite */
+    size_t grp = ctx_tokens_message(&chat.msgs[2]);
+    CHECK(ctx_cut_point(&chat, 0, grp) == 2);
+    CHECK(ctx_cut_point(&chat, 0, grp - 1) == 2); /* letzte gruppe IMMER */
+
+    /* floor jenseits der pflicht-gruppe: die garantie gewinnt, die
+     * letzte gruppe bleibt draussen (der floor waere ungueltig) */
+    CHECK(ctx_cut_point(&chat, 3, 0) == 2);
+
+    chat_free(&chat);
+}
+
+static void test_cut_point_tool_groups(void)
+{
+    /* eine tool-gruppe (assistant-call + ergebnis) bleibt zusammen:
+     * der cut darf nie auf einem tool-ergebnis landen, sonst ginge
+     * ein ergebnis ohne call in den request */
+    Chat chat = {0};
+    CHECK(chat_append(&chat, CHAT_ROLE_USER, "frage") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_ASSISTANT, "") == 0);
+    ChatToolCall *calls = calloc(1, sizeof *calls);
+    CHECK(calls != NULL);
+    if (calls == NULL) {
+        return;
+    }
+    calls[0].id = dup_str("call_1");
+    calls[0].name = dup_str("bash");
+    calls[0].arguments = dup_str("{}");
+    CHECK(chat_set_tool_calls(&chat, calls, 1) == 0);
+    CHECK(chat_append_tool(&chat, "call_1", "ergebnis") == 0);
+    CHECK(chat_append(&chat, CHAT_ROLE_USER, "und jetzt?") == 0);
+
+    /* keep reicht nur fuer die letzte user-nachricht -> cut direkt
+     * davor, das tool-ergebnis geht MIT seinem call in die summary */
+    size_t last = ctx_tokens_message(&chat.msgs[chat.len - 1]);
+    size_t cut = ctx_cut_point(&chat, 0, last);
+    CHECK(cut == 3);
+    CHECK(chat.msgs[cut].role == CHAT_ROLE_USER);
+
+    /* keep reicht fuer ergebnis, aber nicht fuer den call: der cut
+     * rueckt zurueck AUF die gruppengrenze, das ergebnis bleibt
+     * trotzdem nicht verwaist */
+    size_t with_result = last + ctx_tokens_message(&chat.msgs[2]);
+    cut = ctx_cut_point(&chat, 0, with_result);
+    CHECK(cut == 3);
+    CHECK(chat.msgs[cut].role != CHAT_ROLE_TOOL);
+
+    /* keep reicht fuer die ganze gruppe: call + ergebnis bleiben
+     * wortwoertlich, cut liegt davor */
+    size_t with_group = with_result + ctx_tokens_message(&chat.msgs[1]);
+    cut = ctx_cut_point(&chat, 0, with_group);
+    CHECK(cut == 1);
+    CHECK(chat.msgs[cut].role == CHAT_ROLE_ASSISTANT);
+
+    chat_free(&chat);
+}
+
 static void test_calibrate(void)
 {
     ctx_calibrate(NULL, 100, 100); /* darf nicht knallen */
@@ -269,7 +398,10 @@ int main(void)
 {
     test_tokens();
     test_budget();
+    test_summary();
     test_trim();
+    test_cut_point();
+    test_cut_point_tool_groups();
     test_trim_tool_groups();
     test_trim_unfinished_round();
     test_trim_local_only();

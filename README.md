@@ -1,8 +1,9 @@
 # max-agent
 
 A minimal terminal AI coding agent in C17. Streams responses, runs tools
-(bash, read_file, write_file), keeps sessions resumable, and renders to the
-standard terminal buffer — your tmux scrollback is the chat history.
+(bash, read_file, edit_file, write_file), keeps sessions resumable, and
+renders to the standard terminal buffer — your tmux scrollback is the chat
+history.
 
 [![ci](https://github.com/maxischmaxi/max-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/maxischmaxi/max-agent/actions/workflows/ci.yml)
 
@@ -105,9 +106,12 @@ max                     # if installed, or:
 | `/system-prompt` | edit the system prompt in your `$EDITOR` — `:wq` applies it, `:q` keeps the old one |
 | `/quit`     | exit                                        |
 
-The agent has `bash`, `read_file` and `write_file` tools and runs them
-asynchronously — `ctrl+c` cancels a running turn, kills the tool's process
-group, and returns you to the prompt.
+The agent has `bash`, `read_file`, `edit_file` and `write_file` tools and runs them
+asynchronously — independent calls execute in parallel (file edits stay sequential).
+`ctrl+c` cancels a running turn, kills the tools' process groups, and returns you to
+the prompt. When the model's context window overflows, older history is compacted
+into an LLM-generated summary instead of being silently dropped, so long-running
+tasks keep their context.
 
 With `--debug`, every keypress, frame, thread, tool call and API error is
 logged to `/tmp/max-agent-<session-id>.log` — sanitizer reports (use-after-free,

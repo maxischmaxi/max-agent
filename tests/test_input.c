@@ -634,6 +634,32 @@ static void test_screen_wrap(void)
     CHECK(input_screen_row(&in, 4, 3, &line, &off, &len));
     CHECK(line == 2 && off == 0 && len == 0); /* die leere zeile */
 
+    /* --- wort-umbruch: ganze woerter wandern in die neue zeile,
+     *     ueberlange brechen hart an der kante. die abschnitte
+     *     enden VOR dem space (es faellt aus der anzeige) --- */
+    input_set_text(&in, "eins zwei drei");
+    CHECK(input_screen_rows(&in, 10) == 2);
+    CHECK(input_screen_row(&in, 10, 0, &line, &off, &len));
+    CHECK(line == 0 && off == 0 && len == 9); /* "eins zwei" */
+    CHECK(input_screen_row(&in, 10, 1, &line, &off, &len));
+    CHECK(line == 0 && off == 10 && len == 4); /* "drei" */
+
+    /* wort haengt ueber die kante: bricht beim space, nicht mittendrin */
+    input_set_text(&in, "eins zweixyz");
+    CHECK(input_screen_rows(&in, 5) == 3);
+    CHECK(input_screen_row(&in, 5, 0, &line, &off, &len));
+    CHECK(line == 0 && off == 0 && len == 4); /* "eins" */
+    CHECK(input_screen_row(&in, 5, 1, &line, &off, &len));
+    CHECK(line == 0 && off == 5 && len == 5); /* "zweix" */
+
+    /* space-run am umbruch faellt ganz weg */
+    input_set_text(&in, "ab    cd");
+    CHECK(input_screen_rows(&in, 2) == 2);
+    CHECK(input_screen_row(&in, 2, 0, &line, &off, &len));
+    CHECK(len == 2); /* "ab", spaces fallen weg */
+    CHECK(input_screen_row(&in, 2, 1, &line, &off, &len));
+    CHECK(off == 6 && len == 2); /* "cd" */
+
     /* --- utf-8 wird nie zerschnitten --- */
     input_set_text(&in, "\xC3\xA4\xC3\xB6\xC3\xBC\xC3\x9F"); /* aeoeuess */
     CHECK(strlen(in.lines[0]) == 8);       /* 4 zeichen, 8 bytes */
@@ -727,6 +753,45 @@ static void test_screen_cursor(void)
     input_free(&in);
 }
 
+/* der gemeldete bug: umlaute sind im wrap-plan 1 zelle, im alten
+ * renderer 2 zellen – die letzten zeichen fielen vom zeilenrand,
+ * der cursor-block verschwand. plan und abschnitte muessen in
+ * ZELLEN (codepoints) denken, nicht bytes: 4 umlaute passen in
+ * ein 4-zellen-feld exakt, 5 brauchen zwei zeilen. */
+static void test_screen_wrap_utf8(void)
+{
+    Input in;
+    input_init(&in);
+
+    /* 4 umlaute = 4 zellen: passt in EINE zeile */
+    input_set_text(&in, "\xC3\xA4\xC3\xB6\xC3\xBC\xC3\x9F");
+    CHECK(input_screen_rows(&in, 4) == 1);
+
+    /* 5 umlaute = 5 zellen: umbruch nach 4 (8 bytes) */
+    input_set_text(&in, "\xC3\xA4\xC3\xA4\xC3\xA4\xC3\xA4\xC3\xA4");
+    CHECK(input_screen_rows(&in, 4) == 2);
+    size_t line = 99;
+    size_t off = 99;
+    size_t len = 99;
+    CHECK(input_screen_row(&in, 4, 0, &line, &off, &len));
+    CHECK(off == 0 && len == 8);
+    CHECK(input_screen_row(&in, 4, 1, &line, &off, &len));
+    CHECK(off == 8 && len == 2);
+
+    /* wortumbruch mit umlauten: a-uml+"ns"+o-uml+"hn" (7 zellen)
+     * passt exakt, u-uml+"ber" wandert als ganzes wort in zeile 2.
+     * (die oktalen escapes verhindern, dass der C-lexer hex-escape
+     * und folgebuchstaben vermischt: "\xBCb" waere EIN token) */
+    input_set_text(&in, "\303\244ns\303\266hn \303\274ber");
+    CHECK(input_screen_rows(&in, 7) == 2);
+    CHECK(input_screen_row(&in, 7, 0, &line, &off, &len));
+    CHECK(off == 0 && len == 8); /* 8 bytes: a-uml n s o-uml h n */
+    CHECK(input_screen_row(&in, 7, 1, &line, &off, &len));
+    CHECK(off == 9 && len == 5); /* u-uml b e r = 5 bytes */
+
+    input_free(&in);
+}
+
 /* utf-8-editierung: backspace, delete und cursor arbeiten auf
  * ZEICHEN, nicht auf bytes – ein umlaut ist eine einheit, ein
  * halbes wuerde kaputte sequenzen im feld hinterlassen */
@@ -804,6 +869,7 @@ int main(void)
     test_set_text();
     test_typing_past_edge();
     test_screen_wrap();
+    test_screen_wrap_utf8();
     test_screen_cursor();
     test_utf8_editing();
     return test_report();

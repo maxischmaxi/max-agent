@@ -14,22 +14,27 @@ int send_role(ChatRole role);
  * system_prompt (NULL = keiner) wird ALS ERSTE nachricht mit rolle
  * SYSTEM vorangestellt – der prompt ist request-kontext, kein
  * verlaufs-inhalt: er erscheint nicht im chat, und /clear rührt ihn
- * nicht an. ERROR-nachrichten fehlen, alle anderen rollen werden
- * gemappt. die content-strings werden NICHT kopiert, sondern als
- * const vom chat bzw. system_prompt geborgt: das array ist nur
- * gueltig, solange der chat nicht veraendert wird (anhaengen ist
- * ok, freigeben/klemmen nicht).
- * *out ist ein heap-array des aufrufers (free), rueckgabe ist die
- * anzahl; 0 bei leerem (oder nur-fehler-) chat, -1 bei OOM/NULL. */
+ * nicht an. summary (NULL = keine, context.c) folgt direkt danach als
+ * USER-nachricht mit praefix/<summary>-tags (compaction). ERROR-
+ * nachrichten fehlen, alle anderen rollen werden gemappt. die
+ * content-strings werden NICHT kopiert, sondern als const vom chat
+ * bzw. system_prompt geborgt: das array ist nur gueltig, solange der
+ * chat nicht veraendert wird (anhaengen ist ok, freigeben/klemmen
+ * nicht). *out ist ein heap-array des aufrufers (free), rueckgabe ist
+ * die anzahl; 0 bei leerem (oder nur-fehler-) chat, -1 bei OOM/NULL. */
 int send_build_messages(const Chat *chat, const char *system_prompt,
                         OaiMessage **out);
 
 /* wie send_build_messages, aber erst ab nachricht `from` – alles
  * davor hat context.c als nicht mehr ins fenster passend aussortiert
  * (ctx_trim_start liefert den index). der system-prompt bleibt
- * dabei immer erhalten: er steht nicht im transcript. */
+ * dabei immer erhalten: er steht nicht im transcript. summary ist
+ * die BEREITS verpackte compaction-summary (ctx_summary_wrap, NULL =
+ * keine) und wird als USER-nachricht direkt hinter dem system-
+ * prompt eingefuegt – besitz bleibt beim aufrufer. */
 int send_build_messages_from(const Chat *chat, size_t from,
-                             const char *system_prompt, OaiMessage **out);
+                             const char *system_prompt, const char *summary,
+                             OaiMessage **out);
 
 /* modell nach id (cfg->active_model) in der config suchen. liefert
  * das model und den zugehoerigen provider (api_key/base_url) oder

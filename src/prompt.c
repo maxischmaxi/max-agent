@@ -36,11 +36,16 @@ static const char PROMPT_TEMPLATE[] =
     "  sudo) before performing them and wait for confirmation.\n"
     "\n"
     "Tools:\n"
-    "- You can call tools (read_file, bash, write_file); their\n"
-    "  definitions are provided separately. Use them to inspect files\n"
-    "  and run commands instead of guessing, and quote real outputs.\n"
-    "- Prefer one focused tool call at a time; after each call you see\n"
-    "  its result and can decide what to do next.\n";
+    "- You can call tools (read_file, edit_file, write_file, bash);\n"
+    "  their definitions are provided separately. Use them to inspect\n"
+    "  files and run commands instead of guessing, and quote real\n"
+    "  outputs.\n"
+    "- Batch independent tool calls into one response instead of one\n"
+    "  call per response; every round trip costs time.\n"
+    "- Use edit_file for targeted changes: each edits[].oldText must\n"
+    "  match exactly and be unique in the file, and stay as small as\n"
+    "  possible. Use write_file only for new files or when a file\n"
+    "  needs a complete rewrite.\n";
 
 char *prompt_build(const Config *cfg)
 {

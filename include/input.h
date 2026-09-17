@@ -54,10 +54,12 @@ int bottom_border_for(int rows, int list_h, bool g_confirm_quit);
 /* welche zeilenumbrueche der benutzer wollte und welche vom umbruch  */
 /* stammen – der abgeschickte text haenge dann an der fenstergroesse. */
 /*                                                                    */
-/* umgebrochen wird ZEICHENWEISE an der feldkante, nicht am wort      */
-/* (anders als im chat-verlauf): beim tippen soll text dort bleiben,  */
-/* wo er steht, und die cursor-position eindeutig sein. so machen es  */
-/* auch shells. utf-8-codepoints werden nie zerschnitten.             */
+/* umgebrochen wird am WORT, wie im chat-verlauf: passt das naechste */
+/* wort nicht mehr in die zeile, wandert es komplett in die neue.  */
+/* ueberlange woerter (laenger als die feldbreite) brechen hart an   */
+/* der kante, damit sie trotzdem vorwaertslaufen. die feldbreite     */
+/* zaehlt codepoints als zellen (umlaut/emoji = 1 zelle) – genauso   */
+/* wie der renderer, sonst divergieren plan und bild.                */
 /* ------------------------------------------------------------------ */
 
 /* wieviele bildschirmzeilen die eingabe bei dieser breite belegt.

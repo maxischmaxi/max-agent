@@ -1,5 +1,6 @@
 #include "context.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "tools.h"
@@ -55,12 +56,13 @@ size_t ctx_tokens_tools(void)
 }
 
 size_t ctx_tokens_request(const Chat *chat, size_t from,
-                          const char *system_prompt)
+                          const char *system_prompt, const char *summary)
 {
     size_t n = ctx_tokens_tools();
     if (system_prompt != NULL && system_prompt[0] != '\0') {
         n += CTX_MSG_OVERHEAD + ctx_tokens_text(system_prompt);
     }
+    n += ctx_summary_tokens(summary);
     if (chat == NULL) {
         return n;
     }
@@ -70,8 +72,57 @@ size_t ctx_tokens_request(const Chat *chat, size_t from,
     return n;
 }
 
+/* praefix und suffix, mit denen die summary als user-nachricht in
+ * jeden request wandert (pi-agenten-konvention) */
+#define SUMMARY_PREFIX                                               \
+    "The conversation history before this point was compacted into " \
+    "the following summary:\n\n<summary>\n"
+#define SUMMARY_SUFFIX "\n</summary>"
+
+char *ctx_summary_wrap(const char *summary)
+{
+    if (summary == NULL || summary[0] == '\0') {
+        return NULL;
+    }
+    size_t plen = strlen(SUMMARY_PREFIX);
+    size_t slen = strlen(SUMMARY_SUFFIX);
+    size_t len = strlen(summary);
+    char *out = malloc(plen + len + slen + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+    /* das letzte memcpy kopiert slen + 1 bytes – auch das '\0';
+     * der analyzer sieht die terminierung nicht (false positive) */
+    // NOLINTBEGIN(bugprone-not-null-terminated-result)
+    memcpy(out, SUMMARY_PREFIX, plen);
+    memcpy(out + plen, summary, len);
+    memcpy(out + plen + len, SUMMARY_SUFFIX, slen + 1);
+    // NOLINTEND(bugprone-not-null-terminated-result)
+    return out;
+}
+
+size_t ctx_summary_tokens(const char *summary)
+{
+    if (summary == NULL || summary[0] == '\0') {
+        return 0;
+    }
+    return CTX_MSG_OVERHEAD + ctx_tokens_text(SUMMARY_PREFIX) +
+           ctx_tokens_text(summary) + ctx_tokens_text(SUMMARY_SUFFIX);
+}
+
+void ctx_reset(CtxUsage *usage)
+{
+    if (usage == NULL) {
+        return;
+    }
+    free(usage->summary);
+    usage->summary = NULL;
+    usage->covered = 0;
+    usage->compact_failed = false;
+}
+
 size_t ctx_budget(const Model *model, const char *system_prompt,
-                  const CtxUsage *usage)
+                  const char *summary, const CtxUsage *usage)
 {
     if (model == NULL || model->context_window == 0) {
         return CTX_NO_LIMIT; /* fenster unbekannt: nicht kuerzen */
@@ -90,6 +141,7 @@ size_t ctx_budget(const Model *model, const char *system_prompt,
     if (system_prompt != NULL && system_prompt[0] != '\0') {
         fixed += CTX_MSG_OVERHEAD + ctx_tokens_text(system_prompt);
     }
+    fixed += ctx_summary_tokens(summary);
     if (fixed >= window) {
         return 0; /* fenster zu klein: nur die letzte gruppe passt */
     }
@@ -163,6 +215,53 @@ size_t ctx_trim_start(const Chat *chat, size_t budget)
         start++;
     }
     return start;
+}
+
+size_t ctx_cut_point(const Chat *chat, size_t floor, size_t keep_tokens)
+{
+    if (chat == NULL || chat->len == 0) {
+        return 0;
+    }
+    /* letzte sendbare nachricht samt gruppen-anfang: sie bleibt
+     * IMMER unverkuertzt draussen – ohne sie waere der request
+     * leer oder ungueltig (wie der trim-floor) */
+    size_t last = chat->len;
+    for (size_t i = chat->len; i > 0; i--) {
+        if (chat_role_sent(chat->msgs[i - 1].role)) {
+            last = i - 1;
+            break;
+        }
+    }
+    if (last == chat->len) {
+        return 0; /* nichts sendbares: keine summary noetig */
+    }
+    size_t hard_max = group_start(chat, last);
+    /* floor (was ctx_trim_start sowieso fallen laesst) gehoert immer
+     * zur summary-seite – aber nie auf kosten der pflicht-gruppe */
+    size_t min_cut = (floor < hard_max) ? floor : hard_max;
+
+    /* von hinten sammeln, bis keep_tokens erschoepft ist */
+    size_t cut = chat->len;
+    size_t used = 0;
+    for (size_t i = chat->len; i > min_cut; i--) {
+        size_t cost = ctx_tokens_message(&chat->msgs[i - 1]);
+        if (used + cost > keep_tokens) {
+            break;
+        }
+        used += cost;
+        cut = i - 1;
+    }
+    if (cut > hard_max) {
+        cut = hard_max; /* nichts passte: mindestens die pflicht-gruppe */
+    }
+    /* gruppen-ausrichtung: ein tool-ergebnis am fenster-anfang haette
+     * seinen assistant-call verloren (ungueltiger request) – solche
+     * halben gruppen rutschen komplett auf die summary-seite */
+    while (cut < chat->len && (chat->msgs[cut].role == CHAT_ROLE_TOOL ||
+                               !chat_role_sent(chat->msgs[cut].role))) {
+        cut++;
+    }
+    return cut;
 }
 
 void ctx_calibrate(CtxUsage *usage, size_t estimated, int prompt_tokens)

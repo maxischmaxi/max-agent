@@ -1,6 +1,7 @@
 #include "input.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -696,9 +697,12 @@ void input_init(Input *in)
 }
 
 /* ------------------------------------------------------------------ */
-/* Soft-wrap (siehe input.h): eine logische zeile wird zeichenweise   */
-/* an der feldkante umgebrochen. alle funktionen hier lesen nur –     */
-/* der text aendert sich durch den umbruch nie.                       */
+/* Soft-wrap (siehe input.h): eine logische zeile wird am WORT an    */
+/* der feldkante umgebrochen, ueberlange woerter hart an der kante.   */
+/* alle funktionen hier lesen nur – der text aendert sich durch den   */
+/* umbruch nie. die kante zaehlt codepoints (umlaut/emoji = 1 zelle), */
+/* genauso wie row_putn im renderer – nur so stimmen plan und bild    */
+/* ueberein und die letzten zeichen fallen nicht vom rand.            */
 /* ------------------------------------------------------------------ */
 
 /* ein codepoint ab s: byte-laenge. defekte sequenzen zaehlen als
@@ -758,47 +762,87 @@ static size_t wrap_width(int width)
     return (width > 0) ? (size_t)width : 1;
 }
 
-/* wieviele bildschirmzeilen belegt EINE logische zeile? */
+/* wieviele bildschirmzeilen belegt EINE logische zeile?
+ * umgebrochen wird am WORT (wie im chat-verlauf): passt das
+ * naechste wort nicht mehr in die zeile, wandert es komplett
+ * in die naechste. gibt es keinen umbruchpunkt (wort laenger
+ * als die zeile, kein space seit dem zeilenanfang), bricht es
+ * hart an der feldkante, damit ein ueberlanges wort trotzdem
+ * vorwaertslaeuft. die kante zaehlt CODEPOINTS (ein umlaut/emoji
+ * = 1 zelle), genau wie der renderer zaehlt. */
 static size_t line_rows(const char *s, size_t w)
 {
     size_t rows = 1;
-    size_t cells = 0;
-    for (size_t i = 0; s[i] != '\0';) {
-        if (cells == w) {
-            rows++;
-            cells = 0;
+    size_t off = 0;        /* anfang der aktuellen zeile */
+    size_t cells = 0;      /* zellen seit dem zeilenanfang */
+    size_t brk = SIZE_MAX; /* letztes space in dieser zeile */
+    size_t i = 0;
+    while (s[i] != '\0') {
+        if (s[i] == ' ') {
+            brk = i;
         }
-        i += wrap_step(s + i);
+        if (cells + 1 > w) {
+            rows++;
+            if (brk != SIZE_MAX && brk > off) {
+                /* wort-umbruch: das space faellt weg, die neue
+                 * zeile beginnt am wortanfang dahinter */
+                i = brk + 1;
+                while (s[i] == ' ') {
+                    i++;
+                }
+            }
+            off = i;
+            cells = 0;
+            brk = SIZE_MAX;
+            continue;
+        }
         cells++;
+        i += wrap_step(s + i);
     }
     return rows;
 }
 
-/* den n-ten abschnitt EINER logischen zeile: byte-offset + laenge.
- * n muss < line_rows(s, w) sein. */
+/* den n-ten abschnitt EINER logischen zeile: byte-offset und
+ * byte-laenge. n muss < line_rows(s, w) sein. der lauf ist
+ * identisch zu line_rows – nur wenn beide dieselben grenzen
+ * ziehen, stimmen zeilenzahl, slice und cursorposition ueberein.
+ * bei wort-umbruch endet der abschnitt VOR dem space (es faellt
+ * aus der anzeige), die folgezeile beginnt dahinter. */
 static void line_slice(const char *s, size_t w, size_t n, size_t *off,
                        size_t *len)
 {
     size_t row = 0;
-    size_t start = 0;
+    size_t off2 = 0;
     size_t cells = 0;
+    size_t brk = SIZE_MAX;
     size_t i = 0;
     while (s[i] != '\0') {
-        if (cells == w) {
+        if (s[i] == ' ') {
+            brk = i;
+        }
+        if (cells + 1 > w) {
             if (row == n) {
-                *off = start;
-                *len = i - start;
+                *off = off2;
+                *len = (brk != SIZE_MAX && brk > off2) ? brk - off2 : i - off2;
                 return;
             }
             row++;
-            start = i;
+            if (brk != SIZE_MAX && brk > off2) {
+                i = brk + 1;
+                while (s[i] == ' ') {
+                    i++;
+                }
+            }
+            off2 = i;
             cells = 0;
+            brk = SIZE_MAX;
+            continue;
         }
-        i += wrap_step(s + i);
         cells++;
+        i += wrap_step(s + i);
     }
-    *off = start;
-    *len = i - start; /* letzter abschnitt bis zum zeilenende */
+    *off = off2;
+    *len = i - off2; /* letzter abschnitt bis zum zeilenende */
 }
 
 size_t input_screen_rows(const Input *in, int width)
@@ -844,6 +888,48 @@ bool input_screen_row(const Input *in, int width, size_t idx, size_t *line,
     return false;
 }
 
+/* cursor-zeile UND spalte in bildschirm-koordinaten. *row kommt
+ * mit den bildschirmzeilen der VORHERIGEN logischen zeilen herein
+ * und wachst um die zeilen der eigenen – der lauf folgt demselben
+ * wort-umbruch wie line_rows/line_slice: der cursor rutscht mit,
+ * wenn ein wort vor ihm in die naechste zeile wandert. */
+static void cursor_pos(const char *s, size_t w, size_t cur, size_t *row,
+                       size_t *col)
+{
+    size_t r = *row;
+    size_t c = 0;
+    size_t off = 0;        /* anfang der aktuellen zeile */
+    size_t brk = SIZE_MAX; /* letztes space in der zeile */
+    size_t i = 0;
+    while (i < cur) {
+        size_t clen = wrap_step(s + i);
+        if (i + clen > cur) {
+            break; /* cursor mitten in einem zeichen: davor halten */
+        }
+        if (s[i] == ' ') {
+            brk = i;
+        }
+        if (c + 1 > w) {
+            /* gleicher umbruch wie line_rows/line_slice */
+            r++;
+            c = 0;
+            if (brk != SIZE_MAX && brk > off) {
+                i = brk + 1;
+                while (i < cur && s[i] == ' ') {
+                    i++;
+                }
+            }
+            off = i;
+            brk = SIZE_MAX;
+            continue;
+        }
+        c++;
+        i += clen;
+    }
+    *row = r;
+    *col = c;
+}
+
 void input_cursor_screen(const Input *in, int width, size_t *row, size_t *col)
 {
     size_t r = 0;
@@ -861,14 +947,8 @@ void input_cursor_screen(const Input *in, int width, size_t *row, size_t *col)
     if (cur > strlen(s)) {
         cur = strlen(s);
     }
-    for (size_t i = 0; i < cur;) {
-        if (c == w) {
-            r++;
-            c = 0;
-        }
-        i += wrap_step(s + i);
-        c++;
-    }
+    /* r traegt die zeilen der logischen zeilen davor schon herein */
+    cursor_pos(s, w, cur, &r, &c);
 out:
     if (row != NULL) {
         *row = r;

@@ -155,7 +155,7 @@ static void flush_out(void)
 /* ------------------------------------------------------------------ */
 
 static void row_pad(Row *r);
-static void row_putc(Row *r, char c);
+static int row_putc(Row *r, char c);
 static void row_glyph(Row *r, const char *sym);
 static void row_sgr(Row *r, const char *seq);
 static void row_putn(Row *r, const char *s, int n);
@@ -227,18 +227,48 @@ static void fmt_when(long long ms, char *buf, size_t sz);
 
 static void row_pad(Row *r)
 {
-    while (r->cells < r->width) {
-        row_putc(r, ' ');
+    while (r->cells < r->width && row_putc(r, ' ') != 0) {
     }
 }
 
-static void row_putc(Row *r, char c)
+/* byte-laenge des utf-8-zeichens, das bei s[0] beginnt. defekte
+ * folgen gelten als einzelbyte, ueber den terminator wird nie
+ * gelesen (s[0] != '\0' ist am aufrufort gesichert). gleiche
+ * logik wie wrap_step (input.c) und utf8_step (chat.c) */
+static size_t row_utf8_step(const char *s)
+{
+    unsigned char c = (unsigned char)s[0];
+    size_t n = 1;
+    if ((c & 0xE0U) == 0xC0U) {
+        n = 2;
+    } else if ((c & 0xF0U) == 0xE0U) {
+        n = 3;
+    } else if ((c & 0xF8U) == 0xF0U) {
+        n = 4;
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (((unsigned char)s[i] & 0xC0U) != 0x80U) {
+            return 1; /* abgebrochene sequenz */
+        }
+    }
+    return n;
+}
+
+/* ein zeichen aus s uebernehmen, soweit es in die zeile passt
+ * (defekte folgen gelten als einzelbyte). zaehlt CODEPOINTS als
+ * zellen – ein umlaut/emoji ist EINE sichtbare zelle, nicht
+ * seine byte-laenge. genau so zaehlen die umbruch-planer
+ * (input.c soft-wrap, chat_wrap): nur wenn beide gleich zaehlen,
+ * bleibt nichts am zeilenrand haengen. rueckgabe: 1 = zeichen
+ * steht, 0 = kein platz mehr. */
+static int row_putc(Row *r, char c)
 {
     if (r->cells >= r->width) {
-        return;
+        return 0;
     }
     r->f->buf[r->f->pos++] = c;
     r->cells++;
+    return 1;
 }
 
 static void row_glyph(Row *r, const char *sym)
@@ -260,18 +290,49 @@ static void row_sgr(Row *r, const char *seq)
     }
 }
 
-/* die ersten n byte von s, am rand abgeschnitten */
+/* einen codepoint aus s schreiben, wenn EINE weitere zelle frei
+ * ist. defekte folgen gelten als einzelbyte. rueckgabe: 1 = er
+ * steht, 0 = kein platz (string-ende prueft der aufrufer) */
+static int row_put_cp(Row *r, const char *s)
+{
+    size_t clen = row_utf8_step(s);
+    if ((size_t)r->cells + 1U > (size_t)r->width) {
+        return 0;
+    }
+    memcpy(r->f->buf + r->f->pos, s, clen);
+    r->f->pos += clen;
+    r->cells++; /* EIN codepoint = EINE zelle */
+    return 1;
+}
+
+/* die naechsten n byte von s: n<=0 oder string-ende geben nichts
+ * aus. die ZELLE wird je codepoint gezaehlt (ein umlaut/emoji =
+ * EINE zelle), die bytes landen komplett im frame – sonst waere
+ * ein umlaut 2 zellen breit und der renderer wuerde vom
+ * umbruch-plan abweichen (genau der bug, der die letzten zeichen
+ * vom rand fallen liess). passt das zeichen nicht mehr ganz in
+ * die zeile, bleibt es ganz draussen – halbe utf-8-sequenzen
+ * werden nie ausgegeben. */
 static void row_putn(Row *r, const char *s, int n)
 {
-    for (int i = 0; i < n && s[i] != '\0'; i++) {
-        row_putc(r, s[i]);
+    size_t left = (n > 0) ? (size_t)n : 0;
+    while (left > 0 && s[0] != '\0') {
+        size_t clen = row_utf8_step(s);
+        if (clen > left) {
+            break; /* rest gehoert einem halben zeichen: weg */
+        }
+        if (row_put_cp(r, s) == 0) {
+            return; /* kein platz mehr fuer EINE weitere zelle */
+        }
+        s += clen;
+        left -= clen;
     }
 }
 
 static void row_puts(Row *r, const char *s)
 {
-    while (*s != '\0') {
-        row_putc(r, *s++);
+    while (s[0] != '\0' && row_put_cp(r, s) != 0) {
+        s += row_utf8_step(s);
     }
 }
 
@@ -1000,10 +1061,12 @@ static void row_inline(Row *r, const char *text, size_t off, size_t len,
     bool in_code = false; /* hintergrund aktiv? */
     size_t i = 0;
     while (i < len) {
-        /* byte in bold-span? (irgendeine tiefe) */
+        /* byte in bold-span? (irgendeine tiefe). spans beginnen
+         * und enden an ascii-markern – ein mehrbyte-zeichen liegt
+         * immer ganz in oder ganz ausserhalb eines spans, der
+         * erste byte des zeichentscheidet */
         bool b = false;
         bool c = false;
-        bool marker = false;
         for (int k = 0; k < inl.n; k++) {
             if (i >= inl.start[k] && i < inl.end[k]) {
                 if (inl.kinds[k] == MD_INL_BOLD) {
@@ -1013,8 +1076,7 @@ static void row_inline(Row *r, const char *text, size_t off, size_t len,
                 }
             }
         }
-        marker = md_inline_marker(&inl, i);
-        if (marker) {
+        if (md_inline_marker(&inl, i)) {
             /* marker-bytes verschwinden aus der anzeige – sie
              * zaehlen nicht als zelle, kein putc */
             i++;
@@ -1028,8 +1090,16 @@ static void row_inline(Row *r, const char *text, size_t off, size_t len,
             row_sgr(r, c ? theme_role(THEME_ROLE_MD_CODE) : THEME_ROLE_BG_OFF);
             in_code = c;
         }
-        row_putc(r, text[off + i]);
-        i++;
+        /* GANZES utf-8-zeichen ausgeben: die zelle zaehlt einmal,
+         * nicht je byte – sonst waeren umlaute wieder 2 zellen
+         * breit und der wrap-plan des chat_wrap wuerde vom renderer
+         * abweichen (dasselbe problem wie vorher) */
+        size_t clen = row_utf8_step(text + off + i);
+        if (i + clen > len) {
+            clen = 1; /* kann kaum passieren: chat_wrap teilt nie */
+        }
+        row_putn(r, text + off + i, (int)clen);
+        i += clen;
     }
     if (in_bold) {
         row_sgr(r, "\x1b[22m");
@@ -1241,7 +1311,12 @@ static void row_busy_border(Row *r, long long busy_ms)
 
 static void row_start(int main_w)
 {
-    size_t need = ((size_t)main_w * 4) + 64;
+    /* 4 byte je zelle (utf-8-maximum) PLUS 512 byte ansi-spielraum:
+     * seit der codepoint-zaehlung koennen main_w zellen je bis zu
+     * 4 byte text tragen – die sgr-sequenzen (farben, bold,
+     * zuruecksetzungen, je bis ~10 byte) muessen DANACH noch
+     * passen, sonst schreibt row_sgr ueber das puffer-ende */
+    size_t need = ((size_t)main_w * 4U) + 512U;
     if (g_row_buf_cap < need) {
         char *grown = realloc(g_row_buf, need);
         if (grown == NULL) {
@@ -2190,15 +2265,23 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                         size_t dl = strlen(tbl);
                         size_t off = ln->off;
                         if (off < dl) {
-                            for (size_t b = 0; b < ln->len; b++) {
-                                char c = tbl[off + b];
-                                if (c == '|') {
-                                    row_sgr(&g_row, theme_current()->match);
-                                    row_putc(&g_row, c);
-                                    row_sgr(&g_row, THEME_ROLE_RESET);
-                                } else {
-                                    row_putc(&g_row, c);
+                            size_t b = 0;
+                            while (b < ln->len && off + b < dl) {
+                                /* ganzes utf-8-zeichen: ein codepoint
+                                 * ist eine zelle, umlaute duerfen nicht
+                                 * je byte zaehlen */
+                                size_t clen = row_utf8_step(tbl + off + b);
+                                if (off + b + clen > dl || b + clen > ln->len) {
+                                    clen = 1; /* rand: nur das byte */
                                 }
+                                if (tbl[off + b] == '|') {
+                                    row_sgr(&g_row, theme_current()->match);
+                                }
+                                row_putn(&g_row, tbl + off + b, (int)clen);
+                                if (tbl[off + b] == '|') {
+                                    row_sgr(&g_row, THEME_ROLE_RESET);
+                                }
+                                b += clen;
                             }
                         }
                         free(tbl);
@@ -2362,15 +2445,23 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                         if (tbl != NULL) {
                             size_t dl = strlen(tbl);
                             if (ln->off < dl) {
-                                for (size_t b = 0; b < ln->len; b++) {
-                                    char c = tbl[ln->off + b];
-                                    if (c == '|') {
-                                        row_sgr(&g_row, theme_current()->match);
-                                        row_putc(&g_row, c);
-                                        row_sgr(&g_row, THEME_ROLE_RESET);
-                                    } else {
-                                        row_putc(&g_row, c);
+                                size_t b = 0;
+                                while (b < ln->len && ln->off + b < dl) {
+                                    size_t clen =
+                                        row_utf8_step(tbl + ln->off + b);
+                                    if (ln->off + b + clen > dl ||
+                                        b + clen > ln->len) {
+                                        clen = 1;
                                     }
+                                    if (tbl[ln->off + b] == '|') {
+                                        row_sgr(&g_row, theme_current()->match);
+                                    }
+                                    row_putn(&g_row, tbl + ln->off + b,
+                                             (int)clen);
+                                    if (tbl[ln->off + b] == '|') {
+                                        row_sgr(&g_row, THEME_ROLE_RESET);
+                                    }
+                                    b += clen;
                                 }
                             }
                             free(tbl);

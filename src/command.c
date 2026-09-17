@@ -84,6 +84,7 @@ void cmd_new(AppState *state)
     state->ctx.dropped = 0;
     state->ctx.total_prompt = 0;
     state->ctx.total_completion = 0;
+    ctx_reset(&state->ctx); /* compaction-summary gehoert zum verlauf */
     state->worked_ms = 0;
     state->busy_start_ms = 0;
 }

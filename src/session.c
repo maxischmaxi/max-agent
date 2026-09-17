@@ -786,6 +786,20 @@ int session_log_notice(Session *s, const char *text)
     return log_line(s, o);
 }
 
+int session_log_compaction(Session *s, const char *summary, size_t covered)
+{
+    if (!s->active || summary == NULL || summary[0] == '\0') {
+        return 0;
+    }
+    cJSON *o = event_new("compaction");
+    if (o == NULL) {
+        return -1;
+    }
+    cJSON_AddStringToObject(o, "summary", summary);
+    cJSON_AddNumberToObject(o, "covered", (double)covered);
+    return log_line(s, o);
+}
+
 /* ------------------------------------------------------------------ */
 /* transcript zurueckspielen                                           */
 /* ------------------------------------------------------------------ */
@@ -899,6 +913,27 @@ static int replay_line(const cJSON *o, Chat *chat, CtxUsage *ctx)
     }
     if (cJSON_IsString(jtype) && strcmp(jtype->valuestring, "notice") == 0) {
         return chat_append(chat, CHAT_ROLE_NOTICE, text);
+    }
+    if (cJSON_IsString(jtype) &&
+        strcmp(jtype->valuestring, "compaction") == 0) {
+        /* die letzte compaction gewinnt: summary + watermark sind
+         * zustand des CtxUsage, nicht des chats. ctx == NULL =
+         * niemand interessiert sich dafuer */
+        const cJSON *jsum = cJSON_GetObjectItemCaseSensitive(o, "summary");
+        const cJSON *jcov = cJSON_GetObjectItemCaseSensitive(o, "covered");
+        if (ctx == NULL || !cJSON_IsString(jsum) ||
+            jsum->valuestring[0] == '\0') {
+            return 0;
+        }
+        char *copy = dup_str(jsum->valuestring);
+        if (copy == NULL) {
+            return -1;
+        }
+        free(ctx->summary);
+        ctx->summary = copy;
+        ctx->covered = cJSON_IsNumber(jcov) ? (size_t)jcov->valuedouble : 0;
+        ctx->compact_failed = false;
+        return 0;
     }
     return 0; /* unbekannter typ: ignorieren (vorwaerts-kompatibel) */
 }

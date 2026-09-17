@@ -1048,6 +1048,90 @@ static void test_clamp(void)
     chat_free(&st.chat);
 }
 
+/* ------------------------------------------------------------------ */
+/* umlaut-umbruch: plan (codepoints) und renderer muessen gleiche zellen  */
+/* zaehlen. vorher zaehlte der renderer bytes: eine zeile voller umlaute */
+/* war im plan w zellen breit, im bild aber 2*w – die letzten zeichen  */
+/* fielen vom rand, der cursor-block verschwand. hier tippen wir umlaute*/
+/* bis ins die kante: alle muessen sichtbar bleiben.                      */
+/* ------------------------------------------------------------------ */
+static void test_utf8_wrap_render(void)
+{
+    AppState st;
+    state_setup(&st);
+    Config cfg = {0};
+    Capture c = {0};
+
+    const int cols = 40;
+    int w = input_field_width(cols);
+
+    /* zeile voller umlaute exakt an der kante (w zellen): der
+     * cursor-block braucht die spalte dahinter, mit w+1 zellen
+     * bricht die zeile um – der block steht in zeile 2. das space
+     * davor sorgt dafuer, dass das wort-umbruch-verhalten mit im
+     * test haengt. */
+    for (int i = 0; i < w; i++) {
+        input_char(&st.input, '\xC3');
+        input_char(&st.input, '\xA4');
+    }
+    /* ... und das wort danach, das in die naechste zeile wandert */
+    input_char(&st.input, ' ');
+    for (int i = 0; i < 3; i++) {
+        input_char(&st.input, 'x');
+    }
+
+    cap_open(&c);
+    draw(24, cols, &st, &cfg);
+    cap_close(&c);
+
+    /* alle umlaut-bytes muessen im frame sein (kein zeichen vom
+     * rand gefallen): w umlaute = 2*w bytes */
+    size_t uml = 0;
+    for (const char *p = c.text; *p != '\0'; p++) {
+        if ((unsigned char)*p == 0xC3) {
+            uml++;
+        }
+    }
+    CHECK((int)uml == w); /* nichts verschluckt */
+
+    /* der cursor-block ist sichtbar: der text "xxx" (hinter dem
+     * umbruch) plus block in der letzten eingabezeile */
+    {
+        /* zeilen der eingabe sind die, in denen \xC3...x steht:
+         * der block sitzt hinter "xxx" */
+        const char *row = strstr(c.text, "xxx");
+        CHECK(row != NULL);
+        if (row != NULL) {
+            CHECK(strncmp(row + 3, "\xE2\x96\x88", 3) == 0);
+        }
+    }
+
+    /* die worter bleiben ganz: "xxx" steht am ANFANG seiner zeile
+     * (wort-umbruch), nicht mitten in einer umlaut-zeile */
+    {
+        /* suche die zeile, die mit "xxx" beginnt */
+        bool found = false;
+        const char *p = c.text;
+        while ((p = strstr(p, "xxx")) != NULL) {
+            /* xxx steht am zeilenanfang (input-zeilen haben kein
+             * praefix-padding) – das wort ist ganz umgebrochen */
+            const bool at_text_start = (p == c.text);
+            const bool prev_is_newline =
+                (bool)((p != c.text) && (p[-1] == '\n'));
+            if (at_text_start || prev_is_newline) {
+                found = true;
+                break;
+            }
+            p++;
+        }
+        CHECK(found);
+    }
+
+    cap_free(&c);
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
 int main(void)
 {
     test_print_once();
@@ -1067,5 +1151,6 @@ int main(void)
     test_inline_nested();
     test_escapes_rendered();
     test_clamp();
+    test_utf8_wrap_render();
     return test_report();
 }

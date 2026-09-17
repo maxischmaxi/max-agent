@@ -937,6 +937,8 @@ static void handle_sessions(AppState *state, Config *cfg, Key k)
                 state->ctx.total_prompt = 0;
                 state->ctx.total_completion = 0;
                 state->ctx.dropped = 0;
+                ctx_reset(&state->ctx); /* alte summary weg, das
+                                         * transcript bringt seine eigene */
                 (void)session_read_transcript(&state->session, &state->chat,
                                               &state->ctx);
                 state->worked_ms = state->session.worked_ms;

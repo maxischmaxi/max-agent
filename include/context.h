@@ -50,7 +50,35 @@ typedef struct {
      * wird, was die api meldet – nicht unsere schaetzung. */
     size_t total_prompt;
     size_t total_completion;
+
+    /* -------------------------------------------------------------- */
+    /* compaction (send.c): statt verlauf still wegzukuerzen, wird    */
+    /* alles bis zum watermark `covered` per llm zu einer summary    */
+    /* verdichtet und ab dann mitgeschickt – der aufgabenkontext    */
+    /* ueberlebt, wenn das fenster laeuft. summary gehoert dem struct */
+    /* (ctx_reset), NULL = noch nichts komprimiert. das session-log  */
+    /* legt beides als ereignis ab, ein resume stellt es wieder her. */
+    /* compact_failed drosselt neuversuche: nach einem gescheiter-  */
+    /* ten zusammenfassungs-call wird erst wieder versucht, wenn     */
+    /* wieder nennenswert verlauf gefallen ist.                      */
+    /* -------------------------------------------------------------- */
+    char *summary;       /* llm-zusammenfassung, NULL = keine */
+    size_t covered;      /* chat-index, bis zu dem die summary reicht */
+    bool compact_failed; /* letzter versuch schlug fehl */
 } CtxUsage;
+
+/* compaction-zustand freigeben (summary, watermark, fehler-flag),
+ * ohne die eichung (scale) und die gesamtzaehler anzutasten. */
+void ctx_reset(CtxUsage *usage);
+
+/* die summary in das format verpacken, in dem sie als USER-nachricht
+ * mitgeschickt wird (pi-agenten-konvention: praefix + <summary>-tags).
+ * heap-kopie des aufrufers, NULL bei OOM/NULL-eingang. */
+char *ctx_summary_wrap(const char *summary);
+
+/* geschaetzte tokens der verpackten summary (inkl. praefix und
+ * nachricht-geruest). NULL/leer = 0. */
+size_t ctx_summary_tokens(const char *summary);
 
 /* tokens eines strings schaetzen (NULL = 0) */
 size_t ctx_tokens_text(const char *text);
@@ -64,18 +92,19 @@ size_t ctx_tokens_message(const ChatMessage *msg);
 size_t ctx_tokens_tools(void);
 
 /* schaetzung fuer genau den request, der ab index `from` gebaut
- * wird (system-prompt + tool-definitionen + nachrichten). das ist
- * die vergleichsgroesse fuer ctx_calibrate. */
+ * wird (system-prompt + summary + tool-definitionen + nachrichten).
+ * das ist die vergleichsgroesse fuer ctx_calibrate. */
 size_t ctx_tokens_request(const Chat *chat, size_t from,
-                          const char *system_prompt);
+                          const char *system_prompt, const char *summary);
 
 /* wieviele tokens das transcript belegen darf: fenster des modells
- * minus antwort-reserve, tool-definitionen und system-prompt, dann
- * um den korrekturfaktor geschrumpft. CTX_NO_LIMIT, wenn das modell
- * kein contextWindow angibt (dann kuerzt ctx_trim_start nie).
+ * minus antwort-reserve, tool-definitionen, system-prompt UND der
+ * laufenden summary (sie ist fixer bestandteil jedes requests),
+ * dann um den korrekturfaktor geschrumpft. CTX_NO_LIMIT, wenn das
+ * modell kein contextWindow angibt (dann kuerzt ctx_trim_start nie).
  * usage darf NULL sein (= noch keine messung). */
 size_t ctx_budget(const Model *model, const char *system_prompt,
-                  const CtxUsage *usage);
+                  const char *summary, const CtxUsage *usage);
 
 /* index der ERSTEN nachricht, die noch gesendet wird. gezaehlt wird
  * von hinten, bis das budget voll ist.
@@ -89,6 +118,17 @@ size_t ctx_budget(const Model *model, const char *system_prompt,
  *
  * budget == CTX_NO_LIMIT liefert immer 0. */
 size_t ctx_trim_start(const Chat *chat, size_t budget);
+
+/* compaction-cut (send.c): groesster gueltiger index, ab dem der
+ * verlauf UNVERKUERZT mitgeschickt wird, wenn [cut, len) hoechstens
+ * keep_tokens gross sein soll – die nachrichten davor wandern in
+ * die summary. zwei garantien:
+ *  - die letzte sendbare nachrichtengruppe bleibt IMMER draussen
+ *    (der request braucht sie, egal wie klein keep_tokens ist)
+ *  - alles vor `floor` (was ctx_trim_start sowieso fallen lassen
+ *    wuerde) gehoert immer zur summary-seite
+ * das ergebnis ist gruppen-ausgerichtet wie bei ctx_trim_start. */
+size_t ctx_cut_point(const Chat *chat, size_t floor, size_t keep_tokens);
 
 /* die echte token-zahl aus der antwort gegen unsere schaetzung
  * halten und den korrekturfaktor nachfuehren. prompt_tokens <= 0

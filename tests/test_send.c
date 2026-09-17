@@ -242,6 +242,75 @@ static pid_t start_probe_server(int *port, const char *marker)
     _exit(0);
 }
 
+/* server, der ZWEI verbindungen bedient: die erste bekommt eine
+ * feste summary-antwort (der compaction-request), die zweite ist
+ * ein marker-probe wie oben (der haupt-request). damit laesst sich
+ * compaction + normaler round-trip in einem test fahren. */
+static pid_t start_compact_probe_server(int *port, const char *marker,
+                                        const char *summary)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    char *req = malloc(1 << 20);
+    if (req == NULL) {
+        _exit(1);
+    }
+    for (int round = 0; round < 2; round++) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+            _exit(1);
+        }
+        req[0] = '\0';
+        (void)read_request(cfd, req, 1 << 20);
+        const char *content;
+        if (round == 0) {
+            /* compaction-request: antwortet mit der summary */
+            content = summary;
+        } else {
+            content = (strstr(req, marker) != NULL) ? "JA" : "NEIN";
+        }
+        char resp[512];
+        (void)snprintf(
+            resp, sizeof resp,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "data: {\"choices\":[{\"delta\":{\"content\":\"%s\"}}]}\n\n"
+            "data: {\"usage\":{\"prompt_tokens\":1234,"
+            "\"completion_tokens\":2,\"total_tokens\":1236},"
+            "\"choices\":[]}\n\n"
+            "data: [DONE]\n\n",
+            content);
+        (void)write(cfd, resp, strlen(resp));
+        close(cfd);
+    }
+    free(req);
+    _exit(0);
+}
+
 static void sleep_ms(long ms)
 {
     struct timespec ts;
@@ -395,6 +464,163 @@ static pid_t start_tool_server(int *port)
     _exit(0);
 }
 
+/* server fuer den parallel-test: runde 1 liefert ZWEI bash-calls
+ * (je 0.4 s sleep), runde 2 die finale antwort. sind die calls
+ * parallel gelaufen, dauert die runde ~0.4 s statt ~0.8 s. */
+static pid_t start_parallel_server(int *port)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    for (int round = 0; round < 2; round++) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+            _exit(1);
+        }
+        char req[65536];
+        req[0] = '\0';
+        (void)read_request(cfd, req, sizeof req);
+        const char *resp = NULL;
+        if (round == 1) {
+            resp = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/event-stream\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "data: {\"choices\":[{\"delta\":{\"content\":\"beide "
+                   "da\"}}]}\n\n"
+                   "data: [DONE]\n\n";
+        } else {
+            resp = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/event-stream\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
+                   "{\"index\":0,\"id\":\"call_a\",\"function\":{"
+                   "\"name\":\"bash\",\"arguments\":"
+                   "\"{\\\"command\\\":\\\"sleep 0.4; echo a\\\"}\"}},"
+                   "{\"index\":1,\"id\":\"call_b\",\"function\":{"
+                   "\"name\":\"bash\",\"arguments\":"
+                   "\"{\\\"command\\\":\\\"sleep 0.4; echo b\\\"}\"}}"
+                   "]}}]}\n\n"
+                   "data: [DONE]\n\n";
+        }
+        (void)write(cfd, resp, strlen(resp));
+        close(cfd);
+    }
+    _exit(0);
+}
+
+/* chunked-response schreiben und den socket OFFEN halten: erst
+ * so kann ein mock mehrere requests auf EINER verbindung
+ * bedienen (SSE endet normal am connection-close, das hier
+ * explizit NICHT gesendet wird). */
+static void write_chunked_keepalive(int cfd, const char *body)
+{
+    char head[256];
+    int n = snprintf(head, sizeof head,
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/event-stream\r\n"
+                     "Transfer-Encoding: chunked\r\n"
+                     "\r\n"
+                     "%zx\r\n",
+                     strlen(body));
+    (void)write(cfd, head, (size_t)n);
+    (void)write(cfd, body, strlen(body));
+    (void)write(cfd, "\r\n0\r\n\r\n", 7);
+}
+
+/* client-reuse: dieser server akzeptiert GENAU EINE verbindung und
+ * bedient beide anfragen des agent-loops (runde 1: tool-call,
+ * runde 2: finale antwort) auf demselben socket. wuerde send_stream
+ * pro runde einen neuen client bauen, ginge die zweite anfrage auf
+ * eine neue verbindung – die akzeptiert der server spaeter nur noch
+ * als bogus und beantwortet sie mit 500, damit der test schnell
+ * faelschlich failt statt am 120s-timeout zu haengen. */
+static pid_t start_keepalive_server(int *port)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    int cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        _exit(1);
+    }
+    char req[65536];
+    for (int round = 0; round < 2; round++) {
+        req[0] = '\0';
+        (void)read_request(cfd, req, sizeof req);
+        if (round == 0) {
+            write_chunked_keepalive(
+                cfd, "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
+                     "{\"index\":0,\"id\":\"call_1\",\"function\":{"
+                     "\"name\":\"bash\",\"arguments\":"
+                     "\"{\\\"command\\\":\\\"echo reuse-test\\\"}\"}}"
+                     "]}}]}\n\n"
+                     "data: [DONE]\n\n");
+        } else {
+            write_chunked_keepalive(
+                cfd, "data: {\"choices\":[{\"delta\":{\"content\":"
+                     "\"auf einer verbindung\"}}]}\n\n"
+                     "data: [DONE]\n\n");
+        }
+    }
+    close(cfd);
+
+    /* eine dritte verbindung waere der reuse-fehler: schnell 500 */
+    int bogus = accept(lfd, NULL, NULL);
+    if (bogus >= 0) {
+        static const char err[] =
+            "HTTP/1.1 500 Connection wurde nicht wiederverwendet\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n";
+        (void)write(bogus, err, sizeof err - 1);
+        close(bogus);
+    }
+    _exit(0);
+}
+
 /* ein provider, ein modell, base-url auf den mock-port */
 static void build_mock_cfg(Config *cfg, int port)
 {
@@ -531,15 +757,18 @@ static void test_agent_broken_call(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* context-management: passt der verlauf nicht mehr ins fenster des   */
-/* modells, geht der aelteste teil NICHT mehr raus – und der benutzer */
-/* sieht im verlauf, dass gekuerzt wurde.                             */
+/* context-management: laeuft das fenster ueber, wird der abfallende */
+/* verlauf per compaction zu einer summary verdichtet (llm-call) –  */
+/* der alte block geht NICHT mehr wortwoertlich raus, aber sein    */
+/* inhalt lebt in der summary weiter, und der benutzer sieht die    */
+/* compaction im verlauf.                                            */
 /* ------------------------------------------------------------------ */
 
-static void test_context_trim(void)
+static void test_context_compaction(void)
 {
     int port = 0;
-    pid_t server = start_probe_server(&port, "URALTE-NACHRICHT");
+    pid_t server = start_compact_probe_server(&port, "URALTE-NACHRICHT",
+                                              "## Goal: zusammenfassung-test");
     CHECK(server >= 0);
     if (server < 0) {
         return;
@@ -569,20 +798,26 @@ static void test_context_trim(void)
     int rc = send_stream(&st, &cfg, &HOOKS);
     CHECK(rc == 0);
 
-    /* der server hat den alten block NICHT gesehen */
+    /* der server hat den alten block wortwoertlich NICHT gesehen
+     * (er steckt nur in der summary) */
     ChatMessage *answer = &st.chat.msgs[st.chat.len - 1];
     CHECK(answer->role == CHAT_ROLE_ASSISTANT);
     CHECK(answer->text != NULL && strcmp(answer->text, "NEIN") == 0);
 
-    /* die kuerzung ist im verlauf vermerkt und im state gezaehlt */
+    /* compaction: summary uebernommen, watermark hinter dem alten
+     * block, kuerzung im verlauf vermerkt */
     CHECK(st.ctx.dropped == 1);
+    CHECK(st.ctx.summary != NULL);
+    CHECK(strcmp(st.ctx.summary, "## Goal: zusammenfassung-test") == 0);
+    CHECK(st.ctx.covered == 1);
+    CHECK(st.ctx.compact_failed == false);
     bool has_notice = false;
     for (size_t i = 0; i < st.chat.len; i++) {
-        if (st.chat.msgs[i].role == CHAT_ROLE_NOTICE) {
-            has_notice = true;
-            /* genau eine nachricht faellt weg: singular */
-            CHECK(strstr(st.chat.msgs[i].text,
-                         "1 nachricht am anfang weggelassen") != NULL);
+        if (st.chat.msgs[i].role == CHAT_ROLE_NOTICE &&
+            strstr(st.chat.msgs[i].text, "verlauf komprimiert") != NULL &&
+            strstr(st.chat.msgs[i].text, "wird") == NULL) {
+            has_notice = true; /* die fertige compaction, nicht die
+                                * vorankuendigung davor */
         }
     }
     CHECK(has_notice);
@@ -593,11 +828,70 @@ static void test_context_trim(void)
     CHECK(st.ctx.estimated > 0);
 
     chat_free(&st.chat);
+    ctx_reset(&st.ctx);
     input_free(&st.input);
     free_mock_cfg(&cfg);
 
     kill(server, SIGKILL);
     waitpid(server, NULL, 0);
+}
+
+/* faellt die compaction aus (server weg), bleibt trimming der
+ * fallback: alter block weg, hinweis im verlauf, runde lauft */
+static void test_context_compaction_fallback(void)
+{
+    int port = 0;
+    pid_t server = start_compact_probe_server(&port, "URALTE-NACHRICHT",
+                                              "## Goal: zusammenfassung-test");
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+    cfg.providers[0].models[0].context_window = 2000;
+
+    AppState st = {0};
+    input_init(&st.input);
+
+    char *old = malloc(8193);
+    if (old == NULL) {
+        die("out of memory");
+    }
+    memset(old, 'x', 8192);
+    old[8192] = '\0';
+    memcpy(old, "URALTE-NACHRICHT ", strlen("URALTE-NACHRICHT "));
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, old) == 0);
+    free(old);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neue frage") == 0);
+
+    /* compaction-server gleich wieder killen: der erste request
+     * (compaction) scheitert an der verbindung, der zweite (die
+     * eigentliche antwort) auch – die runde endet mit fehler */
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+
+    int rc = send_stream(&st, &cfg, &HOOKS);
+    CHECK(rc == -1);
+
+    /* fallback: summary frei, kuerzung vermerkt, retry-flag gesetzt */
+    CHECK(st.ctx.summary == NULL);
+    CHECK(st.ctx.compact_failed == true);
+    CHECK(st.ctx.covered == st.ctx.dropped);
+    bool has_notice = false;
+    for (size_t i = 0; i < st.chat.len; i++) {
+        if (st.chat.msgs[i].role == CHAT_ROLE_NOTICE &&
+            strstr(st.chat.msgs[i].text, "compaction fehlgeschlagen") != NULL) {
+            has_notice = true;
+        }
+    }
+    CHECK(has_notice);
+
+    chat_free(&st.chat);
+    ctx_reset(&st.ctx);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
 }
 
 /* gegenprobe: grosses fenster -> nichts wird weggelassen */
@@ -869,6 +1163,93 @@ static void test_agent_realloc(void)
  * ihren zeichen-kontext bekommt: geht sie verloren, dereferenziert
  * stream_redraw NULL – und zwar erst im echten betrieb, weil die
  * uebrigen tests mit ctx == NULL fahren. */
+/* zwei parallel laufende bash-calls dauern so lange wie EINER:
+ * sequenziell waeren es mindestens 0.8 s sleep. misst die
+ * gesamtzeit des turns und haelt sie gegen den grenzwert. */
+static void test_tools_parallel(void)
+{
+    int port = 0;
+    pid_t server = start_parallel_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "mach zwei dinge") == 0);
+
+    long long t0 = mono_ms();
+    int rc = send_stream(&st, &cfg, &HOOKS);
+    long long dt = mono_ms() - t0;
+    CHECK(rc == 0);
+
+    /* beide ergebnisse da, in call-reihenfolge; danach die finale
+     * antwort: user, assistant(2 calls), tool, tool, assistant */
+    CHECK(st.chat.len == 5);
+    CHECK(st.chat.msgs[1].tool_calls_len == 2);
+    CHECK(st.chat.msgs[2].role == CHAT_ROLE_TOOL);
+    CHECK(st.chat.msgs[2].tool_call_id != NULL &&
+          strcmp(st.chat.msgs[2].tool_call_id, "call_a") == 0);
+    CHECK(strstr(st.chat.msgs[2].text, "a\n") != NULL);
+    CHECK(st.chat.msgs[3].role == CHAT_ROLE_TOOL);
+    CHECK(st.chat.msgs[3].tool_call_id != NULL &&
+          strcmp(st.chat.msgs[3].tool_call_id, "call_b") == 0);
+    CHECK(strstr(st.chat.msgs[3].text, "b\n") != NULL);
+    CHECK(strcmp(st.chat.msgs[4].text, "beide da") == 0);
+
+    /* parallel: gut unter 2 * 400 ms sleep + overhead. sequenziell
+     * waeren es 800 ms sleep ALLEIN – der grenzwert liegt mit
+     * 750 ms dazwischen */
+    CHECK(dt < 750);
+    CHECK(dt >= 400);
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
+/* beide anfragen eines agent-loops (tool-runde + antwort-runde)
+ * laufen auf EINER verbindung: der client bleibt ueber die runden
+ * am leben, kein tcp/tls-handshake pro runde. */
+static void test_client_reuse(void)
+{
+    int port = 0;
+    pid_t server = start_keepalive_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "frage") == 0);
+
+    int rc = send_stream(&st, &cfg, &HOOKS);
+    CHECK(rc == 0);
+
+    /* runde 1: tool-call ausgefuehrt; runde 2: finale antwort */
+    CHECK(st.chat.len == 4); /* user, assistant(call), tool, assistant */
+    CHECK(strstr(st.chat.msgs[2].text, "reuse-test") != NULL);
+    CHECK(strcmp(st.chat.msgs[3].text, "auf einer verbindung") == 0);
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
 static void test_hooks_ctx(void)
 {
     int port = 0;
@@ -1117,6 +1498,31 @@ int main(void)
     free(msgs);
     msgs = NULL;
 
+    /* --- summary (compaction) als USER-nachricht hinter dem system --- */
+    char *wrapped = ctx_summary_wrap("aufgabe: tests schreiben");
+    CHECK(wrapped != NULL);
+    if (wrapped != NULL) {
+        n = send_build_messages_from(&chat, 0, "sys", wrapped, &msgs);
+        CHECK(n == 4);
+        CHECK(msgs != NULL && msgs[0].role == OAI_ROLE_SYSTEM);
+        CHECK(msgs != NULL && strcmp(msgs[0].content, "sys") == 0);
+        CHECK(msgs != NULL && msgs[1].role == OAI_ROLE_USER);
+        CHECK(msgs != NULL && msgs[1].content == wrapped); /* geborgt */
+        CHECK(msgs != NULL &&
+              strstr(msgs[1].content, "aufgabe: tests") != NULL);
+        CHECK(msgs != NULL && msgs[2].role == OAI_ROLE_SYSTEM);
+        CHECK(msgs != NULL && msgs[3].role == OAI_ROLE_USER);
+        free(msgs);
+        msgs = NULL;
+
+        /* leerer wrap (NULL): wie ohne summary */
+        n = send_build_messages_from(&chat, 0, "sys", NULL, &msgs);
+        CHECK(n == 3);
+        free(msgs);
+        msgs = NULL;
+        free(wrapped);
+    }
+
     /* --- send_find_model --- */
     Config cfg;
     build_cfg(&cfg);
@@ -1186,12 +1592,15 @@ int main(void)
     test_stream();
     test_agent();
     test_agent_broken_call();
-    test_context_trim();
+    test_context_compaction();
+    test_context_compaction_fallback();
     test_context_fits();
     test_stream_abort();
     test_stream_no_abort();
     test_agent_realloc();
     test_hooks_ctx();
+    test_tools_parallel();
+    test_client_reuse();
 
     chat_free(&chat);
     return test_report();

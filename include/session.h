@@ -149,6 +149,12 @@ int session_log_error(Session *s, const char *text, long http_status);
 /* hinweis der app (verlauf gekuerzt, abgebrochen, ...) */
 int session_log_notice(Session *s, const char *text);
 
+/* compaction-ereignis: die llm hat den verlauf bis chat-index
+ * `covered` zur text-zusammenfassung `summary` verdichtet. beim
+ * replay (replay_line) landet beides im CtxUsage und ersetzt dort
+ * eine evtl. aeltere summary – es gibt immer nur die letzte. */
+int session_log_compaction(Session *s, const char *summary, size_t covered);
+
 /* ------------------------------------------------------------------ */
 /* session-liste fuer den resume-dialog                               */
 /* ------------------------------------------------------------------ */

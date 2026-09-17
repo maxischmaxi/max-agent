@@ -175,6 +175,48 @@ static void test_transcript_replay(void)
     session_free(&s);
 }
 
+/* compaction-ereignis: log + replay. beim replay landet die letzte
+ * summary samt watermark im ctx – aeltere compactionen werden
+ * dabei ersetzt (es gibt immer nur die juengste). */
+static void test_compaction_replay(void)
+{
+    Session s = {0};
+    fill_session(&s);
+
+    CHECK(session_log_compaction(&s, "erste zusammenfassung", 3) == 0);
+    CHECK(session_log_compaction(&s, "zweite zusammenfassung", 5) == 0);
+
+    char id[SESSION_ID_MAX];
+    (void)snprintf(id, sizeof id, "%s", s.id);
+    session_end(&s);
+    CHECK(session_open(&s, id) == 0);
+
+    Chat chat = {0};
+    CtxUsage ctx = {0};
+    CHECK(session_read_transcript(&s, &chat, &ctx) == 0);
+
+    /* die compaction ist KEINE chat-nachricht: der verlauf bleibt
+     * unberuehrt (6 zeilen wie in test_transcript_replay), aber der
+     * ctx traegt summary + watermark */
+    CHECK(chat.len == 6);
+    CHECK(ctx.summary != NULL);
+    CHECK(strcmp(ctx.summary, "zweite zusammenfassung") == 0);
+    CHECK(ctx.covered == 5);
+    CHECK(ctx.compact_failed == false);
+
+    ctx_reset(&ctx);
+    CHECK(ctx.summary == NULL);
+    chat_free(&chat);
+
+    /* ctx == NULL (niemand will die summary): replay laeuft trotzdem */
+    Chat chat2 = {0};
+    CHECK(session_read_transcript(&s, &chat2, NULL) == 0);
+    CHECK(chat2.len == 6);
+    chat_free(&chat2);
+
+    session_free(&s);
+}
+
 static void test_rename(void)
 {
     Session s = {0};
@@ -557,6 +599,7 @@ int main(void)
 
     test_lifecycle();
     test_transcript_replay();
+    test_compaction_replay();
     test_rename();
     test_noop_without_session();
     test_cwd_binding();

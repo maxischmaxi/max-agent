@@ -185,6 +185,7 @@ int main(int argc, char **argv)
     input_free(&state.input);
     chat_free(&state.chat);
     history_free(&state.history);
+    ctx_reset(&state.ctx); /* compaction-summary freigeben */
     session_list_free(&state.sessions);
     session_free(&state.session);
     free_config(&cfg);
