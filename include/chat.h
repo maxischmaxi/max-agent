@@ -145,9 +145,14 @@ typedef struct {
                    /* implizit true                    */
     ChatRole role; /* kopie der nachrichten-rolle: die   */
                    /* slot-mapping braucht sie ohne state-pointer */
-    int tool;      /* -1 = textzeile; sonst index in    */
-                   /* msgs[msg].tool_calls: render-zeile   */
-                   /* des calls (off/len unbenutzt)      */
+    int tool;      /* -1 = textzeile; -2 = tabellen-zeile */
+                   /* (off/len im tabellen-display-string, */
+                   /* blk_start/blk_end = block-grenzen   */
+                   /* im originaltext); sonst index in    */
+                   /* msgs[msg].tool_calls: render-zeile  */
+                   /* des calls (off/len unbenutzt)       */
+    size_t blk_start; /* tool==-2: tabelle im originaltext  */
+    size_t blk_end;   /* (beide byte-offsets, end exklusiv) */
 } ChatLine;
 
 /* alle render-zeilen des transcripts fuer eine text-breite (in

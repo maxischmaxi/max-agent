@@ -26,6 +26,12 @@ typedef enum {
      * defaults stehen in theme.c, themes koennen abweichen. */
     THEME_ROLE_MD_HEAD,    /* # ## ### ueberschriften (fett+akzent)   */
     THEME_ROLE_MD_MARKER,  /* "- ", "* ", "1." listen-marker          */
+    /* code-highlighting in ```-bloecken (markdown.c tokenisiert,
+     * draw.c faerbt nach diesen rollen) */
+    THEME_ROLE_MD_KW,      /* schluesselwoerter: akzent + fett        */
+    THEME_ROLE_MD_STR,     /* string-literale                        */
+    THEME_ROLE_MD_NUM,     /* zahlen                                 */
+    THEME_ROLE_MD_COMMENT, /* kommentare (NULL = faint wie DIM)       */
     /* hintergrund der eigenen nachrichten: ein bisschen heller
      * (dunkles terminal) bzw. etwas abgesetzt (helles terminal)
      * als der normale hintergrund – so erkennt man eigene

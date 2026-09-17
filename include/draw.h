@@ -37,12 +37,14 @@ void draw(int rows, int cols, AppState *state, const Config *cfg);
 
 /* nach SIGWINCH: das terminal hat umgebrochen, der relative
  * cursor-zustand ist unbrauchbar – bis zum boden scrollen und den
- * dock frisch aufsetzen. draw_tail_only=true druckt danach noch
- * den schwanz des chats, der auf EINEN bildschirm passt (nach dem
- * umbrechen ist der alte content im scrollback unbraeuchlich
- * zerlegt): der benutzer sieht sofort wieder unterhaltung UND
- * dock, ohne erst eine taste drucken zu muessen. */
-void draw_reset(int rows, bool draw_tail_only);
+ * dock frisch aufsetzen. full_reprint=true druckt danach den
+ * KOMPLETTEN chat mit der neuen breite erneut (g_printed faellt
+ * auf 0): der alte content steht im scrollback falsch umbrochen,
+ * der neue ist lesbar – und alle nachrichten bleiben im verlauf,
+ * auch die vor dem resize. das ist der unterschied zum tail-only-
+ * druck nach /new und resume (draw_content_reset), wo der alte
+ * inhalt wirklich ersetzt wurde. */
+void draw_reset(int rows, bool full_reprint);
 
 /* leichter frame waehrend die ki arbeitet: nur die spinner-zeile(n)
  * werden in ort und stelle ueberschrieben, der rest des docks

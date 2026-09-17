@@ -38,6 +38,11 @@ static const char *const ROLE_DEFAULTS[THEME_ROLE_COUNT] = {
     [THEME_ROLE_DIM] = "\x1b[2m",    /* faint: beiwerk */
     [THEME_ROLE_MD_HEAD] = NULL,   /* = match-farbe + bold, theme_role() */
     [THEME_ROLE_MD_MARKER] = NULL, /* dito, ohne bold */
+    [THEME_ROLE_MD_KW] = NULL,      /* = match (akzent), fett via caller */
+    [THEME_ROLE_MD_STR] = "\x1b[32m",  /* gruen: strings, auf beiden
+                                      * paletten lesbar */
+    [THEME_ROLE_MD_NUM] = "\x1b[33m",  /* gelb: zahlen */
+    [THEME_ROLE_MD_COMMENT] = NULL, /* = faint (DIM) */
     /* user-bg: ein palette-grau, das auf hellen UND dunklen
      * terminals funktioniert. pick_auto waelt nach der OSC-11-
      * antwort ein passenderes (238 dunkel / 250 hell); ohne
@@ -53,8 +58,12 @@ const char *theme_role(ThemeRole role)
     if (g_theme.roles[role] != NULL) {
         return g_theme.roles[role]; /* das theme weichtet ab */
     }
-    if (role == THEME_ROLE_ASSISTANT || role == THEME_ROLE_MD_MARKER) {
+    if (role == THEME_ROLE_ASSISTANT || role == THEME_ROLE_MD_MARKER ||
+        role == THEME_ROLE_MD_KW) {
         return g_theme.match; /* folgt der akzentfarbe */
+    }
+    if (role == THEME_ROLE_MD_COMMENT) {
+        return theme_role(THEME_ROLE_DIM); /* faint, wie beiwerk */
     }
     if (role == THEME_ROLE_MD_HEAD) {
         /* ueberschriften: die akzentfarbe, fett – der default,

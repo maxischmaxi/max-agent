@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "markdown.h"
 #include "utils.h"
 
 /* ------------------------------------------------------------------ */
@@ -286,8 +287,44 @@ static void wrap_emit(ChatRole role, size_t msg, size_t off, size_t len,
         out[*count].first = first;
         out[*count].lstart = lstart;
         out[*count].tool = tool;
+        out[*count].blk_start = 0;
+        out[*count].blk_end = 0;
     }
     (*count)++;
+}
+
+/* tabelle: ausgerichtete darstellung (md_table_display) und deren
+ * zeilen emittieren. die ChatLines zeigen mit tool==-2 auf den
+ * darstellungs-string; blk_start/blk_end verweisen auf die tabelle
+ * im ORIGINAL-text, damit der renderer sie (fuer die farbe)
+ * identifizieren kann. */
+static void wrap_table(ChatRole role, size_t msg, const char *text,
+                       size_t start, size_t end, int full_width,
+                       ChatLine *out, size_t out_max, size_t *count)
+{
+    char *disp = md_table_display(text, start, end, full_width);
+    if (disp == NULL) {
+        return; /* keine tabelle (defensiv) */
+    }
+    size_t dl = strlen(disp);
+    size_t off = 0;
+    bool first = true;
+    while (off < dl) {
+        size_t e = off;
+        while (e < dl && disp[e] != '\n') {
+            e++;
+        }
+        wrap_emit(role, msg, off, e - off, first, first, -2, out, out_max,
+                  count);
+        /* blk-grenzen nachtragen (wrap_emit kennt sie nicht) */
+        if (out != NULL && *count <= out_max) {
+            out[*count - 1].blk_start = start;
+            out[*count - 1].blk_end = end;
+        }
+        first = false;
+        off = e + 1;
+    }
+    free(disp);
 }
 
 /* hex-wert einer ziffer, -1 bei allem anderen */
@@ -528,6 +565,18 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
             continue;
         }
         ChatRole role = chat->msgs[mi].role;
+
+        /* markdown-bloecke NUR fuer ki-antworten: tabellen werden
+         * als ausgerichtete darstellung emittiert (volle breite),
+         * fences als text (row_msg tokenisiert sie). der scan ist
+         * billig (ein durchlauf) und wird je frame neu gemacht. */
+        MdBlocks blks;
+        bool has_blocks = false;
+        if (role == CHAT_ROLE_ASSISTANT) {
+            md_block_scan(text, &blks);
+            has_blocks = (blks.n > 0);
+        }
+
         bool first = true;     /* erste zeile dieser nachricht */
         bool lstart = true;    /* zeile beginnt am originalen \n-anfang */
         size_t off = 0;        /* byte-offset des zeilenanfangs */
@@ -536,6 +585,24 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
         size_t i = 0;
 
         while (text[i] != '\0') {
+            /* tabelle? an jedem originalen zeilenanfang (lstart)
+             * pruefen: beginnt hier ein tabellen-block, wird er
+             * als GANZES als darstellung emittiert und danach
+             * hinter dem block weitergescannt */
+            if (has_blocks && off == i) {
+                const MdBlock *tb = md_block_at(&blks, i);
+                if (tb != NULL && tb->kind == MD_BLK_TABLE) {
+                    wrap_table(role, mi, text, tb->start, tb->end, width, out,
+                               out_max, &count);
+                    first = false;
+                    lstart = true;
+                    i = tb->end;
+                    off = i;
+                    cells = 0;
+                    brk = SIZE_MAX;
+                    continue;
+                }
+            }
             if (text[i] == '\r') {
                 /* CR sollte nie hier ankommen (chat_append filtert);
                  * defensiv als zeilenumbruch werten statt es im text

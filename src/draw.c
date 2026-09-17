@@ -875,6 +875,80 @@ static void row_quit(Row *r)
  * scanner ist zeilenlokal (kein block-zustand): das highlight ist
  * damit schon waehrend des streamings stabil, wenn die zeile erst
  * halb da ist. */
+/* markdown-bloecke der aktuellen live-nachricht: chat_wrap scannt
+ * (fuer tabellen), row_msg fragt hier (fuer fence-highlight). der
+ * zeiger gilt nur waehrend eines frames. */
+static MdBlocks g_msg_blocks;
+static bool g_msg_blocks_valid = false;
+
+/* eine zeile in einem ```-fence: der inhalt wird token-fuer-token
+ * gefaerbt. die fence-zeilen selbst (ticks) sind faint. tokens
+ * ueber die GANZE nachricht konsistent: ein string, der in einer
+ * umbruch-folgezeile weiterlaeuft, wird neu klassifiziert – der
+ * tokenizer laeuft ab zeilenanfang, denn nur dort ist der
+ * kontext (kommentar offen? string offen?) eindeutig genug fuer
+ * ein streaming-sicheres bild. rudimentaer, aber stabil. */
+static void row_code(Row *r, const ChatLine *ln, const char *text,
+                     const char *lang)
+{
+    bool fence_line =
+        (ln->lstart && ln->len >= 3 && text[ln->off] == '`' &&
+         text[ln->off + 1] == '`' && text[ln->off + 2] == '`');
+
+    if (fence_line) {
+        row_sgr(r, theme_role(THEME_ROLE_DIM));
+        row_putn(r, text + ln->off, (int)ln->len);
+        row_sgr(r, THEME_ROLE_RESET);
+        return;
+    }
+
+    /* content: tokenizer ab zeilenanfang, ausgabe bis zeilenende.
+     * tokens koennen uebers zeilenende hinausgehen (string ohne
+     * schliesser, block-kommentar): sie werden an der zeile
+     * abgeschnitten – der tokenizer läuft beim naechsten frame
+     * wieder von vorn. */
+    size_t lend = ln->off + ln->len;
+    size_t i = ln->off;
+    /* block-kommentare ueber mehrere zeilen werden ab ihrem
+     * start-token gezaehlt; folgezeilen ohne eigenes start-token
+     * sind normaler text (rudimentaer, dokumentiert). */
+    while (i < lend) {
+        MdTok tok;
+        size_t n = md_code_token(text, i, lang, &tok);
+        if (n == 0) {
+            break;
+        }
+        size_t t_end = i + tok.len;
+        if (t_end > lend) {
+            t_end = lend; /* token ueber zeilenende: abschneiden */
+        }
+        switch (tok.kind) {
+        case MD_TOK_KW:
+            row_sgr(r, theme_role(THEME_ROLE_MD_KW));
+            row_sgr(r, "\x1b[1m");
+            break;
+        case MD_TOK_STR:
+            row_sgr(r, theme_role(THEME_ROLE_MD_STR));
+            break;
+        case MD_TOK_NUM:
+            row_sgr(r, theme_role(THEME_ROLE_MD_NUM));
+            break;
+        case MD_TOK_COMMENT:
+            row_sgr(r, theme_role(THEME_ROLE_MD_COMMENT));
+            break;
+        default:
+            row_sgr(r, THEME_ROLE_RESET);
+            break;
+        }
+        row_putn(r, text + i, (int)(t_end - i));
+        i = t_end;
+        if (t_end == i && tok.len == 0) {
+            break;
+        }
+    }
+    row_sgr(r, THEME_ROLE_RESET);
+}
+
 static void row_msg(Row *r, const ChatLine *ln, const char *text)
 {
     bool user = (ln->role == CHAT_ROLE_USER);
@@ -885,6 +959,18 @@ static void row_msg(Row *r, const ChatLine *ln, const char *text)
     }
 
     row_putc(r, ' '); /* linkes padding */
+
+    /* code-fence: block-tabelle fragen (gilt nur fuer ki-antworten
+     * und nur, wenn der frame die blocks gesetzt hat) */
+    if (ln->role == CHAT_ROLE_ASSISTANT && g_msg_blocks_valid) {
+        const MdBlock *blk = md_block_at(&g_msg_blocks, ln->off);
+        if (blk != NULL && blk->kind == MD_BLK_CODE) {
+            row_code(r, ln, text, blk->lang);
+            row_putc(r, ' '); /* rechtes padding */
+            row_sgr(r, THEME_ROLE_RESET);
+            return;
+        }
+    }
 
     if (ln->role == CHAT_ROLE_ASSISTANT && ln->lstart) {
         /* markdown-scanning nur am ORIGINALEN zeilenanfang (lstart,
@@ -1121,9 +1207,10 @@ void draw_content_reset(void)
     g_tail_only = true;
 }
 
-void draw_reset(int rows, bool tail_only)
+void draw_reset(int rows, bool full_reprint)
 {
-    dbg("draw: reset (%d zeilen scrollen, tail=%d)", rows, (int)tail_only);
+    dbg("draw: reset (%d zeilen scrollen, full=%d)", rows,
+        (int)full_reprint);
     /* nach einem resize hat das terminal umgebrochen – der
      * relative cursor-zustand ist unbrauchbar. bis zum boden
      * scrollen (der cursor sitzt danach garantiert unten) und den
@@ -1135,14 +1222,24 @@ void draw_reset(int rows, bool tail_only)
     g_prev_rows = 0;
     g_busy_up = 0; /* layout ungueltig: nur volle frames */
     g_tool_spin_up = 0;
-    /* der alte content ist im scrollback falsch umbrochen – dort
-     * steht er zerlegt und unlesbar. nur der schwanz, der auf
-     * EINEN bildschirm passt, wird im naechsten frame neu
-     * gedruckt (dasselbe verfahren wie bei /new und resume). die
-     * frontier (g_printed) faellt zurueck und der renderer
-     * druckt ab dem berechneten start neu. */
-    if (tail_only) {
-        g_tail_only = true;
+    /* RESIZE: der alte content steht im scrollback falsch umge-
+     * brochen – unlesbar, aber noch da. der ganze chat wird im
+     * naechsten frame MIT DER NEUEN BREITE erneut gedruckt:
+     * g_printed faellt auf 0, der renderer setzt alle nachrich-
+     * ten neu an. darueber bleibt der zerbrochene alte rest im
+     * scrollback, der neue ist lesbar.
+     *
+     * g_tail_only (nur der schwanz nach /new und resume) gehoert
+     * hier NICHT her: dort wurde der inhalt ERSETZT, hier ist er
+     * derselbe – nur die geometrie hat sich geaendert. ein
+     * budget-kappung beim resize haette die folgen-dran-nach-
+     * richten im verlauf verloren (bis zum naechsten resize
+     * fehlten alle aelteren im scrollback). */
+    if (full_reprint) {
+        g_printed = 0;
+        g_live_msg = 0;
+        g_live_msg_valid = false;
+        g_live_lines = 0;
     }
 }
 
@@ -1535,6 +1632,7 @@ static void lines_reserve(size_t need)
 static void wrap_tail(const Chat *chat, size_t from, int text_w)
 {
     g_nlines = 0;
+    g_msg_blocks_valid = false;
     if (from >= chat->len) {
         return;
     }
@@ -1545,6 +1643,19 @@ static void wrap_tail(const Chat *chat, size_t from, int text_w)
     lines_reserve(need);
     (void)chat_wrap(&sub, text_w, g_lines, g_lines_cap);
     g_nlines = need;
+    /* block-tabelle fuer den fence-highlight: die letzte
+     * ki-nachricht im schwanz (ihre zeilen sind die, die row_msg
+     * gleich zeichnet). committete nachrichten brauchen keine
+     * mehr – sie sind im scrollback, ein neuer frame zeichnet
+     * nur die frontier und die live-zeile. */
+    for (size_t m = chat->len; m > from; m--) {
+        const ChatMessage *msg = &chat->msgs[m - 1];
+        if (msg->role == CHAT_ROLE_ASSISTANT && msg->text != NULL) {
+            md_block_scan(msg->text, &g_msg_blocks);
+            g_msg_blocks_valid = true;
+            break;
+        }
+    }
 }
 
 /* zeilenbereich [s,e) der relativen nachricht m in g_lines */
@@ -1707,10 +1818,48 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
     /* ---- live-nachricht: die letzte assistant-nachricht, solange
      *      die anfrage laeuft (streaming-platzhalter) ---- */
     size_t live_idx = SIZE_MAX;
+    bool live_open_block = false; /* live-nachricht enthaelt einen
+                                   * block, der noch waechst */
+    size_t live_keep = 0; /* offener block: so viele zeilen von
+                           * unten bleiben live (budget), der rest
+                           * committet in den scrollback */
     if (state->busy && chat->len > 0 &&
         chat->msgs[chat->len - 1].role == CHAT_ROLE_ASSISTANT &&
         chat->msgs[chat->len - 1].tool_calls_len == 0) {
         live_idx = chat->len - 1;
+        /* offener block: der letzte block reicht bis ans text-ende
+         * (end == tlen) – der scanner schliesst dort immer, ob
+         * mit echtem schliesser oder streaming-offen. beim
+         * committen wuerden halbfertige tabellen-breiten bzw. der
+         * wachsende fence eingefroren; die nachricht bleibt
+         * deshalb (budgetiert) live. */
+        /* block-scan JETZT (nicht erst in wrap_tail): der
+         * open-detect braucht die tabelle zum text DIESES
+         * frames. mit dem vorframes-stand feuerte er einen
+         * frame zu spaet und committete in den oeffnenden
+         * block hinein (doppelte zeilen im scrollback). */
+        const char *lt = chat->msgs[live_idx].text;
+        if (lt != NULL) {
+            md_block_scan(lt, &g_msg_blocks);
+            g_msg_blocks_valid = true;
+            for (int b = g_msg_blocks.n - 1; b >= 0; b--) {
+                const MdBlock *blk = &g_msg_blocks.blocks[b];
+                /* offen = der letzte block reicht bis ans
+                 * text-ende (end == tlen) – der scanner
+                 * schliesst dort immer, ob mit echtem
+                 * schliesser oder streaming-offen. beim
+                 * committen wuerden halbfertige tabellen-
+                 * breiten bzw. der wachsende fence eingefroren;
+                 * die nachricht bleibt deshalb (budgetiert) live. */
+                if (blk->end == strlen(lt) && blk->end > blk->start) {
+                    if (blk->kind == MD_BLK_CODE ||
+                        blk->kind == MD_BLK_TABLE) {
+                        live_open_block = true;
+                    }
+                }
+                break; /* nur der letzte block zaehlt */
+            }
+        }
     }
 
     /* platzhalter wurde entfernt (fehler/abbruch): frontier
@@ -1726,6 +1875,23 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
 
     /* ---- wrap des schwanzes ---- */
     wrap_tail(chat, from, text_w);
+
+    /* offener block: budget fuer die live-region. msg_line_range
+     * braucht die FRISCHEN g_lines – deshalb erst nach dem wrap.
+     * die letzten live_keep zeilen der live-nachricht bleiben
+     * ueberschreibbar (mit dem dock zusammen auf dem bildschirm),
+     * der anfang committet in den scrollback. */
+    if (live_open_block && live_idx != SIZE_MAX && live_idx >= from) {
+        size_t s = 0;
+        size_t e = 0;
+        msg_line_range(live_idx - from, &s, &e);
+        size_t total_lines = e - s;
+        size_t avail = (size_t)(rows - dock_n);
+        if (avail < 2) {
+            avail = 2;
+        }
+        live_keep = (total_lines <= avail) ? total_lines : avail;
+    }
 
     /* ---- vorherigen live+dock-bereich raeumen: der cursor parkt
      *      nach jedem frame auf der LETZTEN dock-zeile, die
@@ -1768,8 +1934,62 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
         }
         bool is_live = (mi == live_idx);
         size_t stop = total;
-        if (is_live && total > 0) {
+        if (is_live && total > 0 && !live_open_block) {
             stop = total - 1;
+        }
+        if (is_live && live_open_block) {
+            /* block offen: committet wird hoechstens bis zur
+             * zeile VOR dem block-anfang. der commit-offset darf
+             * nie IN den block hineinwachsen – ein block, der
+             * nach einem commit beginnt (streaming: der fence
+             * kommt erst mit einem spaeteren chunk), haette
+             * sonst schon committete zeilen im scrollback, die
+             * beim block-wachsen nicht mehr mitfaerben koennen.
+             * die live-region umfasst block + budget. */
+            size_t blk_first = total; /* erste zeile des blocks */
+            if (g_msg_blocks_valid && g_msg_blocks.n > 0) {
+                const MdBlock *blk =
+                    &g_msg_blocks.blocks[g_msg_blocks.n - 1];
+                for (size_t li = s; li < e; li++) {
+                    if (g_lines[li].tool == -2 ||
+                        (g_lines[li].lstart &&
+                         g_lines[li].off >= blk->start &&
+                         g_lines[li].off < blk->end)) {
+                        blk_first = li - s;
+                        break;
+                    }
+                }
+            }
+            /* commit-grenze: nie IN einen block, und NIE
+             * r ueber committetes zurueck (g_live_lines ist
+             * monoton – ein rollback wuerde zeilen doppelt
+             * drucken). */
+            if (blk_first < g_live_lines) {
+                /* der block begann nach einem frueheren commit:
+                 * diese zeilen stehen schon im scrollback. wir
+                 * koennen sie nicht mehr live machen – der block
+                 * committet also mit (halb fertige tabelle im
+                 * scrollback ist besser als doppelt druck). */
+                stop = total - 1; /* letzte zeile bleibt live */
+            } else {
+                stop = blk_first;
+                if (total - stop > live_keep) {
+                    /* budget: live-region zu gross – weitere
+                     * zeilen vor dem block committen */
+                    size_t extra = total - stop - live_keep;
+                    if ((size_t)stop > extra) {
+                        stop -= extra;
+                    } else {
+                        stop = 0;
+                    }
+                    if (stop < g_live_lines) {
+                        stop = g_live_lines; /* monoton halten */
+                    }
+                }
+            }
+            g_live_msg = mi;
+            g_live_msg_valid = true;
+            g_live_lines = stop; /* committete zeilen */
         }
         /* die erste VORHANDENE zeile der nachricht (separator-
          *anker). eine leere assistant-nachricht mit tool-calls
@@ -1796,7 +2016,44 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
             const ChatLine *ln = &g_lines[li];
             const ChatMessage *lm = &chat->msgs[ln->msg + from];
 
-            if (ln->tool >= 0) {
+            if (ln->tool == -2) {
+                /* tabellen-zeile: off/len zeigen in den tabellen-
+                 * display-string (md_table_display), nicht in den
+                 * nachricht-text. der inhalt ist linksbuendig
+                 * ausgerichtet, die pipes farbig. der string ist
+                 * pro frame frisch – chat_wrap baut ihn beim
+                 * wrappen. hier drucken wir die zeile STUECKWEISE:
+                 * pipes in akzentfarbe, zellen normal. */
+                row_start(main_w);
+                row_sgr(&g_row, THEME_ROLE_RESET);
+                {
+                    /* display-string fuer diese tabelle neu bauen
+                     * (gleicher algorithmus wie chat_wrap: die
+                     * zeilen MUessen identisch sein) */
+                    char *disp = md_table_display(
+                        lm->text, ln->blk_start, ln->blk_end, main_w);
+                    if (disp != NULL) {
+                        size_t dl = strlen(disp);
+                        size_t off = ln->off;
+                        if (off < dl) {
+                            for (size_t b = 0; b < ln->len; b++) {
+                                char c = disp[off + b];
+                                if (c == '|') {
+                                    row_sgr(&g_row,
+                                            theme_current()->match);
+                                    row_putc(&g_row, c);
+                                    row_sgr(&g_row, THEME_ROLE_RESET);
+                                } else {
+                                    row_putc(&g_row, c);
+                                }
+                            }
+                        }
+                        free(disp);
+                    }
+                }
+                row_sgr(&g_row, THEME_ROLE_RESET);
+                row_finish(true);
+            } else if (ln->tool >= 0) {
                 /* tool-call-zeile: bei einer nachricht OHNE text
                  * (die ki hat nur tools aufgerufen) steht das "ai"-
                  * label direkt am ersten call – eine eigene zeile
@@ -1853,14 +2110,24 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
     if (live_idx != SIZE_MAX) {
         g_printed = live_idx; /* live-nachricht ist die frontier */
     } else {
+        /* turn vorbei: die live-nachricht ist fertig und wird im
+         * naechsten frame GANZ gedruckt (g_live_lines 0) – so
+         * bekommt die tabelle ihre finalen breiten. der frame
+         * nach dem turn raeumt die alte live-region (g_prev_rows
+         * stimmt vom letzten frame) und druckt die nachricht
+         * komplett neu. */
         g_printed = chat->len;
         g_live_msg_valid = false;
         g_live_lines = 0;
     }
 
-    /* ---- live-zeile: das wachsende stream-ende. das "thinking"
+    /* ---- live-zeile(n): das wachsende stream-ende. das "thinking"
      *      lebt seit der spinner-umstellung in der rahmenzeile des
-     *      eingabefelds – ohne text gibt es hier KEINE zeile ---- */
+     *      eingabefelds – ohne text gibt es hier KEINE zeile.
+     *      bei offenem block (fence/tabelle) sind ALLE zeilen der
+     *      live-nachricht live: sie werden je frame komplett neu
+     *      gezeichnet (breiten wachsen mit), gemaess der
+     *      live_open_block-regel weiter oben committet nichts. */
     bool live_text = false;
     if (state->busy && live_idx != SIZE_MAX &&
         chat->msgs[live_idx].text[0] != '\0') {
@@ -1868,12 +2135,62 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
         size_t e = 0;
         msg_line_range(live_idx - from, &s, &e);
         if (e > s) {
-            const ChatLine *ln = &g_lines[e - 1];
-            if (ln->tool < 0) {
-                row_start(main_w);
-                row_msg(&g_row, ln, chat->msgs[live_idx].text);
-                row_finish(true);
+            if (live_open_block) {
+                /* live ab dem commit-punkt (der content-loop
+                 * hat alles davor gedruckt) bis zum ende; das
+                 * budget begrenzt von unten, committete zeilen
+                 * werden nie doppelt gezeichnet. */
+                size_t first_live = e - live_keep;
+                if (first_live < s) {
+                    first_live = s;
+                }
+                if (g_live_msg_valid && g_live_msg == live_idx &&
+                    first_live < s + g_live_lines) {
+                    first_live = s + g_live_lines;
+                }
+                for (size_t li = first_live; li < e; li++) {
+                    const ChatLine *ln = &g_lines[li];
+                    if (ln->tool >= 0) {
+                        continue;
+                    }
+                    row_start(main_w);
+                    if (ln->tool == -2) {
+                        /* tabelle: wie im content-loop (pipes farbig) */
+                        char *disp = md_table_display(
+                            chat->msgs[live_idx].text, ln->blk_start,
+                            ln->blk_end, main_w);
+                        if (disp != NULL) {
+                            size_t dl = strlen(disp);
+                            if (ln->off < dl) {
+                                for (size_t b = 0; b < ln->len; b++) {
+                                    char c = disp[ln->off + b];
+                                    if (c == '|') {
+                                        row_sgr(&g_row,
+                                                theme_current()->match);
+                                        row_putc(&g_row, c);
+                                        row_sgr(&g_row,
+                                                THEME_ROLE_RESET);
+                                    } else {
+                                        row_putc(&g_row, c);
+                                    }
+                                }
+                            }
+                            free(disp);
+                        }
+                    } else {
+                        row_msg(&g_row, ln, chat->msgs[live_idx].text);
+                    }
+                    row_finish(true);
+                }
                 live_text = true;
+            } else {
+                const ChatLine *ln = &g_lines[e - 1];
+                if (ln->tool < 0) {
+                    row_start(main_w);
+                    row_msg(&g_row, ln, chat->msgs[live_idx].text);
+                    row_finish(true);
+                    live_text = true;
+                }
             }
         }
     }
@@ -1895,9 +2212,29 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
     }
 
     /* der naechste frame raeumt genau diesen bereich: live-zeile
-     * (falls eine gedruckt wurde) plus dock */
+     * (falls eine gedruckt wurde) plus dock. bei offenem block
+     * umfasst die live-region ALLE zeilen der live-nachricht –
+     * der erase des naechsten frames muss sie alle raeumen. */
     int live_rows = 0;
-    if (live_text || tool_spin) {
+    if (live_open_block && live_idx != SIZE_MAX) {
+        /* offener block: die live-region umfasst genau die zeilen,
+         * die der live-block GEDRUCKT hat (first_live..e), nicht
+         * die ganze nachricht – committete zeilen stehen im
+         * scrollback und gehoeren nicht zur ueberschreibbaren
+         * region. tool-spinner zaehlt darunter extra. */
+        size_t s = 0;
+        size_t e = 0;
+        msg_line_range(live_idx - from, &s, &e);
+        size_t first_live = e - live_keep;
+        if (first_live < s) {
+            first_live = s;
+        }
+        if (g_live_msg_valid && g_live_msg == live_idx &&
+            first_live < s + g_live_lines) {
+            first_live = s + g_live_lines;
+        }
+        live_rows = (int)(e - first_live);
+    } else if (live_text || tool_spin) {
         live_rows = 1;
     }
     g_prev_rows = dock_n + live_rows;
@@ -1910,10 +2247,20 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
     if (tool_spin) {
         g_tool_spin_up = g_prev_rows - 1;
     }
+    /* live-region gewachsen? dann ist der leichte tick bis zum
+     * naechsten vollen frame verboten: sein anker (g_busy_up)
+     * haelt den ABSTAND des spinner-rahmens vom cursor fest – hat
+     * die live-region zeilen dazugewonnen, liegt der rahmen beim
+     * tick um genau die differenz zu HOCH und ueberschreibt
+     * content-zeilen (doppelte zeilen im stream). der volle frame
+     * danach setzt den anker neu. */
+    static int prev_live_rows = -1;
     g_busy_up = 0;
-    if (state->busy) {
+    if (state->busy && !(live_open_block && live_rows > 0 &&
+                         prev_live_rows >= 0 && live_rows != prev_live_rows)) {
         g_busy_up = d.busy_row_up;
     }
+    prev_live_rows = live_rows;
 
     dbg("frame: content+live=%d dock=%d printed=%zu", live_rows, dock_n,
         g_printed);
