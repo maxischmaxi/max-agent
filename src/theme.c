@@ -36,6 +36,13 @@ static const char *const ROLE_DEFAULTS[THEME_ROLE_COUNT] = {
     [THEME_ROLE_SYSTEM] = "",        /* unauffaellig, ohne sequenz */
     [THEME_ROLE_NOTICE] = "\x1b[2m", /* faint: meldung der app */
     [THEME_ROLE_DIM] = "\x1b[2m",    /* faint: beiwerk */
+    [THEME_ROLE_MD_HEAD] = NULL,   /* = match-farbe + bold, theme_role() */
+    [THEME_ROLE_MD_MARKER] = NULL, /* dito, ohne bold */
+    /* user-bg: ein palette-grau, das auf hellen UND dunklen
+     * terminals funktioniert. pick_auto waelt nach der OSC-11-
+     * antwort ein passenderes (238 dunkel / 250 hell); ohne
+     * antwort (und in tests) gilt dieser default. */
+    [THEME_ROLE_USER_BG] = "\x1b[48;5;238m",
 };
 
 const char *theme_role(ThemeRole role)
@@ -44,10 +51,15 @@ const char *theme_role(ThemeRole role)
         return "";
     }
     if (g_theme.roles[role] != NULL) {
-        return g_theme.roles[role]; /* das theme weicht ab */
+        return g_theme.roles[role]; /* das theme weichtet ab */
     }
-    if (role == THEME_ROLE_ASSISTANT) {
+    if (role == THEME_ROLE_ASSISTANT || role == THEME_ROLE_MD_MARKER) {
         return g_theme.match; /* folgt der akzentfarbe */
+    }
+    if (role == THEME_ROLE_MD_HEAD) {
+        /* ueberschriften: die akzentfarbe, fett – der default,
+         * bis ein theme etwas eigenes definiert */
+        return "\x1b[1m"; /* bold; farbe liefert der caller via match */
     }
     return (ROLE_DEFAULTS[role] != NULL) ? ROLE_DEFAULTS[role] : "";
 }
@@ -326,16 +338,24 @@ static void pick_auto(void)
      * terminal-helligkeit ab */
     memset((void *)g_theme.roles, 0, sizeof g_theme.roles);
     if (!g_have_bg) {
-        return; /* keine antwort: fallback-cyan bleibt */
+        /* keine antwort: fallback bleibt. der user-bg ist ein
+         * palette-grau, das auf beiden helligkeiten funktioniert */
+        g_theme.roles[THEME_ROLE_USER_BG] = "\x1b[48;5;238m";
+        return;
     }
     if (luminance(g_bg) < 128) {
-        /* dunkles terminal: helle palette-farben fuer kontrast */
+        /* dunkles terminal: helle palette-farben fuer kontrast,
+         * user-bg eine stufe heller als der hintergrund */
         g_theme.match = "\x1b[96m";                   /* bright cyan */
         g_theme.roles[THEME_ROLE_ERROR] = "\x1b[91m"; /* bright red */
+        g_theme.roles[THEME_ROLE_USER_BG] = "\x1b[48;5;238m";
     } else {
-        /* helles terminal: dunkle palette-farben */
+        /* helles terminal: dunkle palette-farben, user-bg eine
+         * stufe dunkler (auf hell wirkt "etwas dunkler" wie ein
+         * blasser kachel-hintergrund) */
         g_theme.match = "\x1b[36m";                   /* cyan */
         g_theme.roles[THEME_ROLE_ERROR] = "\x1b[31m"; /* rot */
+        g_theme.roles[THEME_ROLE_USER_BG] = "\x1b[48;5;250m";
     }
 }
 

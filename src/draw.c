@@ -13,6 +13,7 @@
 #include "command.h"
 #include "debug.h"
 #include "input.h"
+#include "markdown.h"
 #include "send.h"
 #include "session.h"
 #include "settings.h"
@@ -22,16 +23,20 @@
 static const char GLYPH_EM_DASH[] = "\xE2\x80\x94";
 static const char GLYPH_BLOCK[] = "\xE2\x96\x88";
 
-/* breite des zeilen-labels ("you  ", "ai   ", "tool ", ...) bzw.
- * der einrueckung von folgezeilen und tool-call-zeilen: alle
- * nachrichtentexte starten damit in derselben spalte */
-#define MSG_PREFIX_W 5
+/* nachrichten starten direkt am linken rand (kein label mehr),
+ * haben aber links und rechts je EIN leerzeichen rand zum rest
+ * des bildes. die wrap-breite rechnet das ab: text_w ist die
+ * nutzbare breite zwischen den paddings. */
+#define MSG_PAD_W 1
 
 /* kein eingabe-praefix mehr: der text beginnt bei spalte 0 –
  * diese spalte bleibt fuer den cursor-block am zeilenende frei */
 #define INPUT_PREFIX_W 0
 
-/* die zwei statuszeilen am unteren rand des docks */
+/* statuszeilen am unteren rand des docks: 2 zeilen brechen bei
+ * schmalen terminals um, jede hoechstens 3 bildschirmzeilen hoch
+ * (dock_build rechnet mit den echten zahlen). STATUS_H ist nur der
+ * alt-last-default, der nie mehr direkt benutzt wird. */
 #define STATUS_H 2
 
 /* maximalzeilen des docks: quit + cmds + eingabe-rahmen + dialog +
@@ -161,8 +166,43 @@ static void row_session(Row *r, const SessionInfo *si, const char *search,
                         bool selected, bool active, int id_col, int name_col);
 static void row_command(Row *r, const Command *cmd, const char *prefix);
 static void row_no_match(Row *r, const char *prefix);
-static void row_status_model(Row *r, const Config *cfg);
-static void row_status_tokens(Row *r, const AppState *st);
+/* ------------------------------------------------------------------ */
+/* statuszeilen: der inhalt ist eine segment-liste, die bei schmalen */
+/* terminals umbricht. trenner ("  \xC2\xB7  ") kleben am segment,      */
+/* das ihnen folgt – der umbruch landet zwischen inhalten. jede     */
+/* der beiden zeilen belegt 1..STATUS_MAX_LINES bildschirmzeilen,   */
+/* mehr nicht (sehr schmale terminals schneiden dann ab).            */
+/* ------------------------------------------------------------------ */
+#define STATUS_MAX_LINES 3
+#define STATUS_SEG_MAX 24
+#define STATUS_LABEL_W 9 /* "model   " / "tokens  " + leerzeichen */
+
+/* segment-text inline: die zahlen/dauern entstehen in lokalen
+ * puffern der seg-builder – ein pointer darauf waere nach deren
+ * return verwaiset (ASan: stack-use-after-return). deshalb wird
+ * der text HIER hineinkopiert. */
+#define STATUS_SEG_TEXT 40
+
+typedef struct {
+    char text[STATUS_SEG_TEXT]; /* utf-8, '\0'-terminiert */
+    const char *sgr;            /* farbsequenz oder NULL = dim */
+    bool sep_before;  /* "  \xC2\xB7  " gehoert zu diesem segment */
+} StatusSeg;
+
+typedef struct {
+    StatusSeg segs[STATUS_SEG_MAX];
+    int n;
+} StatusLine;
+
+static void st_add(StatusLine *l, const char *text, const char *sgr,
+                   bool sep_before);
+static int st_fill(const StatusLine *l, int *idx, int width, int *cell,
+                   int line, int last, bool dry, Row *r);
+static int st_lines(const StatusLine *l, int width);
+static void status_model_segs(StatusLine *l, const Config *cfg);
+static void status_token_segs(StatusLine *l, const AppState *st);
+static void row_status_model(Row *r, const Config *cfg, int sub);
+static void row_status_tokens(Row *r, const AppState *st, int sub);
 static void row_quit(Row *r);
 static void row_msg(Row *r, const ChatLine *ln, const char *text);
 static void row_tool_call(Row *r, const ChatToolCall *call, const ChatLine *ln);
@@ -547,18 +587,46 @@ static void row_no_match(Row *r, const char *prefix)
     row_puts(r, line);
 }
 
-/* token-zahlen kurz halten: 1234 -> "1.2k", 45678 -> "45k" */
-static void put_count(Row *r, size_t n)
+/* token-zahlen kurz halten: 1234 -> "1.2k", 45678 -> "45k".
+ * die _s-variante schreibt in einen puffer: die statuszeilen
+ * sammeln ihre inhalte als segmente und brauchen strings */
+static void put_count_s(char *buf, size_t sz, size_t n)
 {
-    char buf[32];
     if (n < 1000) {
-        (void)snprintf(buf, sizeof buf, "%zu", n);
+        (void)snprintf(buf, sz, "%zu", n);
     } else if (n < 100000) {
-        (void)snprintf(buf, sizeof buf, "%zu.%zuk", n / 1000, (n % 1000) / 100);
+        (void)snprintf(buf, sz, "%zu.%zuk", n / 1000, (n % 1000) / 100);
     } else {
-        (void)snprintf(buf, sizeof buf, "%zuk", n / 1000);
+        (void)snprintf(buf, sz, "%zuk", n / 1000);
     }
-    row_puts(r, buf);
+}
+
+/* sichtbare zellen eines utf-8-strings (ein codepoint = 1 zelle,
+ * wie ueberall im renderer: keine wcwidth-tabelle). nur fuer den
+ * umbruch-entscheid der statuszeilen */
+static int utf8_cells(const char *s)
+{
+    int cells = 0;
+    while (*s != '\0') {
+        unsigned char c = (unsigned char)s[0];
+        size_t n = 1;
+        if ((c & 0xE0U) == 0xC0U) {
+            n = 2;
+        } else if ((c & 0xF0U) == 0xE0U) {
+            n = 3;
+        } else if ((c & 0xF8U) == 0xF0U) {
+            n = 4;
+        }
+        for (size_t i = 1; i < n; i++) {
+            if (((unsigned char)s[i] & 0xC0U) != 0x80U) {
+                n = 1; /* abgebrochene folge: einzelbyte */
+                break;
+            }
+        }
+        cells++;
+        s += n;
+    }
+    return cells;
 }
 
 static void status_label(Row *r, const char *label)
@@ -569,82 +637,222 @@ static void status_label(Row *r, const char *label)
     row_sgr(r, THEME_ROLE_RESET);
 }
 
-/* statuszeile 1: mit wem wir sprechen und wie gross dessen fenster
- * ist. */
-static void row_status_model(Row *r, const Config *cfg)
-{
-    status_label(r, "model   ");
+/* ------------------------------------------------------------------ */
+/* statuszeilen: segment-liste -> bildschirmzeilen                     */
+/* ------------------------------------------------------------------ */
 
-    const Provider *provider = NULL;
-    const Model *m = send_find_model(cfg, cfg->active_model, &provider);
-    if (m == NULL || m->id == NULL) {
-        row_sgr(r, theme_role(THEME_ROLE_DIM));
-        row_puts(r, "keins gewaehlt \xE2\x80\x93 /models");
-        row_sgr(r, THEME_ROLE_RESET);
+static void st_add(StatusLine *l, const char *text, const char *sgr,
+                   bool sep_before)
+{
+    if (l->n >= STATUS_SEG_MAX || text == NULL || text[0] == '\0') {
         return;
     }
-
-    row_sgr(r, theme_role(THEME_ROLE_ASSISTANT));
-    row_puts(r, m->id);
-    row_sgr(r, THEME_ROLE_RESET);
-
-    row_sgr(r, theme_role(THEME_ROLE_DIM));
-    if (m->context_window > 0) {
-        row_puts(r, "  \xC2\xB7  ");
-        put_count(r, m->context_window);
-        row_puts(r, " kontext");
-    }
-    if (provider != NULL && provider->base_url != NULL) {
-        row_puts(r, "  \xC2\xB7  ");
-        row_puts(r, provider->base_url);
-    }
-    row_sgr(r, THEME_ROLE_RESET);
+    (void)snprintf(l->segs[l->n].text, STATUS_SEG_TEXT, "%s", text);
+    l->segs[l->n].sgr = sgr;
+    l->segs[l->n].sep_before = sep_before;
+    l->n++;
 }
 
-/* statuszeile 2: was die sitzung gekostet hat, rechts daneben name
- * und id der offenen session. */
-static void row_status_tokens(Row *r, const AppState *st)
+/* eine bildschirmzeile fuellen. *idx laeuft ueber die segmente,
+ * rueckgabe = es wurde etwas platziert. dry = nur planen (fuer
+ * zeilenzahl/ueberspringen), sonst schreibt r. breite = zellen AB
+ * dem label (der caller druckt das label selbst).
+ * line/last: vorherige zeilen brechen sauber um, auf der LETZTEN
+ * erlaubten zeile (line == last) wird ein nicht mehr ganz passen-
+ * des segment HART an der breite abgeschnitten statt ganz fal-
+ * len gelassen – sonst faele z.B. der log-pfad bei schmalen
+ * terminals weg, obwohl noch platz auf der zeile waere. */
+static int st_fill(const StatusLine *l, int *idx, int width, int *cell,
+                   int line, int last, bool dry, Row *r)
 {
-    status_label(r, "tokens  ");
+    bool wrote = false;
+    while (*idx < l->n) {
+        const StatusSeg *s = &l->segs[*idx];
+        int need = utf8_cells(s->text) + (s->sep_before ? 5 : 0);
+        bool fits = (*cell + need <= width);
+        if (!fits && line != last) {
+            break; /* passt nicht: rest auf die naechste zeile.
+                    * nur auf der letzten erlaubten zeile wird
+                    * abgeschnitten statt umgebrochen */
+        }
+        if (!dry) {
+            const char *sgr = (s->sgr != NULL) ? s->sgr
+                                               : theme_role(THEME_ROLE_DIM);
+            if (s->sep_before) {
+                /* trenner + segment teilen sich die farbe: der
+                 * trenner ist immer DIM, das segment kann farbig
+                 * sein (modell-id, session-name) – sgr einmal
+                 * setzen reicht */
+                if (sgr == theme_role(THEME_ROLE_DIM)) {
+                    row_sgr(r, theme_role(THEME_ROLE_DIM));
+                    row_puts(r, "  \xC2\xB7  ");
+                    row_puts(r, s->text);
+                    /* kein erneutes sgr: dieselbe farbe laeuft */
+                    goto next;
+                }
+                row_sgr(r, theme_role(THEME_ROLE_DIM));
+                row_puts(r, "  \xC2\xB7  ");
+            }
+            row_sgr(r, sgr);
+            row_puts(r, s->text);
+        }
+    next:;
+        *cell += need;
+        if (*cell > width) {
+            *cell = width;
+        }
+        wrote = true;
+        (*idx)++;
+        if (!fits) {
+            break; /* hart abgeschnitten: zeile voll */
+        }
+    }
+    /* die zeile endet IMMER im default-zustand: die alten renderer
+     * schlossen mit THEME_ROLE_RESET ab. ohne das waere alles
+     * nachfolgende (eingabefeld, dialoge) faint/grau – der zustand
+     * wuerde bis zum naechsten sgr in der naechsten zeile hinein-
+     * wirken (der leere rest einer zeile wird nie angestoert). */
+    if (wrote && !dry) {
+        row_sgr(r, THEME_ROLE_RESET);
+    }
+    return wrote;
+}
 
-    row_sgr(r, theme_role(THEME_ROLE_DIM));
-    put_count(r, st->ctx.total_prompt);
-    row_puts(r, " gesendet  \xC2\xB7  ");
-    put_count(r, st->ctx.total_completion);
-    row_puts(r, " empfangen");
+/* wie viele bildschirmzeilen braucht die liste bei dieser breite
+ * (max STATUS_MAX_LINES, mindest 1)? dock_build misst hieran, wie
+ * viele dock-rows die zeile belegt */
+static int st_lines(const StatusLine *l, int width)
+{
+    int idx = 0;
+    int lines = 0;
+    while (lines < STATUS_MAX_LINES) {
+        int cell = 0;
+        if (!st_fill(l, &idx, width, &cell, lines, STATUS_MAX_LINES - 1,
+                     true, NULL)) {
+            break;
+        }
+        lines++;
+    }
+    return (lines > 0) ? lines : 1;
+}
 
-    /* gesamt-arbeitszeit der session: thinking, tool calls,
-     * antworten – alles, was die ki gearbeitet hat */
+/* segmente der model-zeile: modell-id, kontext-groesse, base-url.
+ * von dock_build (zeilenzahl) und row_status_model (inhalt) benutzt */
+static void status_model_segs(StatusLine *l, const Config *cfg)
+{
+    const Provider *provider = NULL;
+    const Model *m = send_find_model(cfg, cfg->active_model, &provider);
+
+    if (m == NULL || m->id == NULL) {
+        st_add(l, "keins gewaehlt \xE2\x80\x93 /models",
+               theme_role(THEME_ROLE_DIM), false);
+        return;
+    }
+    st_add(l, m->id, theme_role(THEME_ROLE_ASSISTANT), false);
+    char buf[40];
+    if (m->context_window > 0) {
+        char cnt[24];
+        put_count_s(cnt, sizeof cnt, m->context_window);
+        (void)snprintf(buf, sizeof buf, "%s kontext", cnt);
+        st_add(l, buf, NULL, true);
+    }
+    if (provider != NULL && provider->base_url != NULL) {
+        st_add(l, provider->base_url, NULL, true);
+    }
+}
+
+static void row_status_model(Row *r, const Config *cfg, int sub)
+{
+    StatusLine l = {0};
+    status_model_segs(&l, cfg);
+
+    int width = r->width - STATUS_LABEL_W;
+    if (width < 1) {
+        width = 1;
+    }
+    int idx = 0;
+    for (int i = 0; i < sub; i++) {
+        int cell = 0;
+        if (!st_fill(&l, &idx, width, &cell, i, STATUS_MAX_LINES - 1,
+                     true, NULL)) {
+            return; /* sub jenseits des inhalts: leer bleibt leer */
+        }
+    }
+    status_label(r, (sub == 0) ? "model   " : "        ");
+    int cell = 0;
+    (void)st_fill(&l, &idx, width, &cell, sub, STATUS_MAX_LINES - 1,
+                  false, r);
+}
+
+/* segmente der token-zeile: verbrauch, arbeitszeit, session und –
+ * mit --debug – die log-datei (dbg_path aktualisiert sich mit der
+ * session-id) */
+static void status_token_segs(StatusLine *l, const AppState *st)
+{
+    char buf[40];
+    {
+        char cnt[24];
+        put_count_s(cnt, sizeof cnt, st->ctx.total_prompt);
+        (void)snprintf(buf, sizeof buf, "%s gesendet", cnt);
+        st_add(l, buf, NULL, false);
+    }
+    {
+        char cnt[24];
+        put_count_s(cnt, sizeof cnt, st->ctx.total_completion);
+        (void)snprintf(buf, sizeof buf, "%s empfangen", cnt);
+        st_add(l, buf, NULL, true);
+    }
+
     if (st->worked_ms > 0) {
         char dur[24];
         fmt_dur(st->worked_ms, dur, sizeof dur);
-        row_puts(r, "  \xC2\xB7  arbeit ");
-        row_puts(r, dur);
+        (void)snprintf(buf, sizeof buf, "arbeit %s", dur);
+        st_add(l, buf, NULL, true);
     }
-
     if (st->session.active) {
-        row_puts(r, "  \xC2\xB7  session ");
         if (st->session.name != NULL) {
-            row_sgr(r, THEME_ROLE_RESET);
-            row_sgr(r, theme_role(THEME_ROLE_ASSISTANT));
-            row_puts(r, st->session.name);
-            row_sgr(r, THEME_ROLE_RESET);
-            row_sgr(r, theme_role(THEME_ROLE_DIM));
-            row_puts(r, "  \xC2\xB7  ");
+            /* name farbig, dahinter die id: der trenner zwischen
+             * beiden gehoert zur id (sep_before) */
+            st_add(l, "session", NULL, true);
+            st_add(l, st->session.name,
+                   theme_role(THEME_ROLE_ASSISTANT), false);
+            st_add(l, st->session.id, NULL, true);
+        } else {
+            /* ohne namen: "session ID" als EIN segment (das alte
+             * layout hatte beides in einem stueck) */
+            (void)snprintf(buf, sizeof buf, "session %s", st->session.id);
+            st_add(l, buf, NULL, true);
         }
-        row_puts(r, st->session.id);
     }
-
-    /* --debug: der trace landet in einer datei unter /tmp – deren
-     * name steht hier, damit mensch und agent ihn finden. dbg_path
-     * ist erst nach dem start gesetzt und aendert sich, sobald die
-     * erste nachricht die session (und damit den umbenannten log)
-     * oeffnet: die zeile aktualisiert sich von selbst */
     if (dbg_active()) {
-        row_puts(r, "  \xC2\xB7  debug mode, log file: ");
-        row_puts(r, dbg_path());
+        char dbg[STATUS_SEG_TEXT];
+        (void)snprintf(dbg, sizeof dbg, "debug mode, log file: %s",
+                       dbg_path());
+        st_add(l, dbg, NULL, true);
     }
-    row_sgr(r, THEME_ROLE_RESET);
+}
+
+static void row_status_tokens(Row *r, const AppState *st, int sub)
+{
+    StatusLine l = {0};
+    status_token_segs(&l, st);
+
+    int width = r->width - STATUS_LABEL_W;
+    if (width < 1) {
+        width = 1;
+    }
+    int idx = 0;
+    for (int i = 0; i < sub; i++) {
+        int cell = 0;
+        if (!st_fill(&l, &idx, width, &cell, i, STATUS_MAX_LINES - 1,
+                     true, NULL)) {
+            return;
+        }
+    }
+    status_label(r, (sub == 0) ? "tokens  " : "        ");
+    int cell = 0;
+    (void)st_fill(&l, &idx, width, &cell, sub, STATUS_MAX_LINES - 1,
+                  false, r);
 }
 
 static void row_quit(Row *r)
@@ -652,46 +860,77 @@ static void row_quit(Row *r)
     row_puts(r, "quit? ctrl+c again to confirm");
 }
 
-/* label und farbe einer rolle: alle labels sind MSG_PREFIX_W breit,
- * die texte aller rollen starten damit in derselben spalte –
- * "you" fuer den benutzer, "ai" fuer die antwort des modells. */
-static ThemeRole role_theme(ChatRole role, const char **label)
-{
-    switch (role) {
-    case CHAT_ROLE_USER:
-        *label = "you  ";
-        return THEME_ROLE_USER;
-    case CHAT_ROLE_ASSISTANT:
-        *label = "ai   ";
-        return THEME_ROLE_ASSISTANT;
-    case CHAT_ROLE_ERROR:
-        *label = "err  ";
-        return THEME_ROLE_ERROR;
-    case CHAT_ROLE_TOOL:
-        *label = "tool ";
-        return THEME_ROLE_TOOL;
-    case CHAT_ROLE_NOTICE:
-        *label = "ctx  ";
-        return THEME_ROLE_NOTICE;
-    case CHAT_ROLE_SYSTEM:
-        break;
-    }
-    *label = "sys  ";
-    return THEME_ROLE_SYSTEM;
-}
-
+/* eine nachrichtenzeile. kein label mehr: der text startet direkt
+ * am rand, links/rechts mit je einem leerzeichen padding.
+ *
+ * user-nachrichten bekommen einen leicht abgesetzten hintergrund
+ * (THEME_ROLE_USER_BG) ueber die GANZE zeilenbreite – das rechte
+ * padding schreibt row_finish mit dem hintergrund, abgeschaltet
+ * wird er erst beim pad.
+ *
+ * ki-antworten (ASSISTANT) laufen durch den markdown-scanner: die
+ * erste zeile einer nachricht kann ueberschrift (#), liste (-, *,
+ * +, 1.) oder zitat (>) sein – marker/heading-zeichen werden in
+ * der akzentfarbe gedruckt, ueberschriften zusaetzlich fett. der
+ * scanner ist zeilenlokal (kein block-zustand): das highlight ist
+ * damit schon waehrend des streamings stabil, wenn die zeile erst
+ * halb da ist. */
 static void row_msg(Row *r, const ChatLine *ln, const char *text)
 {
-    if (ln->first) {
-        const char *label = NULL;
-        ThemeRole role = role_theme(ln->role, &label);
-        row_sgr(r, theme_role(role));
-        row_puts(r, label);
+    bool user = (ln->role == CHAT_ROLE_USER);
+
+    if (user) {
+        row_sgr(r, theme_role(THEME_ROLE_USER_BG));
+        row_sgr(r, theme_role(THEME_ROLE_USER));
+    }
+
+    row_putc(r, ' '); /* linkes padding */
+
+    if (ln->role == CHAT_ROLE_ASSISTANT && ln->lstart) {
+        /* markdown-scanning nur am ORIGINALEN zeilenanfang (lstart,
+         * nicht first: jede nach einem \n beginnende zeile ist ein
+         * kandidat, nur wrap-folgezeilen nicht) */
+        MdLine md;
+        md_scan(text, ln->off, ln->len, ln->lstart, &md);
+        switch (md.kind) {
+        case MD_HEAD: {
+            /* die #-folge farbig+fett, dahinter normal weiter */
+            row_sgr(r, theme_role(THEME_ROLE_MD_HEAD));
+            row_sgr(r, theme_current()->match);
+            row_putn(r, text + md.marker, (int)md.marker_len);
+            row_sgr(r, THEME_ROLE_RESET);
+            row_putn(r, text + ln->off + md.marker_len,
+                     (int)(ln->len - md.marker_len));
+            break;
+        }
+        case MD_LIST:
+        case MD_QUOTE: {
+            /* der marker farbig, dahinter der text normal */
+            row_sgr(r, theme_role(THEME_ROLE_MD_MARKER));
+            row_putn(r, text + md.marker, (int)md.marker_len);
+            row_sgr(r, THEME_ROLE_RESET);
+            row_putn(r, text + ln->off + md.marker_len,
+                     (int)(ln->len - md.marker_len));
+            break;
+        }
+        case MD_NONE:
+        default:
+            row_putn(r, text + ln->off, (int)ln->len);
+            break;
+        }
+    } else {
+        row_putn(r, text + ln->off, (int)ln->len);
+    }
+
+    /* rechtes padding: bei user-nachrichten gehoert es mit zum
+     * hintergrund, row_finish raumt den rest mit BG_OFF */
+    row_putc(r, ' ');
+    if (user) {
+        row_sgr(r, THEME_ROLE_BG_OFF);
         row_sgr(r, THEME_ROLE_RESET);
     } else {
-        row_puts(r, "     "); /* umbruch-folgezeile: unter dem label */
+        row_sgr(r, THEME_ROLE_RESET);
     }
-    row_putn(r, text + ln->off, (int)ln->len);
 }
 
 /* darstellungs-zeilen eines tool-calls. uebergrosse aufrufe (z.B.
@@ -748,7 +987,7 @@ static int spin_frame(long long busy_ms)
 /* live-spinner im chat, waehrend die ki an einem tool arbeitet */
 static void row_tool_spinner(Row *r, long long busy_ms)
 {
-    row_puts(r, "     "); /* auf spalte MSG_PREFIX_W, wie der output */
+    row_puts(r, " "); /* padding wie alle nachrichtenzeilen */
     row_sgr(r, theme_role(THEME_ROLE_DIM));
     row_glyph(r, SPIN[spin_frame(busy_ms)]);
     row_sgr(r, THEME_ROLE_RESET);
@@ -960,6 +1199,8 @@ typedef struct {
     long long busy_ms; /* laufende arbeitszeit des turns (spinner) */
     int busy_row_up;   /* spinner-rahmen: zeilen ueber dem geparkten
                         * cursor (anker fuer den leichten tick) */
+    int status_model_lines; /* belegte zeilen der model-statuszeile */
+    int status_token_lines; /* belegte zeilen der token-statuszeile */
 } DockCtx;
 
 static const char *dlg_title(UIMode mode)
@@ -1120,7 +1361,23 @@ static int dock_build(int rows, int cols, AppState *st, const Config *cfg,
     d->mode = ui_mode(st);
 
     int n = 0;
-    int usable = rows - STATUS_H;
+    /* statuszeilen: bei schmalem terminal bricht der inhalt um.
+     * die zeilenzahl steht hier fest (1..STATUS_MAX_LINES je
+     * zeile), damit usable die eingabebox korrekt eingrenzt und
+     * die rows unten die richtigen teil-zeilen anfordern */
+    {
+        StatusLine m = {0};
+        StatusLine t = {0};
+        status_model_segs(&m, cfg);
+        status_token_segs(&t, st);
+        int w = d->main_w - STATUS_LABEL_W;
+        if (w < 1) {
+            w = 1;
+        }
+        d->status_model_lines = st_lines(&m, w);
+        d->status_token_lines = st_lines(&t, w);
+    }
+    int usable = rows - d->status_model_lines - d->status_token_lines;
     if (usable < 1) {
         usable = 1;
     }
@@ -1235,11 +1492,11 @@ static int dock_build(int rows, int cols, AppState *st, const Config *cfg,
         }
     }
 
-    if (n < out_max) {
-        out_rows[n++] = (DockRow){DROW_STATUS_MODEL, 0, false};
+    for (int sub = 0; sub < d->status_model_lines && n < out_max; sub++) {
+        out_rows[n++] = (DockRow){DROW_STATUS_MODEL, sub, false};
     }
-    if (n < out_max) {
-        out_rows[n++] = (DockRow){DROW_STATUS_TOKENS, 0, false};
+    for (int sub = 0; sub < d->status_token_lines && n < out_max; sub++) {
+        out_rows[n++] = (DockRow){DROW_STATUS_TOKENS, sub, false};
     }
     /* spinner-rahmen in "zeilen ueber dem geparkten cursor" um-
      * rechnen (anker fuer draw_busy_tick) */
@@ -1341,10 +1598,10 @@ static void render_dock_row(const DockRow *row, const DockCtx *d, AppState *st,
         row_quit(r);
         break;
     case DROW_STATUS_MODEL:
-        row_status_model(r, cfg);
+        row_status_model(r, cfg, row->a);
         break;
     case DROW_STATUS_TOKENS:
-        row_status_tokens(r, st);
+        row_status_tokens(r, st, row->a);
         break;
     case DROW_DLG_SEARCH:
         row_dlg_search(r, dlg_title(d->mode), d->search);
@@ -1401,7 +1658,7 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
 {
     Chat *chat = &state->chat;
     int main_w = main_width(cols);
-    int text_w = main_w - MSG_PREFIX_W;
+    int text_w = main_w - (MSG_PAD_W * 2);
     if (text_w < 1) {
         text_w = 1;
     }
@@ -1545,17 +1802,11 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                  * label direkt am ersten call – eine eigene zeile
                  * nur fuer das label gibt es nicht */
                 row_start(main_w);
-                if (lm->role == CHAT_ROLE_ASSISTANT && lm->text[0] == '\0' &&
-                    ln->tool == 0 && ln->off == 0) {
-                    row_sgr(&g_row, theme_role(THEME_ROLE_ASSISTANT));
-                    row_puts(&g_row, "ai   ");
-                    row_sgr(&g_row, THEME_ROLE_RESET);
-                } else {
-                    for (int i = 0; i < MSG_PREFIX_W; i++) {
-                        row_putc(&g_row, ' ');
-                    }
+                for (int i = 0; i < MSG_PAD_W; i++) {
+                    row_putc(&g_row, ' '); /* padding wie text */
                 }
                 row_tool_call(&g_row, &lm->tool_calls[ln->tool], ln);
+                row_sgr(&g_row, THEME_ROLE_RESET);
                 row_finish(true);
             } else if (lm->role == CHAT_ROLE_TOOL) {
                 /* tool-ergebnis: "output:" vor der ersten zeile,
@@ -1564,21 +1815,22 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                 if (ln->first) {
                     row_start(main_w);
                     row_sgr(&g_row, theme_role(THEME_ROLE_DIM));
-                    row_puts(&g_row, "     output:");
+                    row_puts(&g_row, " output:");
                     row_sgr(&g_row, THEME_ROLE_RESET);
                     row_finish(true);
                 }
                 row_start(main_w);
                 int code = exit_marker_of(lm->text, ln);
                 if (code >= 0) {
-                    row_puts(&g_row, "     ");
+                    row_puts(&g_row, " ");
                     row_sgr(&g_row, (code == 0) ? "\x1b[32m" : "\x1b[31m");
                     row_putn(&g_row, lm->text + ln->off, (int)ln->len);
                     row_sgr(&g_row, THEME_ROLE_RESET);
                 } else {
-                    row_puts(&g_row, "     ");
+                    row_puts(&g_row, " ");
                     row_putn(&g_row, lm->text + ln->off, (int)ln->len);
                 }
+                row_sgr(&g_row, THEME_ROLE_RESET);
                 row_finish(true);
             } else if (m->role == CHAT_ROLE_ASSISTANT && m->text[0] == '\0' &&
                        m->tool_calls_len > 0 && ln->first) {

@@ -1138,6 +1138,7 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
                 cmd_models(state);
                 break;
             case CMD_RESUME:
+            case CMD_SESSIONS: /* alias: gleicher dialog */
                 cmd_resume(state);
                 break;
             case CMD_RENAME:
@@ -1164,6 +1165,7 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
                         cmd_models(state);
                         break;
                     case CMD_RESUME:
+                    case CMD_SESSIONS: /* alias: gleicher dialog */
                         cmd_resume(state);
                         break;
                     case CMD_RENAME:

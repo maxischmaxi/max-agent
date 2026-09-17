@@ -10,6 +10,7 @@
 #define COMMAND_SETTINGS "settings"
 #define COMMAND_NEW      "new"
 #define COMMAND_RESUME   "resume"
+#define COMMAND_SESSIONS "sessions"
 #define COMMAND_RENAME   "rename"
 
 typedef enum {
@@ -19,6 +20,7 @@ typedef enum {
     CMD_QUIT,
     CMD_RENAME,
     CMD_RESUME,
+    CMD_SESSIONS, /* alias: oeffnet denselben dialog wie resume */
     CMD_SETTINGS,
     CMD_COUNT, /* muss immer letzter sein: COMMANDS[] sonst NULL-luecke */
 } CmdId;
@@ -35,6 +37,7 @@ static const Command COMMANDS[] = {
     [CMD_QUIT] = {COMMAND_QUIT, "quit max agent"},
     [CMD_RENAME] = {COMMAND_RENAME, "name the current session"},
     [CMD_RESUME] = {COMMAND_RESUME, "list and resume sessions"},
+    [CMD_SESSIONS] = {COMMAND_SESSIONS, "list and resume sessions"},
     [CMD_SETTINGS] = {COMMAND_SETTINGS, "max agent settings"},
 };
 

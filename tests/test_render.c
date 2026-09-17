@@ -182,7 +182,7 @@ static void test_print_once(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(strstr(c.text, "you  hallo welt") != NULL);
+    CHECK(strstr(c.text, " hallo welt") != NULL);
 
     /* weitere frames drucken sie nie wieder */
     cap_open(&c);
@@ -211,8 +211,8 @@ static void test_multiline_user(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(count_str(c.text, "you  erste zeile") == 1);
-    CHECK(count_str(c.text, "     zweite zeile") == 1); /* 5er-einrueckung */
+    CHECK(count_str(c.text, " erste zeile") == 1);
+    CHECK(count_str(c.text, " zweite zeile") == 1); /* 1er-padding */
 
     cap_free(&c);
     input_free(&st.input);
@@ -237,9 +237,9 @@ static void test_assistant_label(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(strstr(c.text, "you  frage") != NULL);
-    /* "ai" in derselben breite wie "you": text startet spalte 5 */
-    CHECK(strstr(c.text, "ai   erste antwort zeile") != NULL);
+    CHECK(strstr(c.text, " frage") != NULL);
+    /* kein label: text startet am rand, 1er-padding */
+    CHECK(strstr(c.text, " erste antwort zeile") != NULL);
 
     /* umbruch-folgezeile der antwort: auf spalte 5 eingerueckt */
     chat_clear(&st.chat);
@@ -251,8 +251,8 @@ static void test_assistant_label(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    /* die fortsetzungszeile beginnt mit 5 leerzeichen */
-    CHECK(strstr(c.text, "\n     ") != NULL);
+    /* die fortsetzungszeile hat das 1er-padding */
+    CHECK(strstr(c.text, "\n ") != NULL);
 
     cap_free(&c);
     input_free(&st.input);
@@ -280,7 +280,7 @@ static void test_streaming(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(count_str(c.text, "you  frage") == 1);
+    CHECK(count_str(c.text, " frage") == 1);
     CHECK(strstr(c.text, "0s") != NULL); /* sekunden-zaehler im rahmen */
     CHECK(strstr(c.raw, "\xE2\xA0\x8B") != NULL); /* spinner-frame 0 */
     CHECK(strstr(c.text, "thinking...") == NULL); /* nicht mehr im chat */
@@ -352,9 +352,10 @@ static void test_tool_rows(void)
     cap_close(&c);
     /* "ai"-label und call in EINER zeile, der pfeil direkt dahinter
      * – KEINE eigene ai-zeile fuer den leeren text */
-    CHECK(strstr(c.text, "ai   \xE2\x86\x92 bash({") != NULL);
-    /* "ai" genau zweimal: am call und an der antwort "fertig" */
-    CHECK(count_str(c.text, "ai   ") == 2);
+    CHECK(strstr(c.text, " \xE2\x86\x92 bash({") != NULL);
+    /* der call ist genau einmal da (kein label mehr, das mit am
+     * call haeng); die antwort "fertig" ist eigener text */
+    CHECK(count_str(c.text, " \xE2\x86\x92 bash(") == 1);
     /* ergebnis: "output:" vor dem inhalt, exit-code am ende */
     CHECK(strstr(c.text, "output:") != NULL);
     CHECK(strstr(c.text, "hi") != NULL);
@@ -471,9 +472,9 @@ static void test_content_reset(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(strstr(c.text, "you  zeile 40") != NULL); /* der schwanz */
-    CHECK(strstr(c.text, "you  zeile 2 ") == NULL); /* aelteste fehlen */
-    CHECK(strstr(c.text, "you  zeile 10 ") == NULL);
+    CHECK(strstr(c.text, " zeile 40") != NULL); /* der schwanz */
+    CHECK(strstr(c.text, " zeile 2 ") == NULL); /* aelteste fehlen */
+    CHECK(strstr(c.text, " zeile 10 ") == NULL);
 
     /* danach normal weiter: neue nachricht einmal drucken */
     CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neu danach") == 0);
@@ -556,7 +557,7 @@ static void test_separator(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(count_str(c.text, "you  erste nachricht") == 1);
+    CHECK(count_str(c.text, " erste nachricht") == 1);
     /* erste nachricht: KEIN trenner – nur die abstands-zeile des
      * docks ueber dem eingabefeld zaehlt als leerzeile */
     CHECK(count_blank_lines(c.text) == 1);
@@ -574,7 +575,7 @@ static void test_separator(void)
     cap_open(&c);
     draw(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(count_str(c.text, "you  dritte") == 1);
+    CHECK(count_str(c.text, " dritte") == 1);
     /* trenner vor "dritte" + dock-abstand */
     CHECK(count_blank_lines(c.text) == 2);
 
@@ -664,8 +665,8 @@ static void test_tool_spinner(void)
     /* der call ist committet (mit ai-label), darunter der live-
      * spinner (5er-einrueckung; der rahmen-spinner der input-zeile
      * sieht aehnlich aus, deshalb pruefen wir die einrueckung) */
-    CHECK(strstr(c.text, "ai   \xE2\x86\x92 bash({}") != NULL);
-    CHECK(strstr(c.text, "     \xE2\xA0\x8B") != NULL); /* spinner */
+    CHECK(strstr(c.text, " \xE2\x86\x92 bash({}") != NULL);
+    CHECK(strstr(c.text, " \xE2\xA0\x8B") != NULL); /* spinner */
 
     /* der leichte tick: KEIN voller frame (kein cursor-up um die
      * ganze dock-hoehe + kein erase des docks), nur die spinner-
@@ -673,7 +674,7 @@ static void test_tool_spinner(void)
     cap_open(&c);
     draw_busy_tick(24, 80, &st, &cfg);
     cap_close(&c);
-    CHECK(strstr(c.text, "     \xE2\xA0\x8B") != NULL); /* spinner dabei */
+    CHECK(strstr(c.text, " \xE2\xA0\x8B") != NULL); /* spinner dabei */
     /* KEIN voller erase (up + alle zeilen loeschen + up, zwei
      * positioning-ups): nur EIN up auf die live-zeile und genau
      * zwei zeilen-rewrites (spinner + rahmen) */
@@ -696,6 +697,52 @@ static void test_tool_spinner(void)
 /* ctrl+c-warnung: solange confirm_quit ansteht, zeigt die abstands-
  * zeile ueber dem eingabefeld die warnung; jede andere taste hebt
  * sie auf und die zeile ist wieder leer */
+/* ------------------------------------------------------------------ */
+/* markdown: ueberschriften, listen, zitate am originalen zeilenanfang  */
+/* ------------------------------------------------------------------ */
+static void test_markdown(void)
+{
+    AppState st;
+    state_setup(&st);
+    Config cfg = {0};
+    Capture c;
+
+    /* ki-antwort mit markdown: die erste zeile jeder logischen
+     * zeile (nach \n) wird gescannt, wrap-folgezeilen nicht */
+    CHECK(chat_append(&st.chat, CHAT_ROLE_ASSISTANT,
+                      "# Titel\n- punkt\n1. nummer\n> zitat\ntext") ==
+          0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+
+    /* headline: die #-folge faellig + fett (bold + akzent) */
+    CHECK(strstr(c.raw, "\x1b[1m") != NULL);
+    CHECK(strstr(c.raw, "\x1b[36m#") != NULL);
+    /* listen-marker farbig */
+    CHECK(strstr(c.raw, "\x1b[36m-") != NULL);
+    CHECK(strstr(c.raw, "\x1b[36m1.") != NULL);
+    CHECK(strstr(c.raw, "\x1b[36m>") != NULL);
+    /* padding: jede nachricht startet mit einem leerzeichen */
+    CHECK(strstr(c.text, " Titel") != NULL);
+    CHECK(strstr(c.text, " punkt") != NULL);
+    CHECK(strstr(c.text, " nummer") != NULL);
+
+    /* user-nachricht: hintergrund-sequenz + BG-OFF am ende */
+    chat_clear(&st.chat);
+    draw_content_reset();
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "mein text") == 0);
+    cap_open(&c);
+    draw(24, 80, &st, &cfg);
+    cap_close(&c);
+    CHECK(strstr(c.raw, "48;5;") != NULL);   /* palette-hintergrund */
+    CHECK(strstr(c.raw, "49m") != NULL);    /* hintergrund wieder aus */
+
+    cap_free(&c);
+    input_free(&st.input);
+    chat_free(&st.chat);
+}
+
 static void test_quit_warning(void)
 {
     AppState st;
@@ -738,5 +785,6 @@ int main(void)
     test_tool_call_multiline();
     test_tool_spinner();
     test_quit_warning();
+    test_markdown();
     return test_report();
 }

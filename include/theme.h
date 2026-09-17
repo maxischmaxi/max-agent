@@ -21,13 +21,27 @@ typedef enum {
     THEME_ROLE_SYSTEM,    /* label "sys"                             */
     THEME_ROLE_NOTICE,    /* label "ctx": hinweise der app           */
     THEME_ROLE_DIM,       /* beiwerk: thinking, scroll-hinweise      */
+    /* markdown-highlight der ki-antworten (markdown.c): headline
+     * = fette akzentfarbe, marker = listen-punkte/-zahlen. die
+     * defaults stehen in theme.c, themes koennen abweichen. */
+    THEME_ROLE_MD_HEAD,    /* # ## ### ueberschriften (fett+akzent)   */
+    THEME_ROLE_MD_MARKER,  /* "- ", "* ", "1." listen-marker          */
+    /* hintergrund der eigenen nachrichten: ein bisschen heller
+     * (dunkles terminal) bzw. etwas abgesetzt (helles terminal)
+     * als der normale hintergrund – so erkennt man eigene
+     * nachrichten sofort. SGR 48;5;N = palette-hintergrund. */
+    THEME_ROLE_USER_BG,
     THEME_ROLE_COUNT,
 } ThemeRole;
 
 /* nach einer rollen-sequenz zu schreiben: raeumt attribute UND
  * vordergrund ab, damit es egal ist, wofuer sich das theme
- * entschieden hat. der hintergrund bleibt unberuehrt. */
+ * entschieden hat. der hintergrund bleibt unberuehrt.
+ * THEME_ROLE_BG_OFF raeumt ZUSAETZLICH den hintergrund: fuer
+ * zeilen mit user-hintergrund am zeilenende (das padding rechts
+ * gehoert wieder zum normalen bild). */
 #define THEME_ROLE_RESET "\x1b[22;39m"
+#define THEME_ROLE_BG_OFF "\x1b[22;39;49m"
 
 typedef struct {
     const char *name;

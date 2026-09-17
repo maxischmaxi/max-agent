@@ -137,8 +137,12 @@ typedef struct {
     size_t msg;    /* index der nachricht in msgs      */
     size_t off;    /* byte-offset des zeilenanfangs im text */
     size_t len;    /* byte-laenge dieser render-zeile  */
-    bool first;    /* erste zeile der nachricht: label  */
-                   /* (siehe draw.c), sonst einrueckung */
+    bool first;    /* erste zeile der nachricht         */
+    bool lstart;   /* beginnt am originalen zeilenan-  */
+                   /* fang (nach '\n'): nur dann darf  */
+                   /* der markdown-scanner ansetzen    */
+                   /* (siehe markdown.h). bei 'first'  */
+                   /* implizit true                    */
     ChatRole role; /* kopie der nachrichten-rolle: die   */
                    /* slot-mapping braucht sie ohne state-pointer */
     int tool;      /* -1 = textzeile; sonst index in    */

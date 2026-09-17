@@ -9,6 +9,10 @@ static void test_cmd_lookup(void)
     CHECK(cmd_lookup("/models") == CMD_MODELS);
     CHECK(cmd_lookup("/quit") == CMD_QUIT);
 
+    /* /sessions ist ein alias auf den resume-dialog */
+    CHECK(cmd_lookup("/sessions") == CMD_SESSIONS);
+    CHECK(cmd_lookup("sessions") == CMD_SESSIONS);
+
     /* ohne slash auch erlaubt */
     CHECK(cmd_lookup("quit") == CMD_QUIT);
 
@@ -24,7 +28,7 @@ static void test_cmd_match(void)
 {
     int m[COMMAND_COUNT];
 
-    /* leerer prefix: alle */
+    /* leerer prefix: alle (inklusive alias) */
     CHECK(cmd_match("", m, COMMAND_COUNT) == COMMAND_COUNT);
 
     /* eindeutiger prefix */
@@ -36,6 +40,11 @@ static void test_cmd_match(void)
     n = cmd_match("clear", m, COMMAND_COUNT);
     CHECK(n == 1);
     CHECK(m[0] == CMD_CLEAR);
+
+    /* alias: sessions matcht CMD_SESSIONS */
+    n = cmd_match("sessions", m, COMMAND_COUNT);
+    CHECK(n == 1);
+    CHECK(m[0] == CMD_SESSIONS);
 
     /* kein treffer */
     CHECK(cmd_match("zz", m, COMMAND_COUNT) == 0);

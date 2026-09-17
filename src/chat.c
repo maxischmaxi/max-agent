@@ -275,8 +275,8 @@ static size_t utf8_step(const char *s, size_t *bytes)
 /* eine zeile in die tabelle schreiben (bzw. nur mitzaehlen, wenn
  * out NULL ist oder die arena voll) */
 static void wrap_emit(ChatRole role, size_t msg, size_t off, size_t len,
-                      bool first, int tool, ChatLine *out, size_t out_max,
-                      size_t *count)
+                      bool first, bool lstart, int tool, ChatLine *out,
+                      size_t out_max, size_t *count)
 {
     if (out != NULL && *count < out_max) {
         out[*count].role = role;
@@ -284,6 +284,7 @@ static void wrap_emit(ChatRole role, size_t msg, size_t off, size_t len,
         out[*count].off = off;
         out[*count].len = len;
         out[*count].first = first;
+        out[*count].lstart = lstart;
         out[*count].tool = tool;
     }
     (*count)++;
@@ -481,12 +482,12 @@ static void wrap_tool_call(ChatRole role, size_t msg, int tool,
         if (cells + 1 > line_w) {
             size_t next;
             if (brk != SIZE_MAX && brk > off) {
-                wrap_emit(role, msg, off, brk - off, first_line, tool, out,
-                          out_max, count);
+                wrap_emit(role, msg, off, brk - off, first_line, first_line,
+                          tool, out, out_max, count);
                 next = brk + 1;
             } else {
-                wrap_emit(role, msg, off, i - off, first_line, tool, out,
-                          out_max, count);
+                wrap_emit(role, msg, off, i - off, first_line, first_line,
+                          tool, out, out_max, count);
                 next = i;
             }
             first_line = false;
@@ -507,8 +508,8 @@ static void wrap_tool_call(ChatRole role, size_t msg, int tool,
      * zeile. endete der text exakt am letzten umbruch, bleibt
      * nichts uebrig */
     if (off < i || first_line) {
-        wrap_emit(role, msg, off, i - off, first_line, tool, out, out_max,
-                  count);
+        wrap_emit(role, msg, off, i - off, first_line, first_line, tool, out,
+                  out_max, count);
     }
     free(s);
 }
@@ -528,6 +529,7 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
         }
         ChatRole role = chat->msgs[mi].role;
         bool first = true;     /* erste zeile dieser nachricht */
+        bool lstart = true;    /* zeile beginnt am originalen \n-anfang */
         size_t off = 0;        /* byte-offset des zeilenanfangs */
         size_t cells = 0;      /* zellen seit dem zeilenanfang */
         size_t brk = SIZE_MAX; /* offset des letzten passenden leerzeichens */
@@ -538,9 +540,10 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
                 /* CR sollte nie hier ankommen (chat_append filtert);
                  * defensiv als zeilenumbruch werten statt es im text
                  * zu belassen */
-                wrap_emit(role, mi, off, i - off, first, -1, out, out_max,
-                          &count);
+                wrap_emit(role, mi, off, i - off, first, lstart, -1, out,
+                          out_max, &count);
                 first = false;
+                lstart = true; /* neue logische zeile */
                 i++;
                 off = i;
                 cells = 0;
@@ -548,9 +551,10 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
                 continue;
             }
             if (text[i] == '\n') { /* erzwungener umbruch */
-                wrap_emit(role, mi, off, i - off, first, -1, out, out_max,
-                          &count);
+                wrap_emit(role, mi, off, i - off, first, lstart, -1, out,
+                          out_max, &count);
                 first = false;
+                lstart = true; /* neue logische zeile */
                 i++;
                 off = i;
                 cells = 0;
@@ -566,9 +570,10 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
                 if (brk != SIZE_MAX && brk > off) {
                     /* am letzten leerzeichen umbrechen; ein space-
                      * run dahinter faellt ganz weg */
-                    wrap_emit(role, mi, off, brk - off, first, -1, out, out_max,
-                              &count);
+                    wrap_emit(role, mi, off, brk - off, first, lstart, -1, out,
+                              out_max, &count);
                     first = false;
+                    lstart = false; /* umbruch, kein original-\n */
                     size_t next = brk + 1;
                     while (text[next] == ' ') {
                         next++;
@@ -578,9 +583,10 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
                 } else {
                     /* kein umbruchpunkt in der zeile (ueberlanges
                      * wort): hart an der breite brechen */
-                    wrap_emit(role, mi, off, i - off, first, -1, out, out_max,
-                              &count);
+                    wrap_emit(role, mi, off, i - off, first, lstart, -1, out,
+                              out_max, &count);
                     first = false;
+                    lstart = false; /* umbruch, kein original-\n */
                     off = i; /* i bleibt: das ueberlaufende zeichen */
                              /* startet die naechste zeile         */
                 }
@@ -597,7 +603,8 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
          * (leerer text, z.B. streaming-platzhalter) bekommt genau eine
          * leere erste zeile, damit der label alleine steht. */
         if (off < i || first) {
-            wrap_emit(role, mi, off, i - off, first, -1, out, out_max, &count);
+            wrap_emit(role, mi, off, i - off, first, lstart, -1, out, out_max,
+                      &count);
         }
 
         /* tool-calls der nachricht: darstellungs-zeilen nach dem
