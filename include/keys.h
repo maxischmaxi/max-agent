@@ -100,6 +100,14 @@ size_t key_seq_len(const char *buf, size_t len);
  * der interne puffer laeuft nie ueber: ueberschuss wird verworfen. */
 void keys_unread(const char *buf, size_t len);
 
+/* den tastatur-puffer komplett verwerfen. /system-prompt ruft
+ * das vor dem editor-start: die enter-taste, die den befehl
+ * abgeschickt hat, sitzt mit sicherheit noch im puffer/stdin,
+ * und nach dem editor wuerde sie eine leerzeile an das modell
+ * schicken. der editor selbst hat stdin ganz und bekommt beim
+ * verlassen seine eigene restbytes direkt vom terminal. */
+void keys_clear_pending(void);
+
 /* waehrend einer laufenden anfrage: hat der benutzer abgebrochen?
  * prueft den tasten-puffer und stdin, ohne je zu blockieren.
  *

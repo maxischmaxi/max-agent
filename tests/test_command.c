@@ -16,6 +16,10 @@ static void test_cmd_lookup(void)
     /* ohne slash auch erlaubt */
     CHECK(cmd_lookup("quit") == CMD_QUIT);
 
+    /* /system-prompt oeffnet den $EDITOR */
+    CHECK(cmd_lookup("/system-prompt") == CMD_SYSTEM_PROMPT);
+    CHECK(cmd_lookup("system-prompt") == CMD_SYSTEM_PROMPT);
+
     /* exakter match: unvollstaendige/bekannte faelle */
     CHECK(cmd_lookup("/qu") == -1);
     CHECK(cmd_lookup("/quitx") == -1);
@@ -64,7 +68,8 @@ static void test_names_and_descs(void)
         CHECK(COMMANDS[i].desc != NULL && COMMANDS[i].desc[0] != '\0');
     }
 
-    CHECK(cmd_name_col() == (int)strlen(COMMAND_SETTINGS)); /* laengster name */
+    CHECK(cmd_name_col() ==
+          (int)strlen(COMMAND_SYSTEM_PROMPT)); /* laengster name */
 }
 
 int main(void)

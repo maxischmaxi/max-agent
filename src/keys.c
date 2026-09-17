@@ -49,6 +49,11 @@ static bool is_csi_final(char c)
     return false;
 }
 
+void keys_clear_pending(void)
+{
+    g_pending_len = 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* POSIX/readline-shortcuts: eine tabelle fuer beide terminal-        */
 /* encodings. legacy terminals senden das nackte ctrl-byte (raw mode),*/
@@ -1150,6 +1155,14 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
             case CMD_SETTINGS:
                 cmd_settings(state);
                 break;
+            case CMD_SYSTEM_PROMPT:
+                /* /system-prompt: das terminal geht an den editor
+                 * und kommt danach hierher zurueck. r/c sind die
+                 * zeiger der main-schleife: draw_content_reset
+                 * druckt den schwanz, das frame danach sieht die
+                 * (vom editor moeglichst andere) terminalgroesse */
+                cmd_system_prompt(state, cfg, &r, &c);
+                break;
             default: {
                 char prefix[64];
                 int idx[COMMAND_COUNT];
@@ -1173,6 +1186,9 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
                         break;
                     case CMD_SETTINGS:
                         cmd_settings(state);
+                        break;
+                    case CMD_SYSTEM_PROMPT:
+                        cmd_system_prompt(state, cfg, &r, &c);
                         break;
                     default:
                         break;

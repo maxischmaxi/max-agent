@@ -9,13 +9,53 @@ standard terminal buffer — your tmux scrollback is the chat history.
 ## Build
 
 ```sh
-make                    # debug build -> build/debug/max-agent
-make BUILD=release      # optimized  -> build/release/max-agent
+make                    # debug build -> build/debug/max
+make BUILD=release      # optimized  -> build/release/max
 make test               # build and run all tests in tests/
 ```
 
 Debug builds include AddressSanitizer and UndefinedBehaviorSanitizer.
 Requires GNU make, gcc or clang, and libcurl.
+
+## Installation
+
+```sh
+make install      # builds a release binary and installs it as `max`
+```
+
+This compiles an optimized release build and copies it to `/usr/local/bin/max`
+— the standard location for locally compiled software on Linux/BSD/macOS.
+If that directory is not writable for your user (which is common when
+`/usr/local` is owned by root), run it with sudo:
+
+```sh
+sudo make install
+```
+
+Afterwards you can start the agent from anywhere with:
+
+```sh
+max
+```
+
+`make install` respects the usual conventions, so you can relocate the
+binary if `/usr/local` is not what you want:
+
+```sh
+make install PREFIX=~/.local          # -> ~/.local/bin/max
+make install DESTDIR=pkgroot         # for packaging/slackware-style staging
+```
+
+To remove it again:
+
+```sh
+make uninstall      # removes /usr/local/bin/max
+sudo make uninstall
+```
+
+Both targets use the same `PREFIX`/`DESTDIR`/`BINDIR` variables, so
+`make install PREFIX=~/.local && make uninstall PREFIX=~/.local` round-trips
+cleanly.
 
 ## Configuration
 
@@ -49,18 +89,20 @@ to this file.
 ## Usage
 
 ```sh
-./build/debug/max-agent            # start the agent
-./build/debug/max-agent --debug    # write a trace to /tmp/max-agent-<session>.log
+max                     # if installed, or:
+./build/debug/max       # straight from the repo
+./build/debug/max --debug    # write a trace to /tmp/max-agent-<session>.log
 ```
 
 | Command     | What it does                                |
 | ----------- | ------------------------------------------- |
 | `/models`   | pick a model from the config                |
 | `/resume`   | list and resume past sessions               |
-| `/rename`   | name the current session                    |
+| `/rename`   | name the current session                   |
 | `/new`      | start a fresh session (old one is kept)    |
 | `/clear`    | same as `/new`                              |
 | `/settings` | theme, system prompt, confirm-quit behavior |
+| `/system-prompt` | edit the system prompt in your `$EDITOR` — `:wq` applies it, `:q` keeps the old one |
 | `/quit`     | exit                                        |
 
 The agent has `bash`, `read_file` and `write_file` tools and runs them
@@ -76,6 +118,8 @@ leaks) land in the same file.
 | Command              | What it does                               |
 | -------------------- | ------------------------------------------ |
 | `make test`          | run all tests (each `tests/*.c` = one binary) |
+| `make install`      | build release and install as `max`         |
+| `make uninstall`    | remove the installed binary                |
 | `make format`        | format sources with clang-format           |
 | `make format-check`  | fail if anything is unformatted            |
 | `make lint`          | run clang-tidy                             |
