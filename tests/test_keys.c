@@ -585,6 +585,93 @@ static void test_utf8_input(void)
     CHECK(key_from_escape("\x1b[9;2u", 7).kind == KEY_NONE);
 }
 
+/* keys_drain: die busy-eingabe. getipptes landet live im feld,
+ * enter puffert in die queue, pfeil-hoch holt die letzte zurueck,
+ * befehle und abbruch verhalten sich wie besprochen. alles ueber
+ * stdin-pipe (key_read_nonblock liest nie blockierend). */
+static void test_busy_drain(void)
+{
+    StdinPipe sp;
+    if (!stdin_pipe_open(&sp)) {
+        return;
+    }
+
+    AppState st = {0};
+    input_init(&st.input);
+    Config cfg = {0};
+    keys_abort_reset();
+    keys_queue_clear(&st);
+    st.busy = true;
+
+    /* --- tippen waehrend busy: landet im feld --- */
+    keys_unread("hallo", 5);
+    CHECK(keys_drain(&st, &cfg, g_rows, g_cols_80));
+    CHECK(strcmp(st.input.lines[0], "hallo") == 0);
+    CHECK(st.queue_n == 0);
+
+    /* --- enter waehrend busy: nachricht in die queue --- */
+    keys_unread("\r", 1);
+    CHECK(keys_drain(&st, &cfg, g_rows, g_cols_80));
+    CHECK(st.queue_n == 1);
+    CHECK(strcmp(st.queue[0], "hallo") == 0);
+    CHECK(st.input.lines[0][0] == '\0'); /* feld geleert */
+
+    /* --- noch eine nachricht: queue waechst --- */
+    keys_unread("zwei\r", 5);
+    CHECK(keys_drain(&st, &cfg, g_rows, g_cols_80));
+    CHECK(st.queue_n == 2);
+
+    /* --- pfeil-hoch im leeren feld: letzte zurueck --- */
+    keys_unread("\x1b[A", 3);
+    CHECK(keys_drain(&st, &cfg, g_rows, g_cols_80));
+    CHECK(st.queue_n == 1);
+    CHECK(strcmp(st.input.lines[0], "zwei") == 0);
+
+    /* --- ctrl+p holt genauso zurueck --- */
+    input_reset(&st.input);
+    keys_unread("\x10", 1);
+    CHECK(keys_drain(&st, &cfg, g_rows, g_cols_80));
+    CHECK(st.queue_n == 0);
+    CHECK(strcmp(st.input.lines[0], "hallo") == 0);
+
+    /* --- leeres enter: kein queue-eintrag --- */
+    input_reset(&st.input);
+    keys_unread("\r", 1);
+    CHECK(keys_drain(&st, &cfg, g_rows, g_cols_80));
+    CHECK(st.queue_n == 0);
+
+    /* --- befehl waehrend busy: warnung, text bleibt --- */
+    keys_unread("/clear\r", 7);
+    CHECK(keys_drain(&st, &cfg, g_rows, g_cols_80));
+    CHECK(st.queue_n == 0);
+    CHECK(st.cmd_warn == 1);
+    CHECK(strcmp(st.input.lines[0], "/clear") == 0);
+    /* weiter-tippen loescht die warnung nicht, enter schon (sie ist
+     * ja nur an den letzten versuch gebunden) */
+
+    /* --- abbruch: esc setzt das flag, keys_abort_pressed nimmt es --- */
+    CHECK(!keys_busy_abort());
+    keys_unread("\x1b[A", 3); /* pfeil-hoch ist KEIN abbruch */
+    (void)keys_drain(&st, &cfg, g_rows, g_cols_80);
+    CHECK(!keys_busy_abort());
+    keys_unread("\x03", 1); /* ctrl+c */
+    (void)keys_drain(&st, &cfg, g_rows, g_cols_80);
+    CHECK(keys_busy_abort());
+    CHECK(keys_abort_pressed());
+    CHECK(!keys_busy_abort()); /* genommen */
+
+    /* --- queue-freigabe --- */
+    st.queue[st.queue_n++] = dup_str("x");
+    keys_queue_clear(&st);
+    CHECK(st.queue_n == 0);
+
+    st.busy = false;
+    input_free(&st.input);
+    chat_free(&st.chat);
+    history_free(&st.history);
+    stdin_pipe_close(&sp);
+}
+
 int main(void)
 {
     test_key_from_byte();
@@ -597,5 +684,6 @@ int main(void)
     test_wrapped_arrows();
     test_key_read_batch();
     test_utf8_input();
+    test_busy_drain();
     return test_report();
 }

@@ -8,6 +8,7 @@
 
 #include "chat.h"
 #include "draw.h"
+#include "keys.h"
 #include "state.h"
 #include "utils.h"
 
@@ -69,6 +70,7 @@ int cmd_list_height(const AppState *st)
 void cmd_new(AppState *state)
 {
     input_reset(&state->input);   /* draw() schreibt eh jeden frame */
+    keys_queue_clear(state);      /* gebuffertes gehoert zum verlauf */
     session_end(&state->session); /* dateien bleiben unangetastet */
     chat_clear(&state->chat);     /* "start a new session" */
     /* renderer-frontier: der chat ist geleert, neu gedruckt wird

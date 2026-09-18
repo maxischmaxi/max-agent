@@ -141,6 +141,65 @@ static pid_t start_sse_server(int *port)
     _exit(0);
 }
 
+/* server fuer die busy-queue: ZWEI antworten auf einer verbindung
+ * (keep-alive), der client (send_stream) nutzt seinen verbindungs-
+ * cache. so kann ein test den ersten turn und das automatische
+ * nachsenden der queue gegen denselben port fahren */
+static pid_t start_two_sse_server(int *port)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(lfd, 4) != 0 ||
+        getsockname(lfd, (struct sockaddr *)&addr, &(socklen_t){sizeof addr}) !=
+            0) {
+        close(lfd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        close(lfd);
+        return pid;
+    }
+
+    /* ZWEI getrennte verbindungen: send_stream baut pro turn einen
+     * eigenen client (der verbindungs-cache gilt nur fuer die
+     * runden EINES turns). jede verbindung bekommt eine antwort */
+    for (int conn = 0; conn < 2; conn++) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+            _exit(1);
+        }
+        char buf[16384];
+        static const char resp[] = "HTTP/1.1 200 OK\r\n"
+                                   "Content-Type: text/event-stream\r\n"
+                                   "Connection: close\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "\r\n"
+                                   "%s";
+        static const char body[] =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"
+            "data: [DONE]\n\n";
+        int blen = (int)(sizeof body - 1);
+        char head[256];
+        buf[0] = '\0';
+        (void)read_request(cfd, buf, sizeof buf);
+        int hlen = snprintf(head, sizeof head, resp, blen, body);
+        (void)write(cfd, head, (size_t)hlen);
+        close(cfd);
+    }
+    _exit(0);
+}
+
 /* wie start_sse_server, aber mit frei waehlbarer antwort: fuer
  * tests, die eine einzelne, gezielt kaputte sse-antwort brauchen */
 static pid_t start_once_server(int *port, const char *resp)
@@ -1504,6 +1563,56 @@ static void test_stream(void)
     free(bad.providers);
 }
 
+/* busy-queue: nach einem turn wird die gebufferte nachricht als
+ * eigener turn nachgeschickt (zwei antworten auf einer verbindung,
+ * der client-cache haelt sie offen). reihenfolge: erst der laufende
+ * turn, dann die queue in FIFO-ordnung. */
+static void test_queue_after_turn(void)
+{
+    int port = 0;
+    pid_t server = start_two_sse_server(&port);
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+
+    /* waehrend der ki arbeitet, puffert der benutzer zwei nach-
+     * richten (der drain legt sie in die queue). hier direkt
+     * eingefuellt – der drain selbst ist in test_keys getestet */
+    st.queue[st.queue_n++] = dup_str("erste puffer-nachricht");
+    st.queue[st.queue_n++] = dup_str("zweite");
+
+    /* erster turn laeuft und endet: jetzt ist "naechste gelegen-
+     * heit" – keys_flush_queue schickt beide als eigene turns */
+    keys_flush_queue(&st, &cfg);
+
+    /* reihenfolge: zwei user-nachrichten mit je einer antwort */
+    CHECK(st.chat.len == 4);
+    CHECK(st.chat.msgs[0].role == CHAT_ROLE_USER);
+    CHECK(strcmp(st.chat.msgs[0].text, "erste puffer-nachricht") == 0);
+    CHECK(st.chat.msgs[1].role == CHAT_ROLE_ASSISTANT);
+    CHECK(st.chat.msgs[2].role == CHAT_ROLE_USER);
+    CHECK(strcmp(st.chat.msgs[2].text, "zweite") == 0);
+    CHECK(st.chat.msgs[3].role == CHAT_ROLE_ASSISTANT);
+    CHECK(st.chat.msgs[3].text != NULL &&
+          strcmp(st.chat.msgs[3].text, "ok") == 0);
+    CHECK(st.queue_n == 0); /* queue ist leer */
+
+    chat_free(&st.chat);
+    input_free(&st.input);
+    keys_queue_clear(&st);
+    session_end(&st.session); /* send_one hat eine session geoffnet */
+    free_mock_cfg(&cfg);
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
 int main(void)
 {
     /* --- send_role: mapping, ERROR ist keine api-rolle --- */
@@ -1712,6 +1821,7 @@ int main(void)
     test_stream_no_abort();
     test_agent_realloc();
     test_hooks_ctx();
+    test_queue_after_turn();
     test_tools_parallel();
     test_client_reuse();
 

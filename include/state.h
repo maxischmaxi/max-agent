@@ -10,6 +10,16 @@
 #include "input.h"
 #include "session.h"
 
+/* busy-queue (keys.c): enter waehrend die ki arbeitet puffert die
+ * nachricht hier. nach dem turn wird sie als eigener turn geschickt
+ * ("bei naechster gelegenheit"); pfeil-hoch im leeren feld holt die
+ * letzte zurueck ins eingabefeld. */
+#define QUEUE_MAX 16
+
+/* davon sichtbare eintraege im dock (die aeltesten werden
+ * weggeklemmt, der hint zaehlt die gesamtzahl mit) */
+#define QUEUE_VIS_MAX 3
+
 /* ------------------------------------------------------------------ */
 /* DialogState: suchtext + cursor eines offenen dialogs. gehoert zur   */
 /* App und ueberlebt redraws/resizes; wird beim dialog-ende geleert.  */
@@ -73,6 +83,17 @@ typedef struct {
     SessionList sessions;
     bool quit;
     bool dirty;
+
+    /* gebufferte nachrichten (FIFO): queue[0] ist die aelteste.
+     * gefuellt wird nur waehrend busy (keys_drain), geleert nach dem
+     * turn (flush_queue) oder per pfeil-hoch (letzte zurueck ins feld).
+     * keys_queue_clear() gibt alles frei. */
+    char *queue[QUEUE_MAX];
+    size_t queue_n;
+
+    /* warnzeile ueber dem eingabefeld, nur waehrend busy: 0 = keine,
+     * 1 = befehl geht waehrend der antwort nicht, 2 = queue voll */
+    int cmd_warn;
 } AppState;
 
 #endif

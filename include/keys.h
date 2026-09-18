@@ -90,6 +90,38 @@ Key key_from_utf8(const char *buf, size_t len);
 
 Key key_read(void);
 
+/* wie key_read, blockiert aber NIE: keine taste da -> KEY_NONE.
+ * der busy-drain (keys_drain) leert damit puffer und stdin, ohne
+ * auf den benutzer zu warten. */
+Key key_read_nonblock(void);
+
+/* ------------------------------------------------------------------ */
+/* busy-eingabe: waehrend die ki arbeitet ruft der stream-tick den
+ * drain, der getipptes live ins eingabefeld nimmt und enter in die
+ * queue (state->queue) legt. pfeil-hoch am anfang holt die letzte
+ * gebufferte nachricht zurueck ins feld. */
+
+/* tasten annehmen, ohne zu blockieren. rueckgabe: true = es wurde
+ * etwas verarbeitet (der aufrufer sollte neu zeichnen). wird nur
+ * waehrend busy gerufen (stream-tick/redraw, tool-loops). */
+bool keys_drain(AppState *state, const Config *cfg, int rows, int cols);
+
+/* abort-flag aus dem drain zuruecksetzen (vor einem neuen turn).
+ * ctrl+c/esc waehrend busy setzen das flag; keys_abort_pressed()
+ * nimmt es beim naechsten poll ab. */
+void keys_abort_reset(void);
+
+/* das abort-flag abfragen, OHNE es zu nehmen */
+bool keys_busy_abort(void);
+
+/* queue-freigabe: app-ende und /new */
+void keys_queue_clear(AppState *state);
+
+/* die queue nach einem turn als eigene turns abschicken (bis leer
+ * oder quit). handle_all ruft das intern nach jedem turn; der
+ * einstieg hier ist fuer main und tests gedacht. */
+void keys_flush_queue(AppState *state, Config *cfg);
+
 /* laenge der ersten vollstaendigen tastensequenz in buf. 0 heisst
  * unvollstaendig: auf mehr bytes warten. ein read kann mehrere
  * tasten enthalten, deshalb wird byte-genau abgeschnitten. */

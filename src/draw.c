@@ -212,6 +212,9 @@ static void status_token_segs(StatusLine *l, const AppState *st);
 static void row_status_model(Row *r, const Config *cfg, int sub);
 static void row_status_tokens(Row *r, const AppState *st, int sub);
 static void row_quit(Row *r);
+static void row_queued(Row *r, const char *text, int width);
+static void row_queued_hint(Row *r, size_t total);
+static void row_cmd_warn(Row *r, int warn);
 static void row_msg(Row *r, const ChatLine *ln, const char *text);
 static void row_tool_call(Row *r, const ChatToolCall *call, const ChatLine *ln);
 static void row_inline(Row *r, const char *text, size_t off, size_t len,
@@ -900,6 +903,61 @@ static void row_quit(Row *r)
     row_puts(r, "quit? ctrl+c again to confirm");
 }
 
+/* gebufferte nachricht (busy-queue): eine zeile, dim, \n wird zu
+ * leerzeichen. der aufrufer klemmt auf QUEUE_VIS_MAX eintraege,
+ * text selbst wird auf die breite geclippt (row_putn haelt die
+ * zelle zaehlung). */
+static void row_queued(Row *r, const char *text, int width)
+{
+    row_puts(r, " ");
+    row_sgr(r, theme_role(THEME_ROLE_DIM));
+    for (const char *p = text; *p != '\0' && (size_t)r->cells < (size_t)width;
+         p++) {
+        if (*p == '\n') {
+            row_putc(r, ' '); /* mehrzeilig: eine zeile, umbruch als space */
+            continue;
+        }
+        size_t clen = row_utf8_step(p);
+        if ((size_t)r->cells + 1U > (size_t)width) {
+            break;
+        }
+        row_putn(r, p, (int)clen);
+        p += clen - 1; /* for-schleife zaehlt noch eins hoch */
+    }
+    row_sgr(r, THEME_ROLE_RESET);
+}
+
+/* hint unter den gebufferten nachrichten: wie man sie bearbeitet
+ * und wieviele insgesamt warten. dim wie die nachrichten selbst */
+static void row_queued_hint(Row *r, size_t total)
+{
+    char buf[64];
+    if (total > 1) {
+        (void)snprintf(buf, sizeof buf,
+                       " \xE2\x86\x91 um zu bearbeiten \xC2\xB7 %zu wartend",
+                       total);
+    } else {
+        (void)snprintf(buf, sizeof buf, " \xE2\x86\x91 um zu bearbeiten");
+    }
+    row_puts(r, " ");
+    row_sgr(r, theme_role(THEME_ROLE_DIM));
+    row_puts(r, buf);
+    row_sgr(r, THEME_ROLE_RESET);
+}
+
+/* warnung ueber dem eingabefeld waehrend busy: befehl geht nicht
+ * bzw. queue voll. ERROR-farbe wie die fehlerzeilen im chat */
+static void row_cmd_warn(Row *r, int warn)
+{
+    const char *msg = (warn == 2)
+                          ? "warteschlange voll \xC2\xB7 enter ignoriert"
+                          : "befehle gehen w\xC3\xA4hrend der antwort nicht";
+    row_puts(r, " ");
+    row_sgr(r, theme_role(THEME_ROLE_ERROR));
+    row_puts(r, msg);
+    row_sgr(r, THEME_ROLE_RESET);
+}
+
 /* eine nachrichtenzeile. kein label mehr: der text startet direkt
  * am rand, links/rechts mit je einem leerzeichen padding.
  *
@@ -1395,6 +1453,9 @@ void draw_reset(int rows, bool full_reprint)
 typedef enum {
     DROW_GAP,           /* abstand ueber dem dock; zeigt solange die
                          * quit-bestaetigung an (DROW_QUUIT) */
+    DROW_QUEUED,        /* a = flacher queue-index: gebufferte nachricht */
+    DROW_QUEUED_HINT,   /* "pfeil-hoch um zu bearbeiten" + anzahl */
+    DROW_CMD_WARN,      /* befehl/queue-voll warnung (a = cmd_warn) */
     DROW_BORDER,        /* trenn-linie aus em-dashes */
     DROW_BUSY_BORDER,   /* rahmen mit spinner + sekunden (ki arbeitet) */
     DROW_INPUT,         /* a = sichtbare eingabezeile */
@@ -1605,7 +1666,21 @@ static int dock_build(int rows, int cols, AppState *st, const Config *cfg,
         d->status_model_lines = st_lines(&m, w);
         d->status_token_lines = st_lines(&t, w);
     }
-    int usable = rows - d->status_model_lines - d->status_token_lines;
+    /* gebufferte nachrichten (busy): zeilen ueber dem eingabefeld.
+     * queue_h fliesst in die geometrie ein, sonst wuerde das feld
+     * ueber den rand rutschen. die aeltesten eintraege fallen weg
+     * (der hint zaehlt die gesamtzahl), nur busy: im idle-fall wird
+     * die queue sofort abgearbeitet */
+    int queue_h = 0;
+    if (st->busy && st->queue_n > 0) {
+        queue_h = (st->queue_n > QUEUE_VIS_MAX) ? (int)QUEUE_VIS_MAX
+                                                : (int)st->queue_n;
+        queue_h += 1; /* hint-zeile */
+    }
+    int warn_h = (st->busy && st->cmd_warn > 0) ? 1 : 0;
+
+    int usable =
+        rows - d->status_model_lines - d->status_token_lines - queue_h - warn_h;
     if (usable < 1) {
         usable = 1;
     }
@@ -1620,6 +1695,24 @@ static int dock_build(int rows, int cols, AppState *st, const Config *cfg,
         } else {
             out_rows[n++] = (DockRow){DROW_GAP, 0, false};
         }
+    }
+
+    if (n + queue_h + warn_h <= out_max) {
+        size_t skip =
+            (st->queue_n > QUEUE_VIS_MAX) ? st->queue_n - QUEUE_VIS_MAX : 0;
+        for (size_t i = skip; i < st->queue_n; i++) {
+            out_rows[n++] = (DockRow){DROW_QUEUED, (int)(i - skip), false};
+        }
+        if (queue_h > 0) {
+            out_rows[n++] = (DockRow){DROW_QUEUED_HINT, 0, false};
+        }
+    } else {
+        queue_h = 0; /* kein platz: auch nicht zaehlen */
+    }
+    if (warn_h > 0 && n < out_max) {
+        out_rows[n++] = (DockRow){DROW_CMD_WARN, st->cmd_warn, false};
+    } else if (warn_h > 0) {
+        warn_h = 0;
     }
 
     if (d->mode == MODE_INPUT) {
@@ -1820,6 +1913,21 @@ static void render_dock_row(const DockRow *row, const DockCtx *d, AppState *st,
     switch (row->kind) {
     case DROW_GAP:
         /* leer – die zeile raeumt row_start selbst */
+        break;
+    case DROW_QUEUED: {
+        size_t skip =
+            (st->queue_n > QUEUE_VIS_MAX) ? st->queue_n - QUEUE_VIS_MAX : 0;
+        size_t idx = skip + (size_t)row->a;
+        if (idx < st->queue_n) {
+            row_queued(r, st->queue[idx], d->input_w);
+        }
+        break;
+    }
+    case DROW_QUEUED_HINT:
+        row_queued_hint(r, st->queue_n);
+        break;
+    case DROW_CMD_WARN:
+        row_cmd_warn(r, row->a);
         break;
     case DROW_BUSY_BORDER:
         row_busy_border(r, d->busy_ms);

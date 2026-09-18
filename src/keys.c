@@ -21,6 +21,28 @@
 #include "theme.h"
 #include "utils.h"
 
+void keys_queue_clear(AppState *state);
+
+/* ------------------------------------------------------------------ */
+/* busy-eingabe: solange die ki arbeitet, laeuft die ui in den hooks  */
+/* (stream_tick/stream_redraw). dort wird keys_drain aufgerufen,    */
+/* das getippte live ins eingabefeld nimmt und enter in die queue   */
+/* legt. abbruch-tasten setzen ein flag: keys_abort_pressed() fragt  */
+/* es ab (der benutzer hat die tasten ja schon gesehen und sie      */
+/* gehoeren nicht ins eingabefeld).                                   */
+/* ------------------------------------------------------------------ */
+static bool g_busy_abort = false;
+
+void keys_abort_reset(void)
+{
+    g_busy_abort = false;
+}
+
+bool keys_busy_abort(void)
+{
+    return g_busy_abort;
+}
+
 /* tastatur-puffer ist privat fuer dieses modul */
 static char g_pending[SEQ_MAX];
 static size_t g_pending_len = 0;
@@ -160,7 +182,8 @@ static bool wait_readable(int timeout_ms)
     return false;
 }
 
-/* steckt in diesen bytes ein abbruch?
+/* steckt in diesen bytes ein abbruch? (auch der busy-drain nutzt
+ * das: eine taste, die abbruch ist, kommt dort NIE als text an)
  *
  * ctrl+c (0x03) ist eindeutig. escape dagegen ist das erste byte
  * JEDER sequenz – pfeiltasten, pos1/ende, f-tasten. wer waehrend der
@@ -189,7 +212,7 @@ static bool has_abort(const char *buf, size_t len)
              * escape-codes" an) melden ctrl+c als CSI 99;5u und
              * esc als CSI 27u – rohe bytes kommen dann NIE an.
              * die sequenz dekodieren und auf die abbruch-kinds
-             * pruefen, sonst laegest die app in jeder anfrage
+             * pruefen, sonst laege die app in jeder anfrage
              * fest, bis der idle-timeout feuert. */
             Key k = key_from_escape(buf + i, (ssize_t)seq);
             if (k.kind == KEY_CTRL_C || k.kind == KEY_ESCAPE) {
@@ -205,6 +228,10 @@ static bool has_abort(const char *buf, size_t len)
 
 bool keys_abort_pressed(void)
 {
+    if (g_busy_abort) {
+        keys_abort_reset();
+        return true;
+    }
     /* was schon im puffer liegt, zuerst: es ist aelter als stdin */
     if (has_abort(g_pending, g_pending_len)) {
         g_pending_len = 0; /* rest verwerfen, siehe keys.h */
@@ -239,10 +266,6 @@ static unsigned mods_bits(int mods)
     return bits & ~(64U | 128U);
 }
 
-/* codepoint als utf-8 in einen KEY_CHAR-key schreiben (kitty-
- * protokoll meldet zeichen als codepoint, nicht als bytes) */
-static void key_set_cp(Key *k, int cp);
-
 static KeyKind modified_key(int cp, unsigned bits)
 {
     if ((bits & 4U) != 0U) {
@@ -253,6 +276,10 @@ static KeyKind modified_key(int cp, unsigned bits)
     }
     return KEY_NONE;
 }
+
+/* codepoint als utf-8 in einen KEY_CHAR-key schreiben (kitty-
+ * protokoll meldet zeichen als codepoint, nicht als bytes) */
+static void key_set_cp(Key *k, int cp);
 
 /* CSI <codepoint>;<mods> u (kitty) und CSI 27;<mods>;<codepoint> ~
  * (xterm modifyOtherKeys) tragen dieselbe information */
@@ -576,6 +603,51 @@ Key key_read(void)
         }
         waited = 0; /* fortschritt: die wartezeit beginnt von vorn */
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* non-blocking read: wartet nie, liefert KEY_NONE wenn nichts da ist.
+ * der busy-drain ruft das in einer schleife bis der puffer leer ist
+ * (key_read wuerde am leeren stdin blockieren). unvollstaendige
+ * sequenzen bleiben liegen und werden beim naechsten drain
+ * vollendet. */
+Key key_read_nonblock(void)
+{
+    while (g_pending_len > 0) {
+        size_t seq_len = key_seq_len(g_pending, g_pending_len);
+        if (seq_len > 0) {
+            return take_pending(seq_len);
+        }
+        /* unvollstaendig: steht noch mehr auf stdin? wenn ja,
+         * nachfuellen und weiter; wenn nein, die esc-wartezeit
+         * gilt wie in key_read – der drain kommt ja alle 50-100ms
+         * wieder, das einzelne esc wird beim naechsten lauf fertig */
+        if (wait_readable(0)) {
+            FillResult r = fill_pending();
+            if (r != FILL_OK) {
+                return (Key){KEY_NONE, {0}};
+            }
+            continue;
+        }
+        /* der drain feuert alle 50-100ms wieder: die wartezeit
+         * (esc-budget) braucht er nicht abzuwarten – ein einzel-
+         * stehendes esc zaehlt beim naechsten aufruf als escape,
+         * eine halbe CSI-sequenz wird dort vollendet */
+        return (Key){KEY_NONE, {0}};
+    }
+    /* puffer leer: ein read, das nie blockiert (wait_readable(0)) */
+    if (!wait_readable(0)) {
+        return (Key){KEY_NONE, {0}};
+    }
+    FillResult r = fill_pending();
+    if (r != FILL_OK) {
+        return (Key){KEY_NONE, {0}};
+    }
+    size_t seq_len = key_seq_len(g_pending, g_pending_len);
+    if (seq_len == 0) {
+        return (Key){KEY_NONE, {0}}; /* halbe sequenz: naechster drain */
+    }
+    return take_pending(seq_len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -942,20 +1014,264 @@ static void stream_redraw(void *ud)
          * leichter tick wuerde nur die spinner zeichnen und der
          * bildschirm bliebe bis zum naechsten chunk leer */
         draw(rc->rows, rc->cols, rc->state, rc->cfg);
+        rc->state->dirty = false;
         return;
     }
+    /* getipptes waehrend des streams live ins feld nehmen */
+    (void)keys_drain(rc->state, rc->cfg, rc->rows, rc->cols);
     draw(rc->rows, rc->cols, rc->state, rc->cfg);
+    rc->state->dirty = false;
 }
 
-/* leichter watchdog-frame: nur die spinner aktualisieren */
+/* leichter watchdog-frame: nur die spinner aktualisieren. hat der
+ * drain dagegen tasten verarbeitet (getippt, gebuffert, zurueck-
+ * geholt), braucht es einen vollen frame – der leichte tick
+ * wuerde nur die spinner ueberschreiben und das getippte bliebe
+ * bis zum naechsten chunk unsichtbar */
 static void stream_tick(void *ud)
 {
     StreamRedrawCtx *rc = ud;
     if (stream_sync_size(rc)) {
         draw(rc->rows, rc->cols, rc->state, rc->cfg);
+        rc->state->dirty = false;
+        return;
+    }
+    if (keys_drain(rc->state, rc->cfg, rc->rows, rc->cols) ||
+        rc->state->dirty) {
+        draw(rc->rows, rc->cols, rc->state, rc->cfg);
+        rc->state->dirty = false;
         return;
     }
     draw_busy_tick(rc->rows, rc->cols, rc->state, rc->cfg);
+}
+
+/* ------------------------------------------------------------------ */
+/* busy-eingabe: getipptes live ins feld, enter in die queue           */
+/* ------------------------------------------------------------------ */
+
+/* eine EDITIER-taste auf das feld anwenden (zeicheneingabe, cursor,
+ * kill-befehle – alles was handle_all im idle-fall auch tut).
+ * rueckgabe: true = das feld wurde veraendert. enter/tab/abort und
+ * alle nicht-editier-tasten gehoeren nicht hierher und liefern
+ * false. */
+static bool edit_key(AppState *state, Input *input, Key k, int cols)
+{
+    switch (k.kind) {
+    case KEY_BACKSPACE:
+    case KEY_CTRL_H:
+        input_backspace(input);
+        state->cmd_active = input_in_cmd(input);
+        return true;
+    case KEY_CHAR:
+        for (const char *p = k.ch; *p != '\0'; p++) {
+            input_char(input, *p);
+        }
+        state->cmd_active = input_in_cmd(input);
+        return true;
+    case KEY_CTRL_A:
+        (void)input_cursor_home(input);
+        return true;
+    case KEY_CTRL_E:
+        (void)input_cursor_end(input);
+        return true;
+    case KEY_CTRL_B:
+        (void)input_cursor_left(input);
+        return true;
+    case KEY_CTRL_F:
+        (void)input_cursor_right(input);
+        return true;
+    case KEY_CTRL_W:
+        (void)input_kill_last_word(input);
+        state->cmd_active = input_in_cmd(input);
+        return true;
+    case KEY_CTRL_U:
+        (void)input_kill_line(input);
+        state->cmd_active = input_in_cmd(input);
+        return true;
+    case KEY_CTRL_K:
+        (void)input_kill_to_end(input);
+        state->cmd_active = input_in_cmd(input);
+        return true;
+    case KEY_CTRL_D:
+        (void)input_delete_forward(input);
+        state->cmd_active = input_in_cmd(input);
+        return true;
+    case KEY_CTRL_T:
+        (void)input_transpose_chars(input);
+        return true;
+    case KEY_ALT_B:
+        (void)input_word_left(input);
+        return true;
+    case KEY_ALT_F:
+        (void)input_word_right(input);
+        return true;
+    case KEY_ALT_D:
+        (void)input_kill_word(input);
+        state->cmd_active = input_in_cmd(input);
+        return true;
+    case KEY_ALT_BACKSPACE:
+        (void)input_kill_word_back(input);
+        state->cmd_active = input_in_cmd(input);
+        return true;
+    case KEY_ALT_T:
+        (void)input_transpose_words(input);
+        return true;
+    case KEY_ALT_U:
+        (void)input_word_upcase(input);
+        return true;
+    case KEY_ALT_L:
+        (void)input_word_downcase(input);
+        return true;
+    case KEY_ALT_C:
+        (void)input_word_capitalize(input);
+        return true;
+    default:
+        (void)cols;
+        return false;
+    }
+}
+
+/* die letzte queue-nachricht zurueck ins feld holen (pfeil-hoch
+ * am anfang). gibt true zurueck, wenn eine nachricht geholt wurde.
+ * der text wird uebernommen, NICHT editiert – der cursor steht am
+ * ende wie bei history-eintraegen. */
+static bool queue_recall_last(AppState *state, Input *input)
+{
+    if (state->queue_n == 0) {
+        return false;
+    }
+    char *last = state->queue[state->queue_n - 1];
+    state->queue[state->queue_n - 1] = NULL;
+    state->queue_n--;
+    input_set_text(input, last);
+    free(last);
+    state->cmd_active = input_in_cmd(input);
+    return true;
+}
+
+/* pfeil hoch/runter im busy-feld: innerhalb des texts cursor-
+ * bewegung (mit soft-wrap-zaehlung wie im idle-fall), am anfang
+ * die letzte queue-nachricht zurueckholen (nur bei pfeil hoch,
+ * pfeil runter am ende ist history und die gibt es busy nicht).
+ * rueckgabe: true = es wurde etwas getan (neu zeichnen). */
+static bool busy_arrow(AppState *state, Input *input, Key k, int cols)
+{
+    int w = input_field_width(cols);
+    if (k.kind == KEY_UP) {
+        if (input_screen_up(input, w)) {
+            return true;
+        }
+        return queue_recall_last(state, input);
+    }
+    if (k.kind == KEY_DOWN) {
+        return input_screen_down(input, w);
+    }
+    return false;
+}
+
+/* eine taste waehrend die ki arbeitet. abbruch-tasten (ctrl+c, esc)
+ * gehoeren dem abort-pfad und werden NIE ins feld geleitet.
+ * rueckgabe: true = der state hat sich veraendert (neu zeichnen). */
+static bool busy_key(AppState *state, Config *cfg, Input *input, Key k,
+                     int rows, int cols)
+{
+    if (k.kind == KEY_CTRL_C || k.kind == KEY_ESCAPE) {
+        g_busy_abort = true;
+        return true;
+    }
+    if (edit_key(state, input, k, cols)) {
+        return true;
+    }
+    switch (k.kind) {
+    case KEY_NEWLINE:
+        input_newline(input, rows, cmd_list_height(state), false);
+        return true;
+    case KEY_ENTER: {
+        char *text = chat_flatten_input(input);
+        if (text == NULL) {
+            return true; /* leeres feld: nichts zu buffern */
+        }
+        if (input_in_cmd(input)) {
+            /* befehl waehrend der antwort: geht nicht, text bleibt
+             * stehen, der hinweis sagt warum */
+            state->cmd_warn = 1;
+            free(text);
+            return true;
+        }
+        if (state->queue_n >= QUEUE_MAX) {
+            state->cmd_warn = 2;
+            free(text);
+            return true;
+        }
+        input_reset(input);
+        state->cmd_active = false;
+        state->cmd_warn = 0;
+        state->queue[state->queue_n++] = text;
+        history_add(&state->history, text);
+        return true;
+    }
+    case KEY_UP:
+    case KEY_DOWN:
+        return busy_arrow(state, input, k, cols);
+    case KEY_CTRL_P:
+        /* readline: ctrl+p/ctrl+n sind im idle-fall immer history.
+         * busy gibt es keine history-navigation – ctrl+p holt wie
+         * pfeil hoch die letzte queue-nachricht zurueck */
+        return queue_recall_last(state, input);
+    case KEY_CTRL_N:
+        return false;
+    case KEY_TAB:
+        return true; /* vervollstaendigung geht busy nicht */
+    case KEY_CTRL_L:
+        return true; /* redraw uebernimmt der hook */
+    default:
+        return false;
+    }
+    (void)cfg;
+}
+
+/* ------------------------------------------------------------------ */
+/* keys_drain: tasten waehrend eines turns annehmen. der stream-tick
+ * (~100ms), der chunk-redraw (~80ms) und die tool-loops (50ms)
+ * rufen das – der main-loop blockiert ja im send. die tasten
+ * landen live im eingabefeld, enter puffert in die queue, abbruch
+ * setzt das flag (keys_abort_pressed nimmt es beim naechsten poll
+ * ab). rueckgabe: true = tasten wurden verarbeitet (neu zeichnen).
+ * ------------------------------------------------------------------ */
+bool keys_drain(AppState *state, const Config *cfg, int rows, int cols)
+{
+    bool any = false;
+    Key k = key_read_nonblock();
+    while (k.kind != KEY_NONE) {
+        if (k.kind == KEY_CTRL_Q) {
+            /* sofort-exit waehrend des turns: quit setzen und die
+             * restlichen tasten verwerfen – die app endet nach dem
+             * turn (bzw. der abort bricht ihn ab) */
+            state->quit = true;
+            g_busy_abort = true;
+            keys_clear_pending();
+            return true;
+        }
+        if (busy_key(state, (Config *)cfg, &state->input, k, rows, cols)) {
+            any = true;
+        }
+        k = key_read_nonblock();
+    }
+    if (any) {
+        state->dirty = true;
+    }
+    return any;
+}
+
+/* queue leeren (app-ende, /new): alle strings freigeben */
+void keys_queue_clear(AppState *state)
+{
+    for (size_t i = 0; i < state->queue_n; i++) {
+        free(state->queue[i]);
+        state->queue[i] = NULL;
+    }
+    state->queue_n = 0;
+    state->cmd_warn = 0;
 }
 
 static void cmd_parse(const AppState *st, char *word, size_t word_sz,
@@ -1000,6 +1316,7 @@ static void run_compact(AppState *state, Config *cfg, int r, int c)
     state->cmd_active = false;
     state->busy = true;
     state->busy_start_ms = mono_ms();
+    keys_abort_reset();
     draw(r, c, state, cfg);
 
     StreamRedrawCtx rc = {
@@ -1016,6 +1333,7 @@ static void run_compact(AppState *state, Config *cfg, int r, int c)
     (void)send_compact_now(state, cfg, &hooks);
 
     state->busy = false;
+    keys_abort_reset();
     /* compaction ist arbeit der ki wie ein turn: mitzaehlen, der
      * spinner zeigt sie ja auch als solche */
     if (state->busy_start_ms > 0) {
@@ -1024,6 +1342,91 @@ static void run_compact(AppState *state, Config *cfg, int r, int c)
         session_worked_set(&state->session, state->worked_ms);
     }
     state->dirty = true;
+}
+
+/* EINE nachricht als turn abschicken: transcript, session-log,
+ * busy-frame, send_stream, zeit-buchhaltung. das ist derselbe rah-
+ * men wie handle_all/KEY_ENTER ihn hat – nur als funktion, damit
+ * die queue nach einem turn dieselbe maschinerie nutzen kann.
+ * r/c sind die lokalen groessen und kommen per zeiger zurueck
+ * (resize waehrend des turns). */
+static void send_one(AppState *state, Config *cfg, char *text, int *rows,
+                     int *cols)
+{
+    int r = *rows;
+    int c = *cols;
+
+    dbg("sende: %.80s", text);
+    if (chat_append(&state->chat, CHAT_ROLE_USER, text) != 0) {
+        die("out of memory");
+    }
+    if (!state->session.active) {
+        (void)session_start(&state->session, cfg);
+    }
+    (void)session_log_user(&state->session, text);
+    free(text);
+
+    state->busy = true;
+    state->busy_start_ms = mono_ms();
+    keys_abort_reset();
+    state->cmd_warn = 0;
+    draw(r, c, state, cfg);
+    StreamRedrawCtx rc = {
+        .state = state,
+        .cfg = cfg,
+        .rows = r,
+        .cols = c,
+    };
+    SendHooks hooks = {
+        .ctx = &rc,
+        .redraw = stream_redraw,
+        .tick = stream_tick,
+    };
+    (void)send_stream(state, cfg, &hooks);
+    state->busy = false;
+    keys_abort_reset();
+    if (rc.rows != r || rc.cols != c) {
+        r = rc.rows;
+        c = rc.cols;
+        if (state->resized) {
+            state->resized = 0;
+        }
+    }
+    if (state->busy_start_ms > 0) {
+        state->worked_ms += mono_ms() - state->busy_start_ms;
+        state->busy_start_ms = 0;
+        session_worked_set(&state->session, state->worked_ms);
+    }
+    state->dirty = true;
+
+    *rows = r;
+    *cols = c;
+}
+
+/* die queue abarbeiten: nach einem turn werden gepufferte nach- */
+/* richten als eigene turns geschickt, bis die queue leer ist (oder
+ * quit). jede nachricht sieht die antwort der vorherigen im ver-
+ * lauf – die ki antwortet also in der reihenfolge, in der der
+ * benutzer getippt hat. */
+static void flush_queue(AppState *state, Config *cfg, int *rows, int *cols)
+{
+    while (state->queue_n > 0 && !state->quit) {
+        char *text = state->queue[0];
+        memmove((void *)state->queue, (const void *)(state->queue + 1),
+                (state->queue_n - 1) * sizeof *state->queue);
+        state->queue_n--;
+        send_one(state, cfg, text, rows, cols);
+    }
+}
+
+/* dasselbe als tests/main-einstieg ohne groessen-pointer: nach
+ * einem turn reicht die aktuelle terminalgroesse */
+void keys_flush_queue(AppState *state, Config *cfg)
+{
+    int rows = 24;
+    int cols = 80;
+    (void)term_size(&rows, &cols);
+    flush_queue(state, cfg, &rows, &cols);
 }
 
 static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
@@ -1136,61 +1539,10 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
             input_reset(input);
             state->cmd_active = false;
             if (text != NULL) {
-                dbg("sende: %.80s", text);
-                if (chat_append(&state->chat, CHAT_ROLE_USER, text) != 0) {
-                    die("out of memory");
-                }
-                /* die erste nachricht oeffnet die session: erst jetzt
-                 * gibt es eine id, /rename und die statuszeile haben
-                 * ab hier etwas in der hand. scheitert das anlegen,
-                 * laeuft der chat ohne aufzeichnung weiter – die
-                 * unterhaltung ist immer wichtiger als das protokoll. */
-                if (!state->session.active) {
-                    (void)session_start(&state->session, cfg);
-                }
-                (void)session_log_user(&state->session, text);
-                free(text);
-                /* viewport am ANFANG der eigenen nachricht fest-
-                 * machen: eine mehrzeilige nachricht darf nie von
-                 * oben beschnitten werden ("dem ende folgen" wuerde
-                 * sonst die ersten zeilen wegschneiden). der erste
-                 * stream-redraw hebt das wieder auf. */
-
-                state->busy = true;
-                state->busy_start_ms = mono_ms();
-                draw(r, c, state, cfg);
-                StreamRedrawCtx rc = {
-                    .state = state,
-                    .cfg = cfg,
-                    .rows = r,
-                    .cols = c,
-                };
-                SendHooks hooks = {
-                    .ctx = &rc,
-                    .redraw = stream_redraw,
-                    .tick = stream_tick,
-                };
-                (void)send_stream(state, cfg, &hooks);
-                state->busy = false;
-                /* hat der watchdog ein resize bemerkt, kennt nur der
-                 * kontext die neue groesse – sie gehoert auch in die
-                 * variablen des main-loops, sonst zeichnet das erste
-                 * frame nach dem turn mit der alten breite */
-                if (rc.rows != r || rc.cols != c) {
-                    r = rc.rows;
-                    c = rc.cols;
-                    if (state->resized) {
-                        state->resized = 0;
-                    }
-                }
-                /* turn vorbei: die arbeitszeit in die gesamt-
-                 * buchhaltung und die session schreiben. gescheiterter
-                 * turn zaehlt nicht (kein busy_start gesetzt) */
-                if (state->busy_start_ms > 0) {
-                    state->worked_ms += mono_ms() - state->busy_start_ms;
-                    state->busy_start_ms = 0;
-                    session_worked_set(&state->session, state->worked_ms);
-                }
+                send_one(state, cfg, text, &r, &c);
+                /* gebufferte nachrichten aus der busy-phase: jetzt
+                 * ist die "naechste gelegenheit" */
+                flush_queue(state, cfg, &r, &c);
             }
             state->dirty = true;
         }
