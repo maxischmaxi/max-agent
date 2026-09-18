@@ -766,6 +766,256 @@ void tool_kill_current(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* output-kondensierung (bash): was das modell pro runde sieht,       */
+/* landet auch im verlauf – jede weitere runde zahlt es nochmal.      */
+/* build-logs, test-laefe und debug-loops produzieren massenhaft       */
+/* identische zeilen (eine echte session hat dasselbe gdb-kommando     */
+/* 71x laufen lassen) und unsichtbaren ansi-muell (farben, cursor).    */
+/* die kondensierung ist deterministisch und ohne llm-call:            */
+/*                                                                      */
+/*  - ansi-escapes (CSI-sequenzen) verschwinden ganz                    */
+/*  - ab 3 identischen zeilen hintereinander bleibt die erste plus     */
+/*    "[... N identical lines omitted]"                                */
+/*  - ab 3 leerzeilen bleibt eine (wie cat -s, ohne marker: eine       */
+/*    leerzeile traegt keine information)                              */
+/*                                                                      */
+/* das ORIGINAL bleibt zugreifbar: ab 2 kb legt tool_bash den rohen    */
+/* output in eine temp-datei und nennt den pfad im ergebnis – das      */
+/* modell kann bei bedarf grep/sed gegen die datei laufen lassen,      */
+/* statt den muell im kontext mitzuschleppen. nur wenn mindestens 10%  */
+/* gespart werden, wird die kondensierte version uebernommen.          */
+/* ------------------------------------------------------------------ */
+
+/* ab soviele IDENTISCHEN zeilen hintereinander kollabiert der run */
+#define CONDENSE_IDENT_RUN 3
+/* ab soviele leerzeilen hintereinander bleibt nur eine */
+#define CONDENSE_BLANK_RUN 3
+/* nur lohnt sich kondensierung, wenn mindestens dieser anteil wegfaellt */
+#define CONDENSE_MIN_SAVE_PCT 10
+/* das rohe original ab dieser groesse in eine temp-datei sichern */
+#define CONDENSE_SAVE_ORIG ((size_t)2 * 1024)
+
+/* dynamischer anhaenge-puffer (die() bei OOM, wie ueberall) */
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} CBuf;
+
+static void cbuf_add(CBuf *b, const char *data, size_t n)
+{
+    if (b->cap < b->len + n + 1) {
+        size_t cap = (b->cap > 0) ? b->cap : 256;
+        while (cap < b->len + n + 1) {
+            cap *= 2;
+        }
+        char *grown = realloc(b->buf, cap);
+        if (grown == NULL) {
+            die("out of memory");
+        }
+        b->buf = grown;
+        b->cap = cap;
+    }
+    memcpy(b->buf + b->len, data, n);
+    b->len += n;
+    b->buf[b->len] = '\0';
+}
+
+static void cbuf_line(CBuf *b, const char *s, size_t n, bool nl)
+{
+    cbuf_add(b, s, n);
+    if (nl) {
+        cbuf_add(b, "\n", 1);
+    }
+}
+
+/* ansi-escapes aus src entfernen: CSI-sequenzen (ESC '[' ... final-byte
+ * 0x40-0x7e) und vereinzelte ESC/OSC-anfaenge. heap-kopie; *out_len
+ * = neue laenge. programme schreiben farben auch in pipes (clang,
+ * cmake, gcc mit -fcolor-diagnostics) – das sind reine token-        */
+/* verschwendung, das terminal sieht sie eh nie.                     */
+static char *ansi_strip(const char *src, size_t src_len, size_t *out_len)
+{
+    CBuf b = {0};
+    size_t i = 0;
+    while (i < src_len) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == 0x1B && i + 1 < src_len) {
+            unsigned char next = (unsigned char)src[i + 1];
+            if (next == '[') {
+                /* CSI: ESC '[' parameter/intermediates final-byte */
+                size_t j = i + 2;
+                while (j < src_len && !((unsigned char)src[j] >= 0x40 &&
+                                        (unsigned char)src[j] <= 0x7E)) {
+                    j++;
+                }
+                i = (j < src_len) ? j + 1 : src_len;
+                continue;
+            }
+            if (next == ']' || next == 'P' || next == '_' || next == '^') {
+                /* OSC/DCS/APC/PM: bis zum naechsten BEL oder ESC-\ */
+                size_t j = i + 2;
+                while (j < src_len) {
+                    if (src[j] == '\a' || (src[j] == '\\' && j > 0 &&
+                                           (unsigned char)src[j - 1] == 0x1B)) {
+                        j++;
+                        break;
+                    }
+                    j++;
+                }
+                i = j;
+                continue;
+            }
+            /* zweizeichen-escape (ESC c, ESC M, ...): beide weg */
+            i += 2;
+            continue;
+        }
+        cbuf_add(&b, src + i, 1);
+        i++;
+    }
+    *out_len = b.len;
+    return b.buf;
+}
+
+/* ist die zeile [s, s+n) leer bzw. nur whitespace? */
+static bool is_blank_line(const char *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] != ' ' && s[i] != '\t' && s[i] != '\r') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* zwei zeilen byteweise gleich? */
+static bool line_eq(const char *a, size_t an, const char *b, size_t bn)
+{
+    return an == bn && memcmp(a, b, an) == 0;
+}
+
+/* zeilen-laeufe kollabieren. src muss '\0'-terminiert sein, len ohne
+ * terminator; ergebnis ist eine '\0'-terminierte heap-kopie,
+ * *out_len ohne terminator. NULL nur bei OOM (dann *out_len 0). */
+static char *collapse_runs(const char *src, size_t len, size_t *out_len)
+{
+    CBuf b = {0};
+    size_t i = 0;
+    char marker[64];
+    while (i < len) {
+        /* zeile [i, eol), inklusive ihrem '\n' falls vorhanden */
+        size_t eol = i;
+        while (eol < len && src[eol] != '\n') {
+            eol++;
+        }
+        bool has_nl = (eol < len);
+        const char *line = src + i;
+        size_t line_n = eol - i;
+
+        if (is_blank_line(line, line_n)) {
+            /* leerzeilen-run zaehlen */
+            size_t run = 1;
+            size_t j = eol + (has_nl ? 1 : 0);
+            while (j < len) {
+                size_t je = j;
+                while (je < len && src[je] != '\n') {
+                    je++;
+                }
+                if (!is_blank_line(src + j, je - j)) {
+                    break;
+                }
+                run++;
+                if (je >= len) {
+                    j = len;
+                    break;
+                }
+                j = je + 1;
+            }
+            if (run >= CONDENSE_BLANK_RUN) {
+                /* N leerzeilen -> eine (cat -s). ohne marker: eine
+                 * leerzeile traegt keine information, die das
+                 * modell brauchen koennte */
+                cbuf_add(&b, "\n", 1);
+            } else {
+                for (size_t r = 0; r < run; r++) {
+                    cbuf_add(&b, "\n", 1);
+                }
+            }
+            i = j;
+            continue;
+        }
+
+        /* identische-zeilen-run zaehlen */
+        size_t run = 1;
+        size_t j = eol + (has_nl ? 1 : 0);
+        while (j < len) {
+            size_t je = j;
+            while (je < len && src[je] != '\n') {
+                je++;
+            }
+            if (!line_eq(line, line_n, src + j, je - j)) {
+                break;
+            }
+            run++;
+            if (je >= len) {
+                j = len;
+                break;
+            }
+            j = je + 1;
+        }
+        if (run >= CONDENSE_IDENT_RUN) {
+            cbuf_line(&b, line, line_n, true);
+            int ml = snprintf(marker, sizeof marker,
+                              "[... %zu identical lines omitted]", run - 1);
+            if (ml < 0) {
+                ml = 0;
+            }
+            cbuf_add(&b, marker, (size_t)ml);
+            cbuf_add(&b, "\n", 1);
+        } else {
+            for (size_t r = 0; r < run; r++) {
+                cbuf_line(&b, line, line_n, true);
+            }
+        }
+        i = j;
+    }
+    *out_len = b.len;
+    return b.buf;
+}
+
+/* ein bash-ergebnis kondensieren (ansi + runs). rueckgabe: neue
+ * '\0'-terminierte heap-kopie mit *out_len bytes, oder NULL, wenn
+ * sich das nicht lohnt (unter CONDENSE_MIN_SAVE_PCT ersparnis) oder
+ * OOM – der aufrufer behaelt dann das original. */
+static char *condense_output(const char *src, size_t len, size_t *out_len)
+{
+    *out_len = 0;
+    if (src == NULL || len < 256) {
+        return NULL; /* kleine outputs: overhead lohnt nie */
+    }
+
+    size_t stripped_len = 0;
+    char *stripped = ansi_strip(src, len, &stripped_len);
+    if (stripped == NULL) {
+        return NULL;
+    }
+    size_t clen = 0;
+    char *collapsed = collapse_runs(stripped, stripped_len, &clen);
+    free(stripped);
+    if (collapsed == NULL) {
+        return NULL;
+    }
+    /* mindest-ersparnis (10 %) nicht erreicht: original behalten.
+     * clen + len/10 >= len  <=>  clen >= len - len/10 */
+    if (clen + len / 10 >= len) {
+        free(collapsed);
+        return NULL;
+    }
+    *out_len = clen;
+    return collapsed;
+}
+
 static char *tool_bash(const cJSON *args)
 {
     char *command = arg_string(args, "command");
@@ -951,13 +1201,71 @@ static char *tool_bash(const cJSON *args)
         (bool)(capped || got > TOOL_MAX_BYTES || total_lines > TOOL_MAX_LINES);
 
     if (!truncated) {
-        /* kleine outputs: unverkuertztes ergebnis, nur statuszeilen */
-        char *out = realloc(buf, got + 64);
+        /* kleine outputs: unverkuertztes ergebnis, nur statuszeilen.
+         * davor die kondensierung: identische zeilen-laeufe und ansi-
+         * muell kosten in JEDER folge-runde wieder tokens (sie stehen
+         * im verlauf), also hier direkt verdichten. das original
+         * wird ab CONDENSE_SAVE_ORIG zusaetzlich in eine temp-datei
+         * gesichert und im hinweis genannt – das modell kann sie
+         * grep-en, statt den muell mitzuschleppen. */
+        char cond_note[160];
+        cond_note[0] = '\0';
+        size_t raw_len = got;
+        size_t cond_len = 0;
+        char *condensed = condense_output(buf, got, &cond_len);
+        if (condensed != NULL) {
+            if (raw_len >= CONDENSE_SAVE_ORIG) {
+                char tmp_path[] = "/tmp/max-agent-bash-XXXXXX";
+                int tfd = mkstemp(tmp_path);
+                bool ok = tfd >= 0;
+                if (ok) {
+                    size_t off = 0;
+                    while (off < raw_len) {
+                        ssize_t n = write(tfd, buf + off, raw_len - off);
+                        if (n < 0) {
+                            if (errno == EINTR) {
+                                continue;
+                            }
+                            ok = false;
+                            break;
+                        }
+                        off += (size_t)n;
+                    }
+                    close(tfd);
+                }
+                if (ok) {
+                    size_t cond_lines = 0;
+                    for (size_t i = 0; i < cond_len; i++) {
+                        if (condensed[i] == '\n') {
+                            cond_lines++;
+                        }
+                    }
+                    if (clen > 0 && condensed[cond_len - 1] != '\n') {
+                        cond_lines++;
+                    }
+                    (void)snprintf(cond_note, sizeof cond_note,
+                                   "\n\n[condensed: %zu -> %zu lines; "
+                                   "full output: %s]",
+                                   total_lines, cond_lines, tmp_path);
+                }
+                dbg("bash: kondensiert %zu -> %zu bytes (original: %s)",
+                    raw_len, cond_len, ok ? tmp_path : "temp fehlgeschlagen");
+            }
+            free(buf);
+            buf = condensed;
+            got = cond_len;
+        }
+        char *out = realloc(buf, got + strlen(cond_note) + 64);
         if (out == NULL) {
             free(buf);
             return NULL;
         }
         size_t pos = got;
+        if (cond_note[0] != '\0') {
+            size_t nl = strlen(cond_note);
+            memcpy(out + pos, cond_note, nl);
+            pos += nl;
+        }
         if (timed_out) {
             pos += (size_t)snprintf(out + pos, 48, "\n[timeout after %lds]",
                                     timeout_s);
@@ -1031,13 +1339,31 @@ static char *tool_bash(const cJSON *args)
     }
 
     size_t body = got - lo;
+
+    /* das fenster kondensieren: auch im 50KB-tail stecken oft
+     * dutzende identische zeilen (progress, loops, warnings). die
+     * temp-datei hat bereits das rohe original, der hinweis nennt
+     * ihren pfad – mehr braucht es nicht. die zeilennummern im
+     * hinweis beziehen sich aufs rohe fenster, das ist die ehr-
+     * lichste beschreibung des ausschnitts. */
+    size_t cond_len = 0;
+    char *condensed = condense_output(buf + lo, body, &cond_len);
+    const char *win = buf + lo;
+    if (condensed != NULL) {
+        win = condensed;
+        body = cond_len;
+        dbg("bash: fenster kondensiert -> %zu bytes", cond_len);
+    }
+
     size_t hint_len = strlen(hint);
     char *out = malloc(body + hint_len + 64);
     if (out == NULL) {
+        free(condensed);
         free(buf);
         return NULL;
     }
-    memcpy(out, buf + lo, body);
+    memcpy(out, win, body);
+    free(condensed);
     memcpy(out + body, hint, hint_len + 1);
     size_t pos = body + hint_len;
     if (timed_out) {

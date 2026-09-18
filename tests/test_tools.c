@@ -280,6 +280,92 @@ int main(void)
     CHECK(r != NULL && strstr(r, "oops") != NULL);
     free(r);
 
+    /* --- bash: output-kondensierung --- */
+
+    /* kleiner output: unberuehrt, kein kondensierungs-marker */
+    r = tool_execute("bash", "{\"command\":\"echo hallo\"}");
+    CHECK(r != NULL && strcmp(r, "hallo\n\n[exit: 0]") == 0);
+    free(r);
+
+    /* identische zeilen kollabieren: 50x dieselbe zeile -> die
+     * erste plus marker. klein genug (< 2 kb), dass das original
+     * keine temp-datei braucht */
+    r = tool_execute("bash", "{\"command\":\"yes iteration | head -50\"}");
+    CHECK(r != NULL);
+    CHECK(strncmp(r, "iteration\n[... 49 identical lines omitted]", 39) == 0);
+    CHECK(strstr(r, "condensed") == NULL); /* unter der save-schwelle */
+    CHECK(strstr(r, "\n[exit: 0]") != NULL);
+    free(r);
+
+    /* grosser output: das rohe original landet in einer temp-datei,
+     * der hinweis nennt den pfad und die zeilenzahlen */
+    r = tool_execute(
+        "bash", "{\"command\":\"yes 0123456789012345678901234567890123456789 | "
+                "head -60\"}");
+    CHECK(r != NULL);
+    CHECK(strncmp(r, "0123456789", 10) == 0);
+    CHECK(strstr(r, "[... 59 identical lines omitted]") != NULL);
+    CHECK(strstr(r, "[condensed: 60 -> ") != NULL);
+    {
+        /* temp-datei aus dem hinweis: enthaelt das VOLLstaendige
+         * rohe original (60 zeilen, keine kondensierung) */
+        char full[128];
+        const char *p = strstr(r, "full output: ");
+        CHECK(p != NULL);
+        size_t n = 0;
+        for (p += strlen("full output: ");
+             *p != ']' && *p != '\0' && n < sizeof full - 1; p++) {
+            full[n++] = *p;
+        }
+        full[n] = '\0';
+        CHECK(n > 0);
+        char *body = NULL;
+        size_t size = 0;
+        CHECK(read_file(full, &body, &size) == 0);
+        CHECK(body != NULL && size == 60 * 41); /* 40 zeichen + '\n' */
+        free(body);
+        unlink(full);
+    }
+    free(r);
+
+    /* ansi-escapes verschwinden komplett (farben sind in einer pipe
+     * reine token-verschwendung), danach kollabiert auch hier der
+     * identische run */
+    r = tool_execute(
+        "bash", "{\"command\":\"printf '\\\\033[31mrot\\\\033[0m\\\\n%.0s' "
+                "$(seq 1 20)\"}");
+    CHECK(r != NULL);
+    CHECK(strstr(r, "\033") == NULL); /* escape weg */
+    CHECK(strstr(r, "[... 19 identical lines omitted]") != NULL);
+    free(r);
+
+    /* leerzeilen-run kollabiert still auf eine einzige (wie cat -s):
+     * kein marker, leerzeilen tragen keine information */
+    r = tool_execute(
+        "bash", "{\"command\":\"yes textzeile | head -10; yes '' | head -200; "
+                "echo done\"}");
+    CHECK(r != NULL);
+    {
+        /* genau EIN leerzeilen-paar zwischen text und done */
+        const char *a = strstr(r, "textzeile");
+        CHECK(a != NULL);
+        const char *b = strstr(r, "\n\ndone");
+        CHECK(b != NULL);
+        /* zwischen run-ende und done liegt genau eine leerzeile */
+        CHECK(strstr(a + 10, "\n\n\n") == NULL);
+    }
+    free(r);
+
+    /* truncation + kondensierung greifen zusammen: 3000 zeilen,
+     * das tail-fenster wird nach dem windowing noch verdichtet,
+     * der hinweis nennt weiterhin das rohe original */
+    r = tool_execute(
+        "bash", "{\"command\":\"seq 1 3000 > /dev/null; yes x | head -3000\"}");
+    CHECK(r != NULL);
+    CHECK(strstr(r, "identical lines omitted") != NULL);
+    CHECK(strstr(r, "Full output: /tmp/max-agent-bash-") != NULL);
+    free(r);
+
     /* timeout-parameter: laeuft ab -> kill, hinweis im ergebnis.
      * laufzeit des tests: gut 1 s */
     r = tool_execute("bash", "{\"command\":\"sleep 5\",\"timeout\":1}");

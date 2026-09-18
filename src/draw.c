@@ -816,12 +816,21 @@ static void row_status_model(Row *r, const Config *cfg, int sub)
  * wieviel davon praktisch gratis war. */
 static void status_token_segs(StatusLine *l, const AppState *st)
 {
-    char buf[80];
+    /* buf in SEGMENT-groesse: st_add kopiert in ein STATUS_SEG_TEXT-
+     * feld, und mit gleich grosser quelle sieht der -O2-gcc, dass
+     * nichts trunciert werden kann (-Wformat-truncation). das laengste
+     * segment ist "99999k kontext (99999k cached)" – 34 zeichen. */
+    char buf[STATUS_SEG_TEXT];
     {
-        char cnt[24];
+        /* put_count_s schreibt hoechstens 8 zeichen ("2147483k") –
+         * die 9-byte-puffer geben dem -O2-gcc die schranke, mit der
+         * er beweisen kann, dass das laengste segment (34 zeichen)
+         * ins 40-byte-feld passt; mit 24-byte-puffern rechnet er
+         * mit 23 zeichen pro zahl und warnt -Wformat-truncation */
+        char cnt[9];
         put_count_s(cnt, sizeof cnt, (size_t)st->ctx.last_prompt);
         if (st->ctx.last_cached > 0) {
-            char cch[24];
+            char cch[9];
             put_count_s(cch, sizeof cch, (size_t)st->ctx.last_cached);
             (void)snprintf(buf, sizeof buf, "%s kontext (%s cached)", cnt, cch);
         } else {

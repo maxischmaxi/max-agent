@@ -122,6 +122,14 @@ don't support it). The status line shows the context size of the last request wi
 its cached share (prefix caching makes those re-reads almost free) instead of a
 cumulative sum that counted the whole history on every round.
 
+Bash output is condensed before it enters the conversation: ANSI escape sequences
+are stripped entirely, runs of identical lines collapse to the first line plus
+`[... N identical lines omitted]`, and runs of blank lines collapse to a single
+one. Since every round re-sends the whole history, this pays off on every
+subsequent round — and the raw output is still available: from 2 KB up it is
+written to a temp file whose path is included in the result, so the model can
+grep it instead of dragging the noise through the context.
+
 When the model's context window overflows (or grows past a ~200k cap, whichever
 comes first), older history is compacted into an LLM-generated summary instead of
 being silently dropped, so long-running tasks keep their context — and rounds stay
