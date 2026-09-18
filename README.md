@@ -107,7 +107,13 @@ max                     # if installed, or:
 | `/quit`     | exit                                        |
 
 The system prompt is hardcoded in `src/prompt.c` — it is part of the codebase
-and intentionally not configurable.
+and intentionally not configurable. On top of that, project context files are
+appended exactly like the pi-agent does: a global `AGENTS.md` from the config
+directory (`~/.config/.maxagent/`) and one from the project root (the working
+directory where `max` was started). Per directory the first of these wins:
+`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD` — and the
+content is embedded in the same `<project_context>` / `<project_instructions>`
+format pi uses, so a file written for one agent reads naturally in both.
 
 The agent has `bash`, `read_file`, `edit_file` and `write_file` tools and runs them
 asynchronously — independent calls execute in parallel (file edits stay sequential).

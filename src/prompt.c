@@ -66,6 +66,102 @@ static const char PROMPT_TEMPLATE[] =
     "- When debugging, form ONE hypothesis, test it with ONE\n"
     "  command, and think about the result before running the next.\n";
 
+/* ------------------------------------------------------------------ */
+/* AGENTS.md: projektspezifische anweisungen, exakt wie der pi-agent   */
+/* sie laedt und einbettet.                                           */
+/*                                                                    */
+/* pro verzeichnis gewinnen die kandidaten in dieser reihenfolge – die */
+/* erste existierende datei zaehlt, die anderen werden ignoriert:    */
+/*   AGENTS.override.md, AGENTS.md, AGENTS.MD, CLAUDE.md, CLAUDE.MD   */
+/* (pi: loadContextFileFromDir). ein utf-8-BOM am anfang wird        */
+/* gestrippt. geladen werden hoechstens zwei verzeichnisse: das      */
+/* config-verzeichnis im home (~/.config/.maxagent, die "globalen"   */
+/* regeln) zuerst, dann das projekt-verzeichnis (das cwd beim        */
+/* start). pi laedt zusaetzlich alle eltern-verzeichnisse – hier ist  */
+/* bewusst nur der projekt-root, wie gewuenscht.                     */
+/*                                                                    */
+/* die einbettung ins <project_context>-format ist byte-identisch mit */
+/* dem pi-agenten: das modell sieht in beiden agents dieselbe struktur. */
+/* ------------------------------------------------------------------ */
+static const char *const AGENTS_CANDIDATES[] = {
+    "AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD",
+};
+
+/* growable string: die vorlage ist fix, aber die AGENTS.md-inhalte
+ * sind beliebig gross. die() bei OOM, wie ueberall in der app. */
+static void sbuf_append(char **buf, size_t *len, size_t *cap, const char *s,
+                        size_t n)
+{
+    if (*cap < *len + n + 1) {
+        size_t cap2 = (*cap > 0) ? *cap : 512;
+        while (cap2 < *len + n + 1) {
+            cap2 *= 2;
+        }
+        char *grown = realloc(*buf, cap2);
+        if (grown == NULL) {
+            die("out of memory");
+        }
+        *buf = grown;
+        *cap = cap2;
+    }
+    memcpy(*buf + *len, s, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+}
+
+static void sbuf_puts(char **buf, size_t *len, size_t *cap, const char *s)
+{
+    sbuf_append(buf, len, cap, s, strlen(s));
+}
+
+/* die erste vorhandene AGENTS-kandidaten-datei in `dir` lesen.
+ * path_out (fuer das path-attribut im prompt) bekommt den vollen
+ * pfad der GEFUNDENEN datei. rueckgabe: heap-inhalt (NUL-termi-
+ * niert, BOM gestrippt) oder NULL, wenn das verzeichnis keinen
+ * der kandidaten enthaelt. */
+static char *agents_from_dir(const char *dir, char *path_out, size_t path_sz)
+{
+    for (size_t i = 0;
+         i < sizeof AGENTS_CANDIDATES / sizeof AGENTS_CANDIDATES[0]; i++) {
+        if ((size_t)snprintf(path_out, path_sz, "%s/%s", dir,
+                             AGENTS_CANDIDATES[i]) >= path_sz) {
+            continue; /* pfad zu lang: kandidat ueberspringen */
+        }
+        if (!is_file(path_out)) {
+            continue;
+        }
+        char *buf = NULL;
+        size_t size = 0;
+        if (read_file(path_out, &buf, &size) != 0) {
+            continue; /* nicht lesbar: naechster kandidat */
+        }
+        /* utf-8-BOM (EF BB BF) strippen, wie pi (stripBom) */
+        char *content = buf;
+        size_t len = size;
+        if (len >= 3 && (unsigned char)content[0] == 0xEF &&
+            (unsigned char)content[1] == 0xBB &&
+            (unsigned char)content[2] == 0xBF) {
+            memmove(content, content + 3, len - 3);
+            len -= 3;
+            content[len] = '\0';
+        }
+        return content;
+    }
+    return NULL;
+}
+
+/* einen <project_instructions>-block im pi-format anhaengen:
+ * <project_instructions path="P">\n INHALT \n</project_instructions>\n\n */
+static void sbuf_project_block(char **buf, size_t *len, size_t *cap,
+                               const char *path, const char *content)
+{
+    sbuf_puts(buf, len, cap, "<project_instructions path=\"");
+    sbuf_puts(buf, len, cap, path);
+    sbuf_puts(buf, len, cap, "\">\n");
+    sbuf_puts(buf, len, cap, content);
+    sbuf_puts(buf, len, cap, "\n</project_instructions>\n\n");
+}
+
 char *prompt_build(void)
 {
     char cwd[4096];
@@ -80,10 +176,52 @@ char *prompt_build(void)
         snprintf(date, sizeof date, "unknown");
     }
 
-    char buf[4096];
-    int n = snprintf(buf, sizeof buf, PROMPT_TEMPLATE, date, cwd);
-    if (n < 0 || (size_t)n >= sizeof buf) {
+    char base[4096];
+    int n = snprintf(base, sizeof base, PROMPT_TEMPLATE, date, cwd);
+    if (n < 0 || (size_t)n >= sizeof base) {
         return NULL;
     }
-    return dup_str(buf);
+
+    /* AGENTS.md einsammeln: global (config-dir) zuerst, dann projekt-
+     * root. dedup: startet der agent direkt im config-dir, ist das
+     * dieselbe datei – dann nur einmal (pi: seenPaths) */
+    char gpath[4096];
+    char ppath[4096];
+    char *global_content = NULL;
+    char *project_content = NULL;
+    char *gdir = append_to_home(".config/.maxagent");
+    if (gdir != NULL) {
+        global_content = agents_from_dir(gdir, gpath, sizeof gpath);
+        free(gdir);
+    }
+    project_content = agents_from_dir(cwd, ppath, sizeof ppath);
+    if (global_content != NULL && project_content != NULL &&
+        strcmp(gpath, ppath) == 0) {
+        free(project_content);
+        project_content = NULL;
+    }
+
+    char *out = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    sbuf_puts(&out, &len, &cap, base);
+
+    if (global_content != NULL || project_content != NULL) {
+        /* byte-identisch mit dem pi-agenten (buildSystemPrompt):
+         * die struktur ist bei beiden agents dieselbe */
+        sbuf_puts(&out, &len, &cap,
+                  "\n\n<project_context>\n\n"
+                  "Project-specific instructions and guidelines:\n\n");
+        if (global_content != NULL) {
+            sbuf_project_block(&out, &len, &cap, gpath, global_content);
+        }
+        if (project_content != NULL) {
+            sbuf_project_block(&out, &len, &cap, ppath, project_content);
+        }
+        sbuf_puts(&out, &len, &cap, "</project_context>\n");
+    }
+
+    free(global_content);
+    free(project_content);
+    return out;
 }
