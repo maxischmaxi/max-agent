@@ -12,11 +12,17 @@
 #include "utils.h"
 
 /* ------------------------------------------------------------------ */
-/* die default-vorlage, orientiert am system-prompt des pi-agenten:   */
-/* identitaet, aktuelles datum, arbeitsumgebung und ein paar arbeits- */
-/* regeln. datum und verzeichnis werden pro request neu eingesetzt – */
-/* eine session, die ueber mitternacht laeuft, loggt automatisch das  */
-/* neue datum.                                                       */
+/* die fest eingebaute vorlage, orientiert am system-prompt des       */
+/* pi-agenten: identitaet, aktuelles datum, arbeitsumgebung und ein   */
+/* paar arbeitsregeln. datum und verzeichnis werden pro request neu   */
+/* eingesetzt – eine session, die ueber mitternacht laeuft, loggt     */
+/* automatisch das neue datum.                                       */
+/*                                                                    */
+/* die "working style"-regeln sind erfahrungswerte aus echten        */
+/* sessions: das modell hat sich sonst in identischen debug-loops     */
+/* verheddert (dasselbe gdb-kommando 71x) und ganze dateien          */
+/* wiederholt gelesen – jede dieser runden kostet den vollen        */
+/* kontext nochmal. die regeln halten es davon ab.                   */
 /* ------------------------------------------------------------------ */
 static const char PROMPT_TEMPLATE[] =
     "You are max agent, a coding agent that lives in the user's\n"
@@ -45,17 +51,23 @@ static const char PROMPT_TEMPLATE[] =
     "- Use edit_file for targeted changes: each edits[].oldText must\n"
     "  match exactly and be unique in the file, and stay as small as\n"
     "  possible. Use write_file only for new files or when a file\n"
-    "  needs a complete rewrite.\n";
+    "  needs a complete rewrite.\n"
+    "\n"
+    "Working style:\n"
+    "- Think before you act: plan the steps of a larger task, then\n"
+    "  execute them. Prefer one decisive action over many probing\n"
+    "  ones.\n"
+    "- Never run the exact same command twice; the output will not\n"
+    "  change. If an approach has failed twice, stop repeating it\n"
+    "  and change your strategy instead.\n"
+    "- Read large files with offset and limit instead of pulling the\n"
+    "  whole file, and do not re-read a file you have already seen\n"
+    "  in this conversation.\n"
+    "- When debugging, form ONE hypothesis, test it with ONE\n"
+    "  command, and think about the result before running the next.\n";
 
-char *prompt_build(const Config *cfg)
+char *prompt_build(void)
 {
-    if (cfg != NULL && cfg->system_prompt != NULL) {
-        if (cfg->system_prompt[0] == '\0') {
-            return NULL; /* explizit aus */
-        }
-        return dup_str(cfg->system_prompt);
-    }
-
     char cwd[4096];
     if (getcwd(cwd, sizeof cwd) == NULL) {
         snprintf(cwd, sizeof cwd, "unknown");
@@ -68,7 +80,7 @@ char *prompt_build(const Config *cfg)
         snprintf(date, sizeof date, "unknown");
     }
 
-    char buf[2048];
+    char buf[4096];
     int n = snprintf(buf, sizeof buf, PROMPT_TEMPLATE, date, cwd);
     if (n < 0 || (size_t)n >= sizeof buf) {
         return NULL;

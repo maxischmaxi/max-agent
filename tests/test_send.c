@@ -894,6 +894,118 @@ static void test_context_compaction_fallback(void)
     free_mock_cfg(&cfg);
 }
 
+/* ------------------------------------------------------------------ */
+
+/* /compact: die manuelle compaction verdichtet den verlauf bis auf
+ * das keep-fenster, ohne auch nur eine nachricht wegzulassen. der
+ * mock-server antwortet auf die compaction mit einer festen summary
+ * (verbinding 1); die zweite verbindung (probe) kommt nie – der
+ * server wird danach gekillt. */
+static void test_compact_now(void)
+{
+    int port = 0;
+    pid_t server = start_compact_probe_server(&port, "URALTE-NACHRICHT",
+                                              "## Goal: manuelle-compaction");
+    CHECK(server >= 0);
+    if (server < 0) {
+        return;
+    }
+
+    Config cfg;
+    build_mock_cfg(&cfg, port);
+
+    AppState st = {0};
+    input_init(&st.input);
+
+    /* leerer verlauf: notice, kein request an den server */
+    CHECK(send_compact_now(&st, &cfg, &HOOKS) == 0);
+    bool empty_notice = false;
+    for (size_t i = 0; i < st.chat.len; i++) {
+        if (st.chat.msgs[i].role == CHAT_ROLE_NOTICE &&
+            strstr(st.chat.msgs[i].text, "nichts zu komprimieren") != NULL) {
+            empty_notice = true;
+        }
+    }
+    CHECK(empty_notice);
+
+    /* ~104 kb verlauf: > keep-fenster (20k tokens ~ 80 kb), also
+     * gibt es etwas zu verdichten */
+    char *old = malloc(8193);
+    if (old == NULL) {
+        die("out of memory");
+    }
+    memset(old, 'x', 8192);
+    old[8192] = '\0';
+    memcpy(old, "URALTE-NACHRICHT ", strlen("URALTE-NACHRICHT "));
+    size_t first_msg = st.chat.len; /* notices stehen schon davor */
+    for (int i = 0; i < 13; i++) {
+        CHECK(chat_append(&st.chat, CHAT_ROLE_USER, old) == 0);
+    }
+    free(old);
+    CHECK(chat_append(&st.chat, CHAT_ROLE_USER, "neue frage") == 0);
+    size_t len_before = st.chat.len;
+    CHECK(len_before == first_msg + 14);
+
+    g_redraws = 0;
+    CHECK(send_compact_now(&st, &cfg, &HOOKS) == 0);
+
+    /* summary uebernommen, watermark mitten im verlauf – und keine
+     * nachricht ist verschwunden (manuell wird nichts weggeworfen,
+     * anders als beim fenster-ueberlauf; die notices der app haengen
+     * natuerlich selbst hinten dran) */
+    CHECK(st.ctx.summary != NULL);
+    CHECK(strcmp(st.ctx.summary, "## Goal: manuelle-compaction") == 0);
+    CHECK(st.ctx.covered > 0 && st.ctx.covered < len_before);
+    CHECK(st.chat.len >= len_before);
+    CHECK(strncmp(st.chat.msgs[first_msg].text, "URALTE-NACHRICHT", 16) == 0);
+    CHECK(strcmp(st.chat.msgs[len_before - 1].text, "neue frage") == 0);
+    CHECK(st.ctx.compact_failed == false);
+    bool done_notice = false;
+    for (size_t i = 0; i < st.chat.len; i++) {
+        if (st.chat.msgs[i].role == CHAT_ROLE_NOTICE &&
+            strstr(st.chat.msgs[i].text, "verlauf komprimiert") != NULL &&
+            strstr(st.chat.msgs[i].text, "wird") == NULL) {
+            done_notice = true;
+        }
+    }
+    CHECK(done_notice);
+
+    /* der compaction-request enthaelt den alten block (der server
+     * haette sonst nichts zu verdichten); die summary landet als
+     * USER-nachricht im request, wenn der naechste turn laeuft */
+    char *wrapped = ctx_summary_wrap(st.ctx.summary);
+    CHECK(wrapped != NULL);
+    OaiMessage *msgs = NULL;
+    int n = send_build_messages_from(&st.chat, st.ctx.covered, "sys", wrapped,
+                                     &msgs);
+    CHECK(n > 2);
+    CHECK(msgs != NULL && msgs[1].role == OAI_ROLE_USER);
+    CHECK(strstr(msgs[1].content, "<summary>") != NULL);
+    free(msgs);
+    free(wrapped);
+
+    /* zweiter aufruf: dieser teil ist bereits komprimiert – keine
+     * neue summary, derselbe zustand */
+    CHECK(send_compact_now(&st, &cfg, &HOOKS) == 0);
+    CHECK(st.ctx.summary != NULL &&
+          strcmp(st.ctx.summary, "## Goal: manuelle-compaction") == 0);
+    bool again_notice = false;
+    for (size_t i = 0; i < st.chat.len; i++) {
+        if (st.chat.msgs[i].role == CHAT_ROLE_NOTICE &&
+            strstr(st.chat.msgs[i].text, "bereits") != NULL) {
+            again_notice = true;
+        }
+    }
+    CHECK(again_notice);
+
+    chat_free(&st.chat);
+    ctx_reset(&st.ctx);
+    input_free(&st.input);
+    free_mock_cfg(&cfg);
+    kill(server, SIGKILL);
+    waitpid(server, NULL, 0);
+}
+
 /* gegenprobe: grosses fenster -> nichts wird weggelassen */
 static void test_context_fits(void)
 {
@@ -1593,6 +1705,7 @@ int main(void)
     test_agent();
     test_agent_broken_call();
     test_context_compaction();
+    test_compact_now();
     test_context_compaction_fallback();
     test_context_fits();
     test_stream_abort();

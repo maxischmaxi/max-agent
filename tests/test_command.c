@@ -16,9 +16,13 @@ static void test_cmd_lookup(void)
     /* ohne slash auch erlaubt */
     CHECK(cmd_lookup("quit") == CMD_QUIT);
 
-    /* /system-prompt oeffnet den $EDITOR */
-    CHECK(cmd_lookup("/system-prompt") == CMD_SYSTEM_PROMPT);
-    CHECK(cmd_lookup("system-prompt") == CMD_SYSTEM_PROMPT);
+    /* /system-prompt ist rausgeflogen: der prompt ist hardcoded */
+    CHECK(cmd_lookup("/system-prompt") == -1);
+    CHECK(cmd_lookup("/settings") == CMD_SETTINGS);
+
+    /* /compact verdichtet den verlauf manuell */
+    CHECK(cmd_lookup("/compact") == CMD_COMPACT);
+    CHECK(cmd_lookup("compact") == CMD_COMPACT);
 
     /* exakter match: unvollstaendige/bekannte faelle */
     CHECK(cmd_lookup("/qu") == -1);
@@ -68,8 +72,8 @@ static void test_names_and_descs(void)
         CHECK(COMMANDS[i].desc != NULL && COMMANDS[i].desc[0] != '\0');
     }
 
-    CHECK(cmd_name_col() ==
-          (int)strlen(COMMAND_SYSTEM_PROMPT)); /* laengster name */
+    /* laengster name: "sessions" */
+    CHECK(cmd_name_col() == (int)strlen(COMMAND_SESSIONS));
 }
 
 int main(void)

@@ -466,8 +466,62 @@ static void test_tool_display_escapes(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* reasoning: thinking wächst per delta in die letzte nachricht, wird  */
+/* beim wrap als eigene dim-zeilen (tool == -3) vor dem text emittiert */
+/* und bleibt dabei von text getrennt                                   */
+/* ------------------------------------------------------------------ */
+static void test_reasoning(void)
+{
+    Chat c = {0};
+    ChatLine lines[32] = {0};
+
+    /* --- append: nur auf assistant-platzhalter, \r wird gefiltert --- */
+    CHECK(!chat_append_reasoning(&c, "text")); /* leeres chat */
+    CHECK(chat_append(&c, CHAT_ROLE_ASSISTANT, "") == 0);
+    CHECK(chat_append_reasoning(&c, "denk"));
+    CHECK(chat_append_reasoning(&c, "")); /* no-op */
+    CHECK(chat_append_reasoning(&c, "\rzeile\r"));
+    CHECK(strcmp(c.msgs[0].reasoning, "denkzeile") == 0);
+    CHECK(strcmp(c.msgs[0].text, "") == 0); /* text bleibt getrennt */
+    CHECK(chat_append(&c, CHAT_ROLE_USER, "frage") == 0);
+    CHECK(!chat_append_reasoning(&c, "x")); /* user ist kein assistant */
+    chat_clear(&c);
+
+    /* --- set: ersetzt, ownership wechselt zum chat --- */
+    CHECK(chat_append(&c, CHAT_ROLE_ASSISTANT, "antwort") == 0);
+    char *own = dup_str("alles neue ueberlegt");
+    CHECK(chat_set_reasoning(&c, own) == 0);
+    CHECK(c.msgs[0].reasoning == own); /* kein copy: pointer uebernommen */
+    char *empty = dup_str("");
+    CHECK(chat_set_reasoning(&c, empty) == 0); /* leer = entfernen */
+    CHECK(c.msgs[0].reasoning == NULL);
+
+    /* --- wrap: thinking-zeilen vor dem text, dim markiert (tool -3) --- */
+    chat_set_reasoning(&c, dup_str("erste gedanke\nzweite gedanke"));
+    CHECK(chat_wrap(&c, 20, lines, 32) == 3);
+    CHECK(lines[0].tool == -3); /* thinking: erste zeile */
+    CHECK(lines[0].first);
+    CHECK(lines[1].tool == -3); /* thinking: zweite zeile (lstart) */
+    CHECK(lines[2].tool == -1); /* die antwort selbst: text-zeile */
+    CHECK(!lines[2].first);     /* thinking hat first verbraucht */
+    /* off/len der antwort-zeile zeigen auf "antwort" im kopie-puffer */
+    const char *disp = chat_disp_text();
+    CHECK(strncmp(disp + lines[2].off, "antwort", lines[2].len) == 0);
+    chat_clear(&c);
+    chat_free_disp();
+
+    /* --- ohne reasoning: exakt das alte verhalten --- */
+    CHECK(chat_append(&c, CHAT_ROLE_ASSISTANT, "aaa bbb") == 0);
+    CHECK(chat_wrap(&c, 20, lines, 32) == 1);
+    CHECK(lines[0].tool == -1);
+    CHECK(lines[0].first);
+    chat_free(&c);
+}
+
 int main(void)
 {
+    test_reasoning();
     test_append_pop_clear();
     test_flatten();
     test_wrap();

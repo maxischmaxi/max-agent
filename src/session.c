@@ -134,8 +134,6 @@ static void session_reset_fields(Session *s)
     s->model = NULL;
     free(s->base_url);
     s->base_url = NULL;
-    free(s->system_prompt);
-    s->system_prompt = NULL;
     free(s->cwd);
     s->cwd = NULL;
     s->id[0] = '\0';
@@ -206,11 +204,6 @@ static int meta_write(const Session *s)
         cJSON_AddStringToObject(o, "base_url", s->base_url);
     } else {
         cJSON_AddNullToObject(o, "base_url");
-    }
-    if (s->system_prompt != NULL) {
-        cJSON_AddStringToObject(o, "system_prompt", s->system_prompt);
-    } else {
-        cJSON_AddNullToObject(o, "system_prompt");
     }
     if (s->cwd != NULL) {
         cJSON_AddStringToObject(o, "cwd", s->cwd);
@@ -399,9 +392,6 @@ int session_start(Session *s, const Config *cfg)
             s->model = dup_str(cfg->active_model);
         }
         s->base_url = provider_url_for(cfg, cfg->active_model);
-        if (cfg->system_prompt != NULL) {
-            s->system_prompt = dup_str(cfg->system_prompt);
-        }
     }
     s->cwd = cwd_current();
 
@@ -458,11 +448,6 @@ static int meta_read(Session *s, cJSON *meta)
     const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(meta, "base_url");
     if (cJSON_IsString(jurl)) {
         s->base_url = dup_str(jurl->valuestring);
-    }
-    const cJSON *jprompt =
-        cJSON_GetObjectItemCaseSensitive(meta, "system_prompt");
-    if (cJSON_IsString(jprompt)) {
-        s->system_prompt = dup_str(jprompt->valuestring);
     }
     const cJSON *jcwd = cJSON_GetObjectItemCaseSensitive(meta, "cwd");
     if (cJSON_IsString(jcwd)) {
@@ -584,23 +569,6 @@ int session_rename(Session *s, const char *name)
     return meta_write(s);
 }
 
-int session_prompt_changed(Session *s, const char *prompt)
-{
-    if (!s->active) {
-        return 0; /* keine session offen: nichts zu spiegeln */
-    }
-    char *copy = NULL;
-    if (prompt != NULL) {
-        copy = dup_str(prompt);
-        if (copy == NULL) {
-            return -1;
-        }
-    }
-    free(s->system_prompt);
-    s->system_prompt = copy;
-    return meta_write(s);
-}
-
 /* ------------------------------------------------------------------ */
 /* ereignis-log                                                        */
 /* ------------------------------------------------------------------ */
@@ -671,7 +639,7 @@ void session_worked_set(Session *s, long long worked_ms)
     (void)meta_write(s);
 }
 
-int session_log_assistant(Session *s, const char *text,
+int session_log_assistant(Session *s, const char *text, const char *reasoning,
                           const ChatToolCall *calls, size_t calls_len,
                           long long ttft_ms, long long total_ms,
                           long long work_ms, int round, const char *model,
@@ -687,6 +655,9 @@ int session_log_assistant(Session *s, const char *text,
     }
     cJSON_AddStringToObject(o, "role", "assistant");
     cJSON_AddStringToObject(o, "text", (text != NULL) ? text : "");
+    if (reasoning != NULL && reasoning[0] != '\0') {
+        cJSON_AddStringToObject(o, "reasoning", reasoning);
+    }
     if (ttft_ms >= 0) {
         cJSON_AddNumberToObject(o, "ttft_ms", (double)ttft_ms);
     }
@@ -877,6 +848,16 @@ static int replay_line(const cJSON *o, Chat *chat, CtxUsage *ctx)
             if (chat_append(chat, CHAT_ROLE_ASSISTANT, text) != 0) {
                 return -1;
             }
+            /* thinking wiederherstellen: ein stueck, keine deltas */
+            const cJSON *jthink =
+                cJSON_GetObjectItemCaseSensitive(o, "reasoning");
+            if (cJSON_IsString(jthink) && jthink->valuestring[0] != '\0') {
+                char *copy = dup_str(jthink->valuestring);
+                if (copy == NULL || chat_set_reasoning(chat, copy) != 0) {
+                    free(copy);
+                    return -1;
+                }
+            }
             size_t calls_len = 0;
             ChatToolCall *calls = calls_from_json(o, &calls_len);
             if (calls != NULL &&
@@ -889,13 +870,15 @@ static int replay_line(const cJSON *o, Chat *chat, CtxUsage *ctx)
                 free(calls);
                 return -1;
             }
-            /* ctx-gesamtzaehler rekonstruieren: nur echte zaehlungen */
+            /* ctx-zaehler rekonstruieren: der KONTEXT des letzten
+             * requests (keine summe mehr, siehe context.h); einen
+             * cache-anteil meldete das alte format nicht – 0. */
             const cJSON *jp =
                 cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens");
             const cJSON *jc =
                 cJSON_GetObjectItemCaseSensitive(o, "completion_tokens");
             if (ctx != NULL && cJSON_IsNumber(jp) && cJSON_IsNumber(jc)) {
-                ctx_account(ctx, (int)jp->valuedouble, (int)jc->valuedouble);
+                ctx_account(ctx, (int)jp->valuedouble, 0, (int)jc->valuedouble);
             }
             return 0;
         }

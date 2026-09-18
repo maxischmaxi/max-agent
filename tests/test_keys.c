@@ -412,135 +412,43 @@ static void test_history_keys(void)
     stdin_pipe_close(&sp);
 }
 
-/* settings -> system prompt: das untermenue setzt die drei
- * config-zustaende, "edit" uebergibt an das eingabefeld.
- * gefahren ueber handle_key(), also die echte kette.
- *
- * WICHTIG: die handler rufen config_persist(), das ueber $HOME in
- * die echte config schreiben wuerde. der test biegt HOME auf ein
- * wegwerf-verzeichnis um. */
-static void test_prompt_setting(void)
+/* der system-prompt ist kein setting mehr: er ist fest in der
+ * codebase (prompt.c) und weder per dialog noch per /system-prompt
+ * editierbar. gefahren ueber handle_key(), also die echte kette. */
+static void test_prompt_setting_gone(void)
 {
-    char tmpl[] = "/tmp/max-agent-keys-XXXXXX";
-    char *home = mkdtemp(tmpl);
-    CHECK(home != NULL);
-    if (home == NULL) {
-        return;
-    }
     StdinPipe sp;
     if (!stdin_pipe_open(&sp)) {
         return;
     }
 
-    char *old_home = getenv("HOME");
-    char saved[512] = {0};
-    if (old_home != NULL) {
-        snprintf(saved, sizeof saved, "%s", old_home);
-    }
-    CHECK(setenv("HOME", home, 1) == 0);
-
     AppState st = {0};
     input_init(&st.input);
     Config cfg = {0};
 
-    /* --- settings oeffnen und "system prompt" waehlen --- */
+    /* --- settings-dialog: "system prompt" existiert nicht mehr --- */
     st.settings_dialog = true;
     st.dialog = (DialogState){0};
     snprintf(st.dialog.search, sizeof st.dialog.search, "system");
     CHECK(ui_mode(&st) == MODE_SETTINGS);
     keys_unread("\r", 1);
     handle_key(&st, &cfg, &g_rows, &g_cols_80);
-    CHECK(st.prompt_sub);
-    CHECK(ui_mode(&st) == MODE_PROMPT);
+    /* kein treffer: enter tut nichts, der dialog bleibt offen und
+     * es gibt kein untermenue, in das man gelangen koennte */
+    CHECK(st.settings_dialog);
+    CHECK(ui_mode(&st) == MODE_SETTINGS);
+    CHECK(st.dialog.selected == 0);
 
-    /* --- "off" setzt den leeren string --- */
-    snprintf(st.dialog.search, sizeof st.dialog.search, "off");
-    keys_unread("\r", 1);
-    handle_key(&st, &cfg, &g_rows, &g_cols_80);
-    CHECK(cfg.system_prompt != NULL && cfg.system_prompt[0] == '\0');
-    CHECK(st.prompt_sub); /* dialog bleibt offen */
-
-    /* --- "default" setzt zurueck auf NULL --- */
-    snprintf(st.dialog.search, sizeof st.dialog.search, "default");
-    keys_unread("\r", 1);
-    handle_key(&st, &cfg, &g_rows, &g_cols_80);
-    CHECK(cfg.system_prompt == NULL);
-
-    /* --- "edit" schliesst den dialog und oeffnet das feld --- */
-    snprintf(st.dialog.search, sizeof st.dialog.search, "edit");
-    keys_unread("\r", 1);
-    handle_key(&st, &cfg, &g_rows, &g_cols_80);
-    CHECK(st.prompt_edit);
-    CHECK(!st.settings_dialog);
-    CHECK(!st.prompt_sub);
-    CHECK(ui_mode(&st) == MODE_INPUT);
-    CHECK(st.input.lines[0][0] == '\0'); /* default -> leer starten */
-
-    /* tippen und speichern */
-    keys_unread("du bist knapp\r", 14);
-    handle_key(&st, &cfg, &g_rows, &g_cols_80); /* 'd' */
-    for (int i = 0; i < 13; i++) {
-        handle_key(&st, &cfg, &g_rows, &g_cols_80);
-    }
-    CHECK(!st.prompt_edit); /* enter hat gespeichert */
-    CHECK(cfg.system_prompt != NULL &&
-          strcmp(cfg.system_prompt, "du bist knapp") == 0);
-    CHECK(st.input.lines[0][0] == '\0'); /* feld wieder frei */
-    /* der prompt-text darf NICHT in der nachrichten-history landen */
-    CHECK(st.history.len == 0);
-    CHECK(st.chat.len == 0); /* und auch nicht im verlauf */
-
-    /* --- erneutes "edit" legt den bestehenden text vor --- */
-    st.settings_dialog = true;
-    st.prompt_sub = true;
-    st.dialog = (DialogState){0};
-    snprintf(st.dialog.search, sizeof st.dialog.search, "edit");
-    keys_unread("\r", 1);
-    handle_key(&st, &cfg, &g_rows, &g_cols_80);
-    CHECK(st.prompt_edit);
-    CHECK(strcmp(st.input.lines[0], "du bist knapp") == 0);
-
-    /* --- escape verwirft die bearbeitung --- */
-    keys_unread("x", 1);
-    handle_key(&st, &cfg, &g_rows, &g_cols_80);
+    /* escape schliesst */
     keys_unread("\x1b", 1);
     handle_key(&st, &cfg, &g_rows, &g_cols_80);
-    CHECK(!st.prompt_edit);
-    CHECK(cfg.system_prompt != NULL &&
-          strcmp(cfg.system_prompt, "du bist knapp") == 0); /* unveraendert */
+    CHECK(!st.settings_dialog);
+    CHECK(ui_mode(&st) == MODE_INPUT);
 
-    /* --- leeres feld speichern = zurueck zur vorlage --- */
-    st.prompt_edit = true;
-    input_set_text(&st.input, "");
-    keys_unread("\r", 1);
-    handle_key(&st, &cfg, &g_rows, &g_cols_80);
-    CHECK(cfg.system_prompt == NULL);
-    CHECK(!st.prompt_edit);
-
-    free_config(&cfg);
     input_free(&st.input);
     chat_free(&st.chat);
     history_free(&st.history);
-
-    if (saved[0] != '\0') {
-        CHECK(setenv("HOME", saved, 1) == 0);
-    } else {
-        CHECK(unsetenv("HOME") == 0);
-    }
-
     stdin_pipe_close(&sp);
-
-    /* das wegwerf-home wieder abraeumen, sonst sammelt sich bei
-     * jedem testlauf ein verzeichnis in /tmp an. das layout ist
-     * bekannt, also ohne shell-aufruf. */
-    char path[600];
-    (void)snprintf(path, sizeof path, "%s/.config/.maxagent/config.json", home);
-    (void)unlink(path);
-    (void)snprintf(path, sizeof path, "%s/.config/.maxagent", home);
-    (void)rmdir(path);
-    (void)snprintf(path, sizeof path, "%s/.config", home);
-    (void)rmdir(path);
-    CHECK(rmdir(home) == 0);
 }
 
 /* pfeil-hoch in einer UMGEBROCHENEN zeile muss sichtbar eine zeile
@@ -685,7 +593,7 @@ int main(void)
     test_keys_unread_fifo();
     test_abort_poll();
     test_history_keys();
-    test_prompt_setting();
+    test_prompt_setting_gone();
     test_wrapped_arrows();
     test_key_read_batch();
     test_utf8_input();

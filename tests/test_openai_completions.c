@@ -154,6 +154,67 @@ static void handle_conn(int fd)
                       "{\"error\":{\"message\":\"invalid api key\"}}");
             continue;
         }
+        if (strstr(body, "\"model\":\"reasoning\"") != NULL) {
+            /* nicht-streaming: thinking in reasoning_content, cache-
+             * anteil unter prompt_tokens_details (openai-form) */
+            send_json(fd, "200 OK",
+                      "{\"id\":\"c4\",\"model\":\"reasoning\",\"choices\":[{"
+                      "\"index\":0,\"message\":{\"role\":\"assistant\","
+                      "\"content\":\"antwort\",\"reasoning_content\":"
+                      "\"ich denke\"},\"finish_reason\":\"stop\"}],"
+                      "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":"
+                      "2,\"total_tokens\":7,\"prompt_tokens_details\":"
+                      "{\"cached_tokens\":4}}}");
+            continue;
+        }
+        if (strstr(body, "\"model\":\"reasonround\"") != NULL) {
+            /* roundtrip: assistant-thinking muss als reasoning_content
+             * zurueckgespielt werden (agent-loop) */
+            static const char *const need[] = {
+                "\"role\":\"assistant\"",
+                "\"reasoning_content\":\"ich denke\"",
+                "\"content\":\"antwort\"",
+            };
+            int miss = first_missing(body, need, 3);
+            if (miss >= 0) {
+                send_missing(fd, miss);
+                continue;
+            }
+            send_json(fd, "200 OK", default_json());
+            continue;
+        }
+        if (strstr(body, "\"model\":\"reasonstream\"") != NULL) {
+            /* stream: thinking-deltas vor dem content, cache-anteil
+             * top-level als cached_tokens (ollama-artig). request
+             * muss reasoning_effort enthalten */
+            static const char *const need[] = {
+                "\"reasoning_effort\":\"high\"",
+            };
+            int miss = first_missing(body, need, 1);
+            if (miss >= 0) {
+                send_missing(fd, miss);
+                continue;
+            }
+            const char *resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Connection: close\r\n\r\n"
+                "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":[{"
+                "\"index\":0,\"delta\":{\"role\":\"assistant\","
+                "\"reasoning_content\":\"denk\"}}]}\n\n"
+                "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":[{"
+                "\"index\":0,\"delta\":{\"reasoning_content\":\"e\","
+                "\"content\":\"ant\"}}]}\n\n"
+                "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":[{"
+                "\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}"
+                "\n\n"
+                "data: {\"id\":\"c1\",\"model\":\"t\",\"choices\":[],"
+                "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,"
+                "\"total_tokens\":13,\"cached_tokens\":6}}\n\n"
+                "data: [DONE]\n\n";
+            write(fd, resp, strlen(resp));
+            return;
+        }
         if (strstr(body, "\"model\":\"malformed\"") != NULL) {
             send_json(fd, "200 OK", "{kein json!");
             continue;
@@ -409,10 +470,12 @@ static pid_t start_server(int *port)
 
 typedef struct {
     char text[512];
+    char reasoning[512]; /* reasoning_content-deltas, konkateniert */
     int chunks;
     int finish_seen;
     int usage_seen;
     int usage_total;
+    int usage_cached;
 } StreamAcc;
 
 typedef struct {
@@ -441,6 +504,11 @@ static int on_chunk(const OaiChatCompletionChunk *chunk, void *user_data)
             snprintf(acc->text + len, sizeof acc->text - len, "%s",
                      c->content_delta);
         }
+        if (c->reasoning_delta != NULL) {
+            size_t len = strlen(acc->reasoning);
+            snprintf(acc->reasoning + len, sizeof acc->reasoning - len, "%s",
+                     c->reasoning_delta);
+        }
         if (c->finish_reason != NULL) {
             acc->finish_seen = 1;
         }
@@ -448,6 +516,7 @@ static int on_chunk(const OaiChatCompletionChunk *chunk, void *user_data)
     if (chunk->has_usage) {
         acc->usage_seen = 1;
         acc->usage_total = chunk->usage.total_tokens;
+        acc->usage_cached = chunk->usage.cached_tokens;
     }
     return 0;
 }
@@ -855,6 +924,71 @@ int main(void)
         CHECK(strcmp(result.completion.choices[0].message.content,
                      "teileins") == 0);
         oai_completion_result_free(&result);
+    }
+
+    /* 14) reasoning-modell, nicht-streaming: thinking in
+     * reasoning_content, cache-anteil unter prompt_tokens_details */
+    {
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "reasoning",
+            .messages = messages,
+            .messages_len = 1,
+        };
+        OaiCompletionResult result;
+        CHECK(oai_chat_completions_create(&client, &params, &result) == 0);
+        CHECK(result.ok);
+        OaiResponseMessage *msg = &result.completion.choices[0].message;
+        CHECK(strcmp(msg->content, "antwort") == 0);
+        CHECK(msg->reasoning != NULL &&
+              strcmp(msg->reasoning, "ich denke") == 0);
+        CHECK(result.completion.usage.cached_tokens == 4);
+
+        /* roundtrip: dieselbe nachricht mit thinking zurueckspielen
+         * – reasoning_content MUSS mit raus (agent-loop) */
+        OaiMessage back[] = {
+            {.role = OAI_ROLE_USER, .content = "hi"},
+            {.role = OAI_ROLE_ASSISTANT,
+             .content = "antwort",
+             .reasoning = msg->reasoning},
+        };
+        OaiChatCompletionParams params2 = {
+            .model = "reasonround",
+            .messages = back,
+            .messages_len = 2,
+        };
+        OaiCompletionResult r2;
+        CHECK(oai_chat_completions_create(&client, &params2, &r2) == 0);
+        CHECK(r2.ok);
+        oai_completion_result_free(&r2);
+        oai_completion_result_free(&result);
+    }
+
+    /* 15) reasoning-stream: thinking-deltas + reasoning_effort im
+     * request + cache-anteil top-level (ollama-form) */
+    {
+        OaiMessage messages[] = {{.role = OAI_ROLE_USER, .content = "hi"}};
+        OaiChatCompletionParams params = {
+            .model = "reasonstream",
+            .messages = messages,
+            .messages_len = 1,
+            .include_usage = true,
+            .has_reasoning_effort = true,
+            .reasoning_effort = "high",
+        };
+        StreamState state = {0};
+        OaiStreamCallbacks cbs = {
+            .on_chunk = on_chunk, .on_error = on_error, .user_data = &state};
+        CHECK(oai_chat_completions_create_stream(&client, &params, &cbs) == 0);
+        if (state.error_seen) {
+            fprintf(stderr, "  reasonstream-fehler: %s\n", state.error_msg);
+        }
+        CHECK(!state.error_seen);
+        CHECK(strcmp(state.acc.text, "ant") == 0);
+        CHECK(strcmp(state.acc.reasoning, "denke") == 0);
+        CHECK(state.acc.usage_seen);
+        CHECK(state.acc.usage_cached == 6);
+        CHECK(state.acc.finish_seen);
     }
 
     /* 14) stream-idle-timeout: stalleder stream wird nach 1s abgebrochen */

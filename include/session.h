@@ -53,7 +53,6 @@ typedef struct {
     size_t messages;      /* ereignisse im transcript (list-anzeige) */
     char *model;          /* snapshot des modells bei session_start */
     char *base_url;       /* dito provider-url */
-    char *system_prompt;  /* NULL = default, "" = aus, text = eigener */
     char *cwd;            /* verzeichnis, in dem die session gestartet */
                           /* wurde. bestimmt, wo der resume-dialog    */
                           /* sie anzeigt. NULL = legacy ohne cwd.     */
@@ -89,8 +88,8 @@ int session_dir_ensure(void);
 int sessions_migrate_legacy(void);
 
 /* neue session: id generieren, meta schreiben, log oeffnen. die
- * snapshots (model, base_url, system_prompt) stammen aus cfg, das
- * cwd aus dem aktuellen arbeitsverzeichnis. */
+ * snapshots (model, base_url) stammen aus cfg, das cwd aus dem
+ * aktuellen arbeitsverzeichnis. */
 int session_start(Session *s, const Config *cfg);
 
 /* bestehende session anhaengend oeffnen (resume). meta wird gelesen,
@@ -108,12 +107,6 @@ void session_free(Session *s);
 /* name setzen (leerer name = fehler). schreibt das meta sofort. */
 int session_rename(Session *s, const char *name);
 
-/* prompt-snapshot der offenen session ersetzen: der benutzer kann
- * den system-prompt mitten in einer session aendern, und ein resume
- * soll den prompt wiederherstellen, den die session ZULETZT hatte –
- * nicht den von ihrem anfang. NULL = default, "" = aus, text. */
-int session_prompt_changed(Session *s, const char *prompt);
-
 /* ------------------------------------------------------------------ */
 /* ereignis-log. alle funktionen sind no-ops ohne aktive session und  */
 /* schlagen still fehl – das aufzeichnen darf den chat niemals       */
@@ -126,13 +119,15 @@ int session_log_user(Session *s, const char *text);
  * die ki fertig ist) und ins meta schreiben */
 void session_worked_set(Session *s, long long worked_ms);
 
-/* eine (ggf. noch teil-) antwort des modells. calls = die tool-
- * calls, die daran haengen (NULL/0 = keine). ttft/total in ms,
- * <0 = nicht gemessen. work_ms = die zeit des GESAMTEN turns seit
+/* antwort des modells mit allen messwerten der runde. text und
+ * reasoning (thinking, "reasoning_content"; NULL = keins) werden
+ * getrennt aufgezeichnet und beim replay getrennt wiederher-
+ * gestellt. ttft_ms = zeit bis zum ersten datenstrom, total_ms =
+ * die ganze runde, work_ms = die zeit des GESAMTEN turns ab der
  * der user-nachricht (thinking + alle runden + tools), <0 = un-
  * bekannt. round = agent-loop-runde, <0 = unbekannt.
  * token-zaehlung <0 = die api hat nichts geliefert. */
-int session_log_assistant(Session *s, const char *text,
+int session_log_assistant(Session *s, const char *text, const char *reasoning,
                           const ChatToolCall *calls, size_t calls_len,
                           long long ttft_ms, long long total_ms,
                           long long work_ms, int round, const char *model,

@@ -46,15 +46,15 @@ static void fill_session(Session *s)
     CHECK(s->messages == 0);
 
     CHECK(session_log_user(s, "hallo welt") == 0);
-    CHECK(session_log_assistant(s, "hi!", NULL, 0, 12, 34, 5000, 0,
-                                "test-model", 10, 5, false) == 0);
+    CHECK(session_log_assistant(s, "hi!", "ich denke nach", NULL, 0, 12, 34,
+                                5000, 0, "test-model", 10, 5, false) == 0);
 
     ChatToolCall call = {0};
     call.id = dup_str("call_1");
     call.name = dup_str("bash");
     call.arguments = dup_str("{\"command\":\"true\"}");
-    CHECK(session_log_assistant(s, "", &call, 1, 1, 2, 6000, 1, "test-model",
-                                -1, -1, false) == 0);
+    CHECK(session_log_assistant(s, "", NULL, &call, 1, 1, 2, 6000, 1,
+                                "test-model", -1, -1, false) == 0);
     CHECK(session_log_tool(s, "call_1", "bash", "exit 0", 3) == 0);
     CHECK(session_log_error(s, "http 418: ich bin eine teekanne", 418) == 0);
     CHECK(session_log_notice(s, "abgebrochen") == 0);
@@ -137,9 +137,14 @@ static void test_transcript_replay(void)
     CHECK(chat.msgs[4].role == CHAT_ROLE_ERROR);
     CHECK(chat.msgs[5].role == CHAT_ROLE_NOTICE);
 
-    /* ctx-gesamtzaehler aus den assistant-ereignissen */
-    CHECK(ctx.total_prompt == 10);
+    /* ctx-zaehler aus den assistant-ereignissen: der KONTEXT des
+     * letzten requests (keine summe), completion kumuliert */
+    CHECK(ctx.last_prompt == 10);
     CHECK(ctx.total_completion == 5);
+    /* reasoning wird getrennt vom text wiederhergestellt */
+    CHECK(chat.msgs[1].reasoning != NULL &&
+          strcmp(chat.msgs[1].reasoning, "ich denke nach") == 0);
+    CHECK(chat.msgs[2].reasoning == NULL);
 
     chat_free(&chat);
 
@@ -252,8 +257,8 @@ static void test_noop_without_session(void)
      * ausser bei NULL-json (das ist ein interner fehler, hier
      * uninteressant) */
     CHECK(session_log_user(&s, "text") == 0);
-    CHECK(session_log_assistant(&s, "text", NULL, 0, -1, -1, -1, -1, NULL, -1,
-                                -1, false) == 0);
+    CHECK(session_log_assistant(&s, "text", NULL, NULL, 0, -1, -1, -1, -1, NULL,
+                                -1, -1, false) == 0);
     CHECK(session_log_tool(&s, "call", "bash", "out", 1) == 0);
     CHECK(session_log_error(&s, "kaputt", 500) == 0);
     CHECK(session_log_notice(&s, "hinweis") == 0);

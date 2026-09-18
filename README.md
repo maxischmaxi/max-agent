@@ -102,16 +102,32 @@ max                     # if installed, or:
 | `/rename`   | name the current session                   |
 | `/new`      | start a fresh session (old one is kept)    |
 | `/clear`    | same as `/new`                              |
-| `/settings` | theme, system prompt, confirm-quit behavior |
-| `/system-prompt` | edit the system prompt in your `$EDITOR` — `:wq` applies it, `:q` keeps the old one |
+| `/compact`  | summarize older history into a compact summary (manual compaction) |
+| `/settings` | theme and confirm-quit behavior            |
 | `/quit`     | exit                                        |
+
+The system prompt is hardcoded in `src/prompt.c` — it is part of the codebase
+and intentionally not configurable.
 
 The agent has `bash`, `read_file`, `edit_file` and `write_file` tools and runs them
 asynchronously — independent calls execute in parallel (file edits stay sequential).
 `ctrl+c` cancels a running turn, kills the tools' process groups, and returns you to
-the prompt. When the model's context window overflows, older history is compacted
-into an LLM-generated summary instead of being silently dropped, so long-running
-tasks keep their context.
+the prompt.
+
+Reasoning models stream their thinking (`reasoning_content`) — it is rendered dim
+above the answer, recorded in the session log, and sent back to the model in later
+rounds so it can build on its own analysis. Models flagged `"reasoning": true` in
+the config get `reasoning_effort: "high"` explicitly (ignored by endpoints that
+don't support it). The status line shows the context size of the last request with
+its cached share (prefix caching makes those re-reads almost free) instead of a
+cumulative sum that counted the whole history on every round.
+
+When the model's context window overflows (or grows past a ~200k cap, whichever
+comes first), older history is compacted into an LLM-generated summary instead of
+being silently dropped, so long-running tasks keep their context — and rounds stay
+fast. A guardrail watches for the exact same bash command being repeated: from the
+third identical run on, a note in the tool result tells the model to change its
+approach instead of burning another round on the same output.
 
 With `--debug`, every keypress, frame, thread, tool call and API error is
 logged to `/tmp/max-agent-<session-id>.log` — sanitizer reports (use-after-free,

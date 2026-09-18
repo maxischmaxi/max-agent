@@ -80,4 +80,21 @@ typedef struct {
  * steht als ERROR-nachricht im verlauf). */
 int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks);
 
+/* manuelle compaction (/compact): den verlauf bis auf das keep-fenster
+ * (COMPACT_KEEP_TOKENS) in die llm-summary verdichten – dieselbe
+ * maschinerie wie die automatische compaction, aber ohne
+ * trimming-fallback: schlaegt der zusammenfassungs-call fehl (oder der
+ * benutzer bricht ab), bleibt der verlauf unangetastet. die ergebnisse
+ * (erfolg, "zu wenig verlauf", "bereits komprimiert", abbruch, fehler)
+ * stehen als NOTICE im verlauf; compaction-laeden werden wie beim
+ * automatischen fall ins session-log geschrieben und ueberstehen ein
+ * resume.
+ * hooks wie send_stream (redraw/tick halten die ui waehrend des calls
+ * am leben, NULL = ohne – fuer tests). darf nur aufgerufen werden,
+ * wenn kein turn laeuft (das kommando kommt aus der eingabe).
+ * rueckgabe 0 = gelaufen (ergebnis steht im verlauf), -1 nur bei
+ * benutzungsfehlern (kein modell/provider gewaehlt). */
+int send_compact_now(AppState *state, const Config *cfg,
+                     const SendHooks *hooks);
+
 #endif

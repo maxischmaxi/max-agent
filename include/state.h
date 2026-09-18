@@ -45,10 +45,6 @@ typedef struct {
     bool settings_dialog;
     bool sessions_dialog; /* resume-dialog: session-liste im dock */
     bool theme_sub;       /* theme-untermenue offen (nur mit settings_dialog) */
-    bool prompt_sub;      /* system-prompt-untermenue (dito) */
-    /* das eingabefeld bearbeitet gerade den system-prompt statt
-     * einer nachricht: enter speichert, escape verwirft */
-    bool prompt_edit;
     volatile sig_atomic_t resized;
     bool busy; /* anfrage laeuft: die obere input-rahmenzeile zeigt */
                /* spinner + sekunden, die UI blockiert bis die ant-   */

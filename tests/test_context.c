@@ -231,10 +231,10 @@ static void test_summary(void)
     CHECK(ctx_tokens_request(&chat, 0, NULL, "zusammenfassung") > all);
     chat_free(&chat);
 
-    /* --- reset: summary/watermark weg, eichung + gesamtzaehler bleiben --- */
+    /* --- reset: summary/watermark weg, eichung + verbrauch bleiben --- */
     CtxUsage ctx = {0};
     ctx_calibrate(&ctx, 1000, 1100);
-    ctx_account(&ctx, 1000, 200);
+    ctx_account(&ctx, 1000, 100, 200);
     ctx.summary = dup_str("alte summary");
     ctx.covered = 7;
     ctx.compact_failed = true;
@@ -244,7 +244,8 @@ static void test_summary(void)
     CHECK(ctx.covered == 0);
     CHECK(ctx.compact_failed == false);
     CHECK(ctx.scale == 1100); /* 1100 echte / 1000 geschaetzt */
-    CHECK(ctx.total_prompt == 1000);
+    CHECK(ctx.last_prompt == 1000);
+    CHECK(ctx.last_cached == 100);
     CHECK(ctx.total_completion == 200);
     /* dropped bleibt (es zaehlt den trim, nicht die summary) */
     CHECK(ctx.dropped == 5);
@@ -361,34 +362,41 @@ static void test_calibrate(void)
 }
 
 /* verbrauchs-buchhaltung fuer die statuszeile: getrennt von der
- * eichung, summiert ueber die ganze sitzung. */
+ * eichung. prompt ist der KONTEXT DES LETZTEN requests (keine
+ * summe mehr – die summe zaehlte den prefix jede runde neu),
+ * completion bleibt kumuliert, dazu der cache-anteil. */
 static void test_account(void)
 {
-    ctx_account(NULL, 10, 5); /* darf nicht knallen */
+    ctx_account(NULL, 10, 5, 5); /* darf nicht knallen */
 
     CtxUsage u = {0};
-    CHECK(u.total_prompt == 0 && u.total_completion == 0);
+    CHECK(u.last_prompt == 0 && u.total_completion == 0);
 
-    ctx_account(&u, 100, 20);
-    CHECK(u.total_prompt == 100);
+    ctx_account(&u, 100, 80, 20);
+    CHECK(u.last_prompt == 100);
+    CHECK(u.last_cached == 80);
     CHECK(u.total_completion == 20);
 
-    /* mehrere runden summieren sich */
-    ctx_account(&u, 250, 30);
-    CHECK(u.total_prompt == 350);
+    /* die naechste runde ueberschreibt prompt/cached, completion
+     * summiert weiter */
+    ctx_account(&u, 250, 0, 30);
+    CHECK(u.last_prompt == 250);
+    CHECK(u.last_cached == 0);
     CHECK(u.total_completion == 50);
 
     /* fehlende zahlen (api hat nichts geliefert) aendern nichts */
-    ctx_account(&u, 0, 0);
-    ctx_account(&u, -5, -1);
-    CHECK(u.total_prompt == 350);
+    ctx_account(&u, 0, 0, 0);
+    ctx_account(&u, -5, -1, -1);
+    CHECK(u.last_prompt == 250);
     CHECK(u.total_completion == 50);
 
-    /* einzeln zaehlen ist erlaubt: nur prompt, nur completion */
-    ctx_account(&u, 10, 0);
-    CHECK(u.total_prompt == 360 && u.total_completion == 50);
-    ctx_account(&u, 0, 7);
-    CHECK(u.total_prompt == 360 && u.total_completion == 57);
+    /* nur completion ohne prompt ist erlaubt */
+    ctx_account(&u, 0, 0, 7);
+    CHECK(u.last_prompt == 250 && u.total_completion == 57);
+
+    /* cache groesser als prompt: geklemmt, nicht uebergelaufen */
+    ctx_account(&u, 100, 500, 0);
+    CHECK(u.last_prompt == 100 && u.last_cached == 100);
 
     /* die buchhaltung fasst den korrekturfaktor nicht an */
     CHECK(u.scale == 0);

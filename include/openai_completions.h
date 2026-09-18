@@ -268,6 +268,12 @@ typedef struct {
 typedef struct {
     OaiRole role;
     const char *content; /* NULL bei assistant-nachrichten mit tool_calls */
+    /* thinking des modells (OpenAI-compat: "reasoning_content", wie
+     * es Ollama/vLLM/DeepSeek streamen). nur fuer ASSISTANT-nachrichten
+     * sinnvoll: der agent-loop gibt das thinking der voherigen runden
+     * mit zurueck, damit das modell auf seiner eigenen analyse
+     * aufbauen kann. NULL = keins. */
+    const char *reasoning;
     /* statt content: multimodales array (vision). nicht beides setzen!  */
     const OaiContentPart *content_parts;
     size_t content_parts_len;
@@ -338,6 +344,13 @@ typedef struct {
                                       /* "json_schema"                   */
     const char *response_format_json_schema; /* json-schema-string, nur */
                                              /* bei type == json_schema */
+    /* thinking-level fuer reasoning-modelle ("low" | "medium" |
+     * "high"): wird als "reasoning_effort" mitgeschickt – OpenAI-
+     * kompatible endpoints, die das nicht kennen, ignorieren das
+     * feld (Ollama lehnt unbekannte params nicht ab). NULL = nichts
+     * senden (has_reasoning_effort false). */
+    bool has_reasoning_effort;
+    const char *reasoning_effort;
     bool include_usage; /* nur streaming: stream_options.include_usage  */
                         /* -> letzter chunk enthaelt die token-zaehlung */
 } OaiChatCompletionParams;
@@ -347,8 +360,10 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    char *role;    /* "assistant" */
-    char *content; /* NULL wenn das modell nur tool-calls erzeugt hat */
+    char *role;      /* "assistant" */
+    char *content;   /* NULL wenn das modell nur tool-calls erzeugt hat */
+    char *reasoning; /* thinking des modells ("reasoning_content"), NULL = keins
+                      */
     OaiToolCall *tool_calls;
     size_t tool_calls_len;
 } OaiResponseMessage;
@@ -363,6 +378,11 @@ typedef struct {
     int prompt_tokens;
     int completion_tokens;
     int total_tokens;
+    int cached_tokens; /* anteil von prompt_tokens, den der server aus */
+                       /* dem prompt-cache gelesen hat (0 = nichts/ge- */
+                       /* meldet der endpoint es nicht). quelle:        */
+                       /* usage.prompt_tokens_details.cached_tokens     */
+                       /* bzw. usage.cached_tokens                      */
 } OaiUsage;
 
 typedef struct {
@@ -385,8 +405,10 @@ typedef struct {
 
 typedef struct {
     size_t index;
-    char *role;          /* meist nur im ersten chunk gesetzt        */
-    char *content_delta; /* inkrementeller text, NULL wenn keiner    */
+    char *role;            /* meist nur im ersten chunk gesetzt        */
+    char *content_delta;   /* inkrementeller text, NULL wenn keiner    */
+    char *reasoning_delta; /* inkrementelles thinking ("reasoning_ */
+                           /* content"), NULL wenn keines           */
     OaiChunkToolCall *tool_call_deltas;
     size_t tool_call_deltas_len;
     char *finish_reason; /* NULL ausser beim letzten chunk           */

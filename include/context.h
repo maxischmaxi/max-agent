@@ -38,6 +38,16 @@
 /* korrekturfaktor in promille; 1000 = schaetzung unveraendert */
 #define CTX_SCALE_ONE 1000
 
+/* kappe fuer das effektive kontextfenster: modelle mit riesigen
+ * fenstern (z.B. glm-5.3: 1M) wuerden sonst erst am echten
+ * fensterende compacten – bis dahin wird jede runde langsamer
+ * (auch ein cache-hit auf 500k tokens kostet zeit) und das
+ * modell streut bei riesigem kontext. jenseits der kappe
+ * verdichtet die compaction (send.c) den verlauf in eine
+ * summary. sie greift nur bei fenstern GROESSER als die kappe;
+ * kleinere modell-fenster bleiben unangetastet. */
+#define CTX_WINDOW_CAP 200000
+
 /* gemessene abweichung zwischen schaetzung und api-zaehlung. lebt
  * im AppState und ueberdauert damit die runden einer sitzung. */
 typedef struct {
@@ -46,9 +56,19 @@ typedef struct {
     int scale;         /* promille: echt/geschaetzt, 0 = noch ungeeicht */
     size_t dropped;    /* nachrichten, die zuletzt weggelassen wurden */
 
-    /* verbrauch der ganzen sitzung, fuer die statuszeile. gezaehlt
-     * wird, was die api meldet – nicht unsere schaetzung. */
-    size_t total_prompt;
+    /* verbrauch fuer die statuszeile. FRUEHER wurde hier der
+     * prompt-verbrauch KUMULIERT – jede runde zaehlte den ganzen
+     * kontext nochmal, und 400 runden zeigten 60 mio "gesendete"
+     * tokens, obwohl der server den prefix aus seinem cache las.
+     * jetzt: die prompt-tokens des LETZTEN requests (der aktuelle
+     * kontext) und davon der anteil aus dem server-cache – so wie
+     * der pi-agent es anzeigt. completion-tokens bleiben kumuliert,
+     * die sind wirklich erzeugt (und auch wirklich erzeugt-sichtbar
+     * teuer). gezaehlt wird, was die api meldet, nicht unsere
+     * schaetzung. */
+    int last_prompt; /* prompt-tokens des letzten requests, 0 = noch keine */
+    int last_cached; /* anteil davon aus dem server-cache (0 = nicht gemeldet)
+                      */
     size_t total_completion;
 
     /* -------------------------------------------------------------- */
@@ -136,10 +156,14 @@ size_t ctx_cut_point(const Chat *chat, size_t floor, size_t keep_tokens);
  * keine zahl geliefert). */
 void ctx_calibrate(CtxUsage *usage, size_t estimated, int prompt_tokens);
 
-/* den verbrauch der sitzung fortschreiben. bewusst getrennt von
- * ctx_calibrate: das eine eicht die schaetzung, das andere ist
- * buchhaltung fuer die anzeige. negative werte (api hat nichts
- * geliefert) werden ignoriert. */
-void ctx_account(CtxUsage *usage, int prompt_tokens, int completion_tokens);
+/* den verbrauch fortschreiben: prompt-tokens + cached-anteil des
+ * LETZTEN requests (ueberschreiben sich pro runde, keine summe –
+ * s.o.) und die kumulierten completion-tokens. negative werte
+ * (api hat nichts geliefert) lassen alles unberuehrt; ein cache-
+ * anteil groesser als prompt-tokens wird geklemmt. bewusst
+ * getrennt von ctx_calibrate: das eine eicht die schaetzung, das
+ * andere ist buchhaltung fuer die anzeige. */
+void ctx_account(CtxUsage *usage, int prompt_tokens, int cached_tokens,
+                 int completion_tokens);
 
 #endif

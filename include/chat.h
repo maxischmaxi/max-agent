@@ -88,6 +88,14 @@ typedef struct {
     ChatRole role;
     char *text; /* heap-kopie, utf-8, mehrzeilig ('\n'-getrennt) */
 
+    /* ASSISTANT: thinking des modells ("reasoning_content"), das
+     * vor dem eigentlichen text gestreamt wurde. NULL = keins.
+     * wird mit zurueckgeschickt (agent-loop), im session-log
+     * aufgezeichnet und im chat dim gerendert – aber NIEMALS in
+     * m->text eingemischt: api-round-trip und log sehen text und
+     * reasoning getrennt. */
+    char *reasoning;
+
     /* ASSISTANT: tool-calls, die das modell ausfuehren will
      * (agent-loop). text kann dabei leer sein. */
     ChatToolCall *tool_calls;
@@ -130,6 +138,18 @@ bool chat_pop(Chat *chat);
  * allocation-fehler. */
 bool chat_append_text(Chat *chat, const char *text);
 
+/* thinking-fragment an die LETZTE nachricht anhaengen (streaming:
+ * "reasoning_content"-deltas). die nachricht muss ein assistant-
+ * platzhalter sein, sonst false. '\r' wird wie ueberall gefiltert.
+ * leerer text ist ein no-op mit rueckgabe true. */
+bool chat_append_reasoning(Chat *chat, const char *text);
+
+/* reasoning der LETZTEN nachricht ERSETZEN, ownership wechselt in
+ * den chat (nicht-streaming-pfad und transcript-replay: dort ist
+ * das thinking in einem stueck da, statt als deltas). NULL/leer
+ * entfernt vorhandenes reasoning. -1 bei leerem chat/OOM. */
+int chat_set_reasoning(Chat *chat, char *reasoning);
+
 /* transcript leeren: alle texte freigeben, kapazitaet behalten.
  * das ist das, was /clear aufrufen wird. */
 void chat_clear(Chat *chat);
@@ -167,7 +187,9 @@ typedef struct {
     int tool;         /* -1 = textzeile; -2 = tabellen-zeile */
                       /* (off/len im tabellen-display-string, */
                       /* blk_start/blk_end = block-grenzen   */
-                      /* im originaltext); sonst index in    */
+                      /* im originaltext); -3 = thinking-    */
+                      /* zeile (dim gerendert, off/len wie   */
+                      /* textzeilen); sonst index in         */
                       /* msgs[msg].tool_calls: render-zeile  */
                       /* des calls (off/len unbenutzt)       */
     size_t blk_start; /* tool==-2: tabelle im originaltext  */

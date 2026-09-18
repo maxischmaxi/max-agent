@@ -80,7 +80,6 @@ int send_build_messages(const Chat *chat, const char *system_prompt,
 {
     return send_build_messages_from(chat, 0, system_prompt, NULL, out);
 }
-
 int send_build_messages_from(const Chat *chat, size_t from,
                              const char *system_prompt, const char *summary,
                              OaiMessage **out)
@@ -140,6 +139,13 @@ int send_build_messages_from(const Chat *chat, size_t from,
         const ChatMessage *m = &chat->msgs[i];
         msgs[j].role = (OaiRole)role;
         msgs[j].content = m->text; /* const-borrow */
+        if (role == OAI_ROLE_ASSISTANT) {
+            /* thinking mit zurueckgeben: das modell baut auf seiner
+             * eigenen analyse der voherigen runden auf (und manche
+             * chat-templates von thinking-modellen erwarten das
+             * feld in der history). nur ein borrow, wie content */
+            msgs[j].reasoning = m->reasoning;
+        }
 
         if (role == OAI_ROLE_ASSISTANT && m->tool_calls_len > 0) {
             /* tool-calls mit zurueckgeben (round-trip der api):
@@ -569,13 +575,13 @@ static int compact_run(AppState *state, const SendReq *req, OaiClient *client,
  * client gehoert dem turn: eine verbindung fuer alle runden und
  * die compaction darauf (ein tls-handshake pro runde waere rein
  * verschenktes warten). */
-static int send_round_build(AppState *state, const Config *cfg, SendReq *req,
-                            OaiClient *client, const SendHooks *hooks)
+static int send_round_build(AppState *state, SendReq *req, OaiClient *client,
+                            const SendHooks *hooks)
 {
     Chat *chat = &state->chat;
     CtxUsage *ctx = &state->ctx;
     send_teardown(req);
-    req->system = prompt_build(cfg); /* NULL = kein system-prompt */
+    req->system = prompt_build(); /* hardcoded in prompt.c, NULL = fehler */
 
     size_t budget = ctx_budget(req->model, req->system, ctx->summary, ctx);
     size_t from = ctx_trim_start(chat, budget);
@@ -681,7 +687,7 @@ int send_message(AppState *state, const Config *cfg)
         return -1;
     }
 
-    if (send_round_build(state, cfg, &req, &client, NULL) != 0) {
+    if (send_round_build(state, &req, &client, NULL) != 0) {
         oai_client_free(&client);
         return -1;
     }
@@ -690,6 +696,13 @@ int send_message(AppState *state, const Config *cfg)
         .model = req.model->id,
         .messages = req.msgs,
         .messages_len = (size_t)req.n,
+        /* thinking-modell: explizit hohen aufwand anfordern. der
+         * pi-agent tut dasselbe (defaultThinkingLevel high) – die
+         * qualitaet pro runde entscheidet, wieviele runden ein
+         * task braucht, und damit viel mehr als die latenz. endpoints
+         * ohne unterstuetzung ignorieren das feld einfach. */
+        .has_reasoning_effort = req.model->reasoning,
+        .reasoning_effort = "high",
     };
 
     long long t_start = mono_ms();
@@ -716,19 +729,30 @@ int send_message(AppState *state, const Config *cfg)
     }
 
     /* antwort ins transcript (content NULL = nur tool-calls, ohne
-     * tools nicht zu erwarten: dann leere nachricht) */
+     * tools nicht zu erwarten: dann leere nachricht). das thinking
+     * ("reasoning_content") haengen wir als eigenes feld an die
+     * nachricht – es geht mit zurueck an die api und ins log, aber
+     * niemals in den sichtbaren antwort-text */
     const char *text = "";
-    if (result.completion.choices_len > 0 &&
-        result.completion.choices[0].message.content != NULL) {
-        text = result.completion.choices[0].message.content;
+    char *reasoning = NULL;
+    if (result.completion.choices_len > 0) {
+        if (result.completion.choices[0].message.content != NULL) {
+            text = result.completion.choices[0].message.content;
+        }
+        reasoning = result.completion.choices[0].message.reasoning;
+        result.completion.choices[0].message.reasoning = NULL; /* borrow */
     }
     if (result.completion.has_usage) {
         ctx_calibrate(&state->ctx, req.est,
                       result.completion.usage.prompt_tokens);
         ctx_account(&state->ctx, result.completion.usage.prompt_tokens,
+                    result.completion.usage.cached_tokens,
                     result.completion.usage.completion_tokens);
     }
     if (chat_append(chat, CHAT_ROLE_ASSISTANT, text) != 0) {
+        die("out of memory");
+    }
+    if (reasoning != NULL && chat_set_reasoning(chat, reasoning) != 0) {
         die("out of memory");
     }
     int ptok = -1;
@@ -738,9 +762,9 @@ int send_message(AppState *state, const Config *cfg)
         ctok = result.completion.usage.completion_tokens;
     }
     (void)session_log_assistant(
-        &state->session, text, NULL, 0, t_done - t_start, t_done - t_start,
-        t_done - t_start, 0, (req.model->id != NULL) ? req.model->id : NULL,
-        ptok, ctok, false);
+        &state->session, text, reasoning, NULL, 0, t_done - t_start,
+        t_done - t_start, t_done - t_start, 0,
+        (req.model->id != NULL) ? req.model->id : NULL, ptok, ctok, false);
     oai_completion_result_free(&result);
     return 0;
 }
@@ -866,6 +890,8 @@ typedef struct {
     int prompt_tokens;     /* aus dem letzten chunk (include_usage): */
                            /* eichgroesse fuer ctx_calibrate, 0 = keine */
     int completion_tokens; /* dito, fuer die verbrauchs-anzeige */
+    int cached_tokens;     /* dito: anteil der prompt_tokens aus dem */
+                           /* server-cache (0 = endpoint meldet keins) */
     bool aborted;          /* benutzer hat esc/ctrl+c gedrueckt           */
 } StreamCtx;
 
@@ -911,6 +937,21 @@ static int stream_on_chunk(const OaiChatCompletionChunk *chunk, void *ud)
         if (delta != NULL && !chat_append_text(sc->chat, delta)) {
             die("out of memory");
         }
+        /* thinking-deltas ("reasoning_content"):
+         *
+         * glm-5.3 und andere reasoning-modelle streamen ihr denk-
+         * arbeit in einem eigenen feld – bisher fielen diese tokens
+         * einfach unter den tisch: sie wurden generiert (zeit,
+         * completion-tokens!), aber weder angezeigt noch in der
+         * history mitgeschickt, und das modell konnte in spaeteren
+         * runden nicht auf seiner eigenen analyse aufbauen. jetzt
+         * waechst das thinking in den platzhalter (reasoning-feld,
+         * getrennt vom text) und geht in den folge-runden wieder
+         * mit raus. */
+        const char *think = chunk->choices[i].reasoning_delta;
+        if (think != NULL && !chat_append_reasoning(sc->chat, think)) {
+            die("out of memory");
+        }
         /* tool-call-deltas: gleiche logik wie beim text, nur dass
          * sie in den akku wandern statt in den platzhalter-text */
         for (size_t t = 0; t < chunk->choices[i].tool_call_deltas_len; t++) {
@@ -920,6 +961,7 @@ static int stream_on_chunk(const OaiChatCompletionChunk *chunk, void *ud)
     if (chunk->has_usage) {
         sc->prompt_tokens = chunk->usage.prompt_tokens;
         sc->completion_tokens = chunk->usage.completion_tokens;
+        sc->cached_tokens = chunk->usage.cached_tokens;
     }
 
     /* erster chunk sofort, danach hoechstens alle SEND_REDRAW_MS */
@@ -958,7 +1000,8 @@ static void stream_on_error(long http_status, const char *message, void *ud)
         /* teil-antwort bleibt im verlauf -> auch ins session-log,
          * sonst fehlt sie nach einem resume */
         (void)session_log_assistant(
-            sc->session, chat->msgs[chat->len - 1].text, NULL, 0,
+            sc->session, chat->msgs[chat->len - 1].text,
+            chat->msgs[chat->len - 1].reasoning, NULL, 0,
             (sc->t_first > 0) ? sc->t_first - sc->t_start : -1,
             mono_ms() - sc->t_start, mono_ms() - sc->turn_start, sc->round,
             sc->model, -1, -1, false);
@@ -1190,6 +1233,78 @@ static bool tool_run_batch(const ChatToolCall *calls, size_t len,
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* duplikat-bremse fuer bash-kommandos. in echten sessions hat das     */
+/* modell dasselbe gdb-kommando 71x hintereinander ausgefuehrt – jede  */
+/* dieser runden kostete den vollen kontext nochmal. der hinweis an   */
+/* das tool-ergebnis bringt das modell dazu, die strategie zu wechseln */
+/* statt auf der stelle zu treten.                                     */
+/* ------------------------------------------------------------------ */
+
+/* ab der wievielten ausfuehrung der hinweis kommt. ein erneuter
+ * versuch (2x) kann legitim sein (timing, flaky tests) – ab der
+ * dritten ist es muellschleuder */
+#define DUP_HINT_MIN 3
+
+/* wie oft lief dieses exakte bash-kommando schon, BEVOR der call an
+ * position self_in_last (index im call-array der LETZTEN nachricht)
+ * ausgefuehrt wird? gezählt: byte-gleiche arguments-strings von
+ * bash-calls aus allen voherigen nachrichten plus den frueheren
+ * calls der aktuellen batch. */
+static size_t dup_bash_count(const Chat *chat, const char *args,
+                             size_t self_in_last)
+{
+    size_t n = 0;
+    for (size_t mi = 0; mi < chat->len; mi++) {
+        const ChatMessage *m = &chat->msgs[mi];
+        size_t limit = m->tool_calls_len;
+        if (mi + 1 == chat->len && self_in_last < limit) {
+            limit = self_in_last; /* eigene batch: nur die davor */
+        }
+        for (size_t t = 0; t < limit; t++) {
+            const ChatToolCall *c = &m->tool_calls[t];
+            if (c->name != NULL && c->arguments != NULL &&
+                strcmp(c->name, "bash") == 0 &&
+                strcmp(c->arguments, args) == 0) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* hinweis an das ergebnis anhaengen, wenn das kommando zum
+ * DUP_HINT_MIN-ten (oder oefteren) mal laeuft. result ist owned
+ * und bleibt owned (realloc in place). das model sieht den hinweis
+ * als teil des tool-outputs, die anzeige zeigt ihn mit. */
+static char *dup_maybe_hint(const Chat *chat, const ChatToolCall *call,
+                            size_t self_in_last, char *result)
+{
+    if (result == NULL || call->name == NULL || call->arguments == NULL ||
+        strcmp(call->name, "bash") != 0) {
+        return result;
+    }
+    size_t before = dup_bash_count(chat, call->arguments, self_in_last);
+    size_t nth = before + 1;
+    if (nth < DUP_HINT_MIN) {
+        return result;
+    }
+    char tail[192];
+    (void)snprintf(tail, sizeof tail,
+                   "\n\n[note: you have now run this exact command %zu "
+                   "times in this session. Its output will not change. "
+                   "Stop repeating it and change your approach.]",
+                   nth);
+    size_t rl = strlen(result);
+    size_t tl = strlen(tail);
+    char *grown = realloc(result, rl + tl + 1);
+    if (grown == NULL) {
+        return result; /* der hinweis ist kosmetik: ohne geht auch */
+    }
+    memcpy(grown + rl, tail, tl + 1);
+    return grown;
+}
+
 /* der runden-loop eines turns: runden bauen, requests streamen,
  * tools ausfuehren, bis die antwort ohne tool-calls steht. alle
  * requests laufen auf DEM turn-client (eine verbindung, kein
@@ -1197,15 +1312,14 @@ static bool tool_run_batch(const ChatToolCall *calls, size_t len,
  * sich um client + req-ressourcen, die exits hier sind reine
  * ergebnis-codes: 0 = turn fertig (antwort oder abbruch), -1 =
  * fehler (die meldung steht im verlauf). */
-static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
-                            OaiClient *client, const OaiTool *tools,
-                            size_t tools_len, const SendHooks *hooks,
-                            long long turn_start)
+static int send_stream_loop(AppState *state, SendReq *req, OaiClient *client,
+                            const OaiTool *tools, size_t tools_len,
+                            const SendHooks *hooks, long long turn_start)
 {
     Chat *chat = &state->chat;
 
     for (int round = 0;; round++) {
-        if (send_round_build(state, cfg, req, client, hooks) != 0) {
+        if (send_round_build(state, req, client, hooks) != 0) {
             send_teardown(req);
             return -1;
         }
@@ -1226,6 +1340,8 @@ static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
             .tools = tools,
             .tools_len = tools_len,
             .include_usage = true, /* letzter chunk: token-zaehlung */
+            .has_reasoning_effort = req->model->reasoning,
+            .reasoning_effort = "high",
         };
 
         StreamCtx sc = {
@@ -1277,7 +1393,8 @@ static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
             }
             if (partial) {
                 (void)session_log_assistant(
-                    &state->session, chat->msgs[chat->len - 1].text, NULL, 0,
+                    &state->session, chat->msgs[chat->len - 1].text,
+                    chat->msgs[chat->len - 1].reasoning, NULL, 0,
                     (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
                     mono_ms() - sc.t_start, mono_ms() - sc.turn_start, round,
                     sc.model, -1, -1, true);
@@ -1289,7 +1406,8 @@ static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
         /* schaetzung gegen die api-zaehlung halten: die naechste
          * runde rechnet mit dem korrigierten faktor */
         ctx_calibrate(&state->ctx, req->est, sc.prompt_tokens);
-        ctx_account(&state->ctx, sc.prompt_tokens, sc.completion_tokens);
+        ctx_account(&state->ctx, sc.prompt_tokens, sc.cached_tokens,
+                    sc.completion_tokens);
 
         /* akku uebernehmen: die letzte nachricht bekommt die calls.
          * chat_set_tool_calls uebernimmt das array (die() bei OOM
@@ -1316,7 +1434,7 @@ static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
         ChatMessage *last = &chat->msgs[chat->len - 1];
         if (last->tool_calls_len == 0) {
             (void)session_log_assistant(
-                &state->session, last->text, NULL, 0,
+                &state->session, last->text, last->reasoning, NULL, 0,
                 (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
                 mono_ms() - sc.t_start, mono_ms() - sc.turn_start, round,
                 sc.model, sc.prompt_tokens, sc.completion_tokens, false);
@@ -1326,7 +1444,8 @@ static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
         /* antwort MIT tool-calls: calls haengen an der nachricht, die
          * gleich ausgefuehrt werden – als eine zeile mitspeichern */
         (void)session_log_assistant(
-            &state->session, last->text, last->tool_calls, last->tool_calls_len,
+            &state->session, last->text, last->reasoning, last->tool_calls,
+            last->tool_calls_len,
             (sc.t_first > 0) ? sc.t_first - sc.t_start : -1,
             mono_ms() - sc.t_start, mono_ms() - sc.turn_start, round, sc.model,
             sc.prompt_tokens, sc.completion_tokens, false);
@@ -1347,6 +1466,7 @@ static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
          * ansonsten: alle parallel – eine runde mit fuenf reads
          * dauert dann so lange wie eine (statt fuenf). */
         bool has_seq = false;
+
         for (size_t i = 0; i < calls_len; i++) {
             if (tool_is_sequential(calls[i].name)) {
                 has_seq = true;
@@ -1373,6 +1493,7 @@ static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
                     if (result == NULL) {
                         die("out of memory");
                     }
+                    result = dup_maybe_hint(chat, call, i, result);
                     (void)session_log_tool(&state->session, call->id,
                                            call->name, result, dur);
                     if (chat_append_tool(chat, call->id, result) != 0) {
@@ -1398,6 +1519,7 @@ static int send_stream_loop(AppState *state, const Config *cfg, SendReq *req,
                     if (results[i] == NULL) {
                         die("out of memory");
                     }
+                    results[i] = dup_maybe_hint(chat, call, i, results[i]);
                     (void)session_log_tool(&state->session, call->id,
                                            call->name, results[i], durs[i]);
                     if (chat_append_tool(chat, call->id, results[i]) != 0) {
@@ -1462,11 +1584,78 @@ int send_stream(AppState *state, const Config *cfg, const SendHooks *hooks)
         return -1;
     }
 
-    int rc = send_stream_loop(state, cfg, &req, &client, tools, tools_len,
-                              hooks, turn_start);
+    int rc = send_stream_loop(state, &req, &client, tools, tools_len, hooks,
+                              turn_start);
 
     oai_client_free(&client);
     send_teardown(&req); /* no-op nach gelaufenen runden, aufraeumen
                           * nach einem abbruch in round_build */
     return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* manuelle compaction (/compact): derselbe verdichtungs-call wie im   */
+/* automatischen fall, nur vom benutzer getriggert. der unterschied:   */
+/* ein fehlversuch laesst den verlauf UNANGETASTET (kein trimming-     */
+/* fallback – wegwerfen darf nur der kontext-ueberlauf, nicht der       */
+/* benutzer), und der cut-punkt liegt nicht am fensterrand, sondern    */
+/* rein am keep-fenster: alles bis auf die letzten COMPACT_KEEP_TOKENS */
+/* wird in die summary aufgenommen.                                    */
+/* ------------------------------------------------------------------ */
+int send_compact_now(AppState *state, const Config *cfg, const SendHooks *hooks)
+{
+    if (state == NULL || cfg == NULL) {
+        return -1;
+    }
+    Chat *chat = &state->chat;
+    CtxUsage *ctx = &state->ctx;
+
+    if (chat->len == 0) {
+        notice(state, "nichts zu komprimieren: der verlauf ist leer");
+        return 0;
+    }
+
+    SendReq req;
+    if (send_setup(state, cfg, &req) != 0) {
+        return -1; /* die meldung steht als ERROR im verlauf */
+    }
+
+    OaiClientOptions opts = {
+        .api_key = req.provider->api_key,
+        .base_url = req.provider->base_url,
+        .timeout_ms = SEND_TIMEOUT_MS,
+    };
+    OaiClient client;
+    if (oai_client_init(&client, &opts) != 0) {
+        send_teardown(&req);
+        fail(state, 0, "client-init fehlgeschlagen");
+        return -1;
+    }
+
+    /* cut wie im automatischen fall, aber ohne fenster-zwang: das
+     * keep-fenster allein entscheidet, was unveraendert bleibt */
+    size_t cut = ctx_cut_point(chat, 0, COMPACT_KEEP_TOKENS);
+    if (cut == 0) {
+        notice(state,
+               "zu wenig verlauf: die letzten ~%zu tokens bleiben immer "
+               "unveraendert, mehr ist nicht da",
+               COMPACT_KEEP_TOKENS);
+    } else if (cut <= ctx->covered) {
+        notice(state, "nichts zu komprimieren: dieser teil des verlaufs ist "
+                      "bereits in der zusammenfassung");
+    } else {
+        int rc = compact_run(state, &req, &client, cut, hooks);
+        if (rc == 1) {
+            notice(state, "abgebrochen");
+        } else if (rc != 0) {
+            notice(state, "compaction fehlgeschlagen: der verlauf bleibt "
+                          "unangetastet");
+        }
+        /* rc == 0: compact_run hat die erfolgs-notice selbst angehaengt
+         * (summary, watermark, session-log sind dort erledigt) */
+    }
+
+    oai_client_free(&client);
+    send_teardown(&req);
+    return 0;
 }

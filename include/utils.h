@@ -17,7 +17,6 @@ typedef enum {
     MODE_MODELS,   /* modell-liste am unteren rand statt eingabefeld */
     MODE_SETTINGS, /* settings-liste am unteren rand */
     MODE_THEME,    /* theme-untermenue des settings-dialogs */
-    MODE_PROMPT,   /* system-prompt-untermenue des settings-dialogs */
     MODE_SESSIONS, /* resume-dialog: session-liste als dock-box */
 } UIMode;
 

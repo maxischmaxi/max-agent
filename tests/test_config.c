@@ -31,8 +31,7 @@ static int build_test_config(Config *cfg)
     cfg->theme = dup_str("tokyo-night");
     cfg->confirm_quit = false;
     cfg->active_model = dup_str("gpt-test");
-    cfg->system_prompt = dup_str("du bist ein test-agent.");
-    if (!cfg->theme || !cfg->active_model || !cfg->system_prompt) {
+    if (!cfg->theme || !cfg->active_model) {
         return -1;
     }
 
@@ -103,8 +102,6 @@ int main(void)
     CHECK(!loaded.confirm_quit);
     CHECK(loaded.active_model != NULL &&
           strcmp(loaded.active_model, "gpt-test") == 0);
-    CHECK(loaded.system_prompt != NULL &&
-          strcmp(loaded.system_prompt, "du bist ein test-agent.") == 0);
 
     /* "$schema" an der wurzel ueberlebt das speichern (editor-
      * linting der config muss die app-rewrites ueberdauern) */

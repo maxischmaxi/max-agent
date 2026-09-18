@@ -34,6 +34,8 @@ size_t ctx_tokens_message(const ChatMessage *msg)
         return 0; /* lokale meldung: kostet nichts, geht nie raus */
     }
     size_t n = CTX_MSG_OVERHEAD + ctx_tokens_text(msg->text);
+    n += ctx_tokens_text(msg->reasoning); /* thinking wird mit- */
+                                          /* geschickt und zaehlt */
     for (size_t i = 0; i < msg->tool_calls_len; i++) {
         n += CTX_CALL_OVERHEAD + ctx_tokens_text(msg->tool_calls[i].name) +
              ctx_tokens_text(msg->tool_calls[i].arguments);
@@ -128,6 +130,17 @@ size_t ctx_budget(const Model *model, const char *system_prompt,
         return CTX_NO_LIMIT; /* fenster unbekannt: nicht kuerzen */
     }
     size_t window = model->context_window;
+
+    /* frueh-compacten: grosse fenster (100k+) machen jede runde
+     * langsamer (der server muss den prefix verarbeiten, selbst
+     * mit cache) und das modell streut bei riesigem kontext.
+     * jenseits der kappe faellt alter verlauf in die compaction-
+     * summary statt nur am echten fensterende. die kappe greift
+     * nur, wenn das fenster des modells GROESSER ist – kleine
+     * fenster bleiben unangetastet. */
+    if (window > CTX_WINDOW_CAP) {
+        window = CTX_WINDOW_CAP;
+    }
 
     size_t reserve = window / CTX_RESERVE_DIV;
     if (reserve < CTX_RESERVE_MIN) {
@@ -285,13 +298,21 @@ void ctx_calibrate(CtxUsage *usage, size_t estimated, int prompt_tokens)
     usage->scale = (int)scale;
 }
 
-void ctx_account(CtxUsage *usage, int prompt_tokens, int completion_tokens)
+void ctx_account(CtxUsage *usage, int prompt_tokens, int cached_tokens,
+                 int completion_tokens)
 {
     if (usage == NULL) {
         return;
     }
     if (prompt_tokens > 0) {
-        usage->total_prompt += (size_t)prompt_tokens;
+        usage->last_prompt = prompt_tokens;
+        if (cached_tokens > 0 && cached_tokens <= prompt_tokens) {
+            usage->last_cached = cached_tokens;
+        } else if (cached_tokens > 0) {
+            usage->last_cached = prompt_tokens; /* kaputte meldung: klemmen */
+        } else {
+            usage->last_cached = 0;
+        }
     }
     if (completion_tokens > 0) {
         usage->total_completion += (size_t)completion_tokens;

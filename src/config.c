@@ -185,7 +185,6 @@ static void load_settings(cJSON *root, Config *config)
     }
     (void)dup_json_str(s, "theme", &config->theme);
     (void)dup_json_str(s, "activeModel", &config->active_model);
-    (void)dup_json_str(s, "systemPrompt", &config->system_prompt);
 
     cJSON *cq = cJSON_GetObjectItem(s, "confirmQuit");
     if (cJSON_IsBool(cq)) {
@@ -409,14 +408,6 @@ static cJSON *settings_to_json(const Config *config)
         cJSON_AddItemToObject(obj, "activeModel", model);
     }
 
-    if (config->system_prompt != NULL) {
-        cJSON *sp = cJSON_CreateString(config->system_prompt);
-        if (!sp) {
-            goto fail;
-        }
-        cJSON_AddItemToObject(obj, "systemPrompt", sp);
-    }
-
     return obj;
 
 fail:
@@ -503,8 +494,6 @@ void free_config(Config *config)
     config->theme = NULL;
     free(config->active_model);
     config->active_model = NULL;
-    free(config->system_prompt);
-    config->system_prompt = NULL;
     free(config->schema_url);
     config->schema_url = NULL;
 

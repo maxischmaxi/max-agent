@@ -9,10 +9,8 @@
 
 int main(void)
 {
-    /* --- default: NULL-cfg und cfg ohne system_prompt --- */
-    Config empty = {0};
-
-    char *p = prompt_build(NULL);
+    /* --- hardcoded: kein config-override mehr, immer die vorlage --- */
+    char *p = prompt_build();
     /* identitaet + arbeitsregeln wie beim pi-agenten-vorbild */
     CHECK(p != NULL && strstr(p, "You are max agent") != NULL);
     CHECK(p != NULL && strstr(p, "coding agent") != NULL);
@@ -29,22 +27,29 @@ int main(void)
     CHECK(localtime_r(&now, &tmv) != NULL);
     CHECK(strftime(today, sizeof today, "%Y-%m-%d", &tmv) > 0);
 
-    p = prompt_build(&empty);
+    p = prompt_build();
     CHECK(p != NULL && strstr(p, today) != NULL);
     free(p);
 
-    /* --- custom prompt: exakt der text, keine template-ersetzung --- */
-    Config custom = {0};
-    custom.system_prompt = "du bist ein test-agent. $DATE bleibt so.";
-    p = prompt_build(&custom);
+    /* --- effizienz-regeln aus der praxis (71x dasselbe gdb-kommando,
+     * ganze dateien wiederholt gelesen): jede runde kostet den
+     * vollen kontext, also muss der prompt das modell bremsen --- */
+    p = prompt_build();
     CHECK(p != NULL &&
-          strcmp(p, "du bist ein test-agent. $DATE bleibt so.") == 0);
+          strstr(p, "Never run the exact same command twice") != NULL);
+    CHECK(p != NULL && strstr(p, "failed twice") != NULL);
+    CHECK(p != NULL && strstr(p, "offset and limit") != NULL);
+    CHECK(p != NULL && strstr(p, "do not re-read a file") != NULL);
+    CHECK(p != NULL && strstr(p, "ONE hypothesis") != NULL);
+    CHECK(p != NULL && strstr(p, "Batch independent tool calls") != NULL);
     free(p);
 
-    /* leerer string: explizit KEIN system-prompt */
-    Config off = {0};
-    off.system_prompt = "";
-    CHECK(prompt_build(&off) == NULL);
+    /* zweiter aufruf liefert dieselbe vorlage (kein zustand) */
+    char *q = prompt_build();
+    char *r = prompt_build();
+    CHECK(q != NULL && r != NULL && strcmp(q, r) == 0);
+    free(q);
+    free(r);
 
     return test_report();
 }

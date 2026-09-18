@@ -91,10 +91,6 @@
                 "activeModel": {
                     "type": "string",
                     "description": "ID des aktuell gewählten Modells (wird vom models-Dialog gesetzt)"
-                },
-                "systemPrompt": {
-                    "type": "string",
-                    "description": "Eigener System-Prompt. NULL/fehlt = eingebaute Vorlage, leerer String = deaktiviert"
                 }
             }
         }

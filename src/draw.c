@@ -170,9 +170,6 @@ static void row_setting(Row *r, const Config *cfg, int idx, const char *search,
                         bool selected, int id_col);
 static void row_theme_opt(Row *r, int idx, const char *search, bool selected,
                           bool active, int id_col);
-static void row_prompt_opt(Row *r, int idx, const char *search, bool selected,
-                           bool active, int id_col);
-static void row_prompt_hint(Row *r);
 static void row_session(Row *r, const SessionInfo *si, const char *search,
                         bool selected, bool active, int id_col, int name_col);
 static void row_command(Row *r, const Command *cmd, const char *prefix);
@@ -451,15 +448,6 @@ static void row_setting(Row *r, const Config *cfg, int idx, const char *search,
     case SET_THEME:
         row_puts(r, (cfg->theme != NULL) ? cfg->theme : "auto");
         break;
-    case SET_SYSTEM_PROMPT:
-        if (cfg->system_prompt == NULL) {
-            row_puts(r, "default");
-        } else if (cfg->system_prompt[0] == '\0') {
-            row_puts(r, "off");
-        } else {
-            row_puts(r, cfg->system_prompt);
-        }
-        break;
     case SET_CONFIRM_QUIT:
         row_puts(r, on_off(cfg->confirm_quit));
         break;
@@ -497,48 +485,6 @@ static void row_theme_opt(Row *r, int idx, const char *search, bool selected,
     if (active) {
         row_puts(r, "(active)");
     }
-}
-
-/* eintrag des system-prompt-untermenues. "(active)" haengt an der
- * option, die dem aktuellen config-zustand entspricht. */
-static void row_prompt_opt(Row *r, int idx, const char *search, bool selected,
-                           bool active, int id_col)
-{
-    const Theme *theme = theme_current();
-    if (idx < 0 || idx >= PROMPT_OPT_COUNT) {
-        return;
-    }
-    const char *name = PROMPT_OPT_NAMES[idx];
-
-    if (selected) {
-        row_sgr(r, theme->match);
-        row_puts(r, " > ");
-        row_sgr(r, theme->reset);
-    } else {
-        row_puts(r, "   ");
-    }
-
-    int slen = (int)strlen(search);
-    row_sgr(r, theme->match);
-    row_putn(r, name, slen);
-    row_sgr(r, theme->reset);
-    row_putn(r, name + slen, (int)strlen(name) - slen);
-
-    while (r->cells < 3 + id_col + 2) {
-        row_putc(r, ' ');
-    }
-    if (active) {
-        row_puts(r, "(active)");
-    }
-}
-
-/* hinweis unter dem eingabefeld, solange es den system-prompt
- * bearbeitet: enter speichert hier statt zu senden. */
-static void row_prompt_hint(Row *r)
-{
-    row_sgr(r, theme_role(THEME_ROLE_DIM));
-    row_puts(r, "  system prompt: enter speichert, esc verwirft");
-    row_sgr(r, THEME_ROLE_RESET);
 }
 
 /* unix-ms -> "dd.mm hh:mm" (bzw. mit jahr, wenn es aelter ist) */
@@ -857,16 +803,30 @@ static void row_status_model(Row *r, const Config *cfg, int sub)
     (void)st_fill(&l, &idx, width, &cell, sub, STATUS_MAX_LINES - 1, false, r);
 }
 
-/* segmente der token-zeile: verbrauch, arbeitszeit, session und –
- * mit --debug – die log-datei (dbg_path aktualisiert sich mit der
- * session-id) */
+/* segmente der token-zeile: aktueller kontext (mit cache-anteil),
+ * arbeitszeit, session und – mit --debug – die log-datei
+ * (dbg_path aktualisiert sich mit der session-id)
+ *
+ * der kontext ist die prompt-groesse des LETZTEN requests, nicht
+ * eine kumulierte summe: frueher summierte jede runde den ganzen
+ * verlauf nochmal ("679k gesendet"), obwohl der server den
+ * prefix fast komplett aus seinem cache las – die zahl war
+ * ungefaehr so aussagekraeftig wie ein tachometer, das die
+ * gefahrenen meter aller tage addiert. der cache-anteil zeigt,
+ * wieviel davon praktisch gratis war. */
 static void status_token_segs(StatusLine *l, const AppState *st)
 {
-    char buf[40];
+    char buf[80];
     {
         char cnt[24];
-        put_count_s(cnt, sizeof cnt, st->ctx.total_prompt);
-        (void)snprintf(buf, sizeof buf, "%s gesendet", cnt);
+        put_count_s(cnt, sizeof cnt, (size_t)st->ctx.last_prompt);
+        if (st->ctx.last_cached > 0) {
+            char cch[24];
+            put_count_s(cch, sizeof cch, (size_t)st->ctx.last_cached);
+            (void)snprintf(buf, sizeof buf, "%s kontext (%s cached)", cnt, cch);
+        } else {
+            (void)snprintf(buf, sizeof buf, "%s kontext", cnt);
+        }
         st_add(l, buf, NULL, false);
     }
     {
@@ -1431,7 +1391,6 @@ typedef enum {
     DROW_INPUT,         /* a = sichtbare eingabezeile */
     DROW_CMD,           /* a = befehl-index (COMMANDS) */
     DROW_CMD_EMPTY,     /* hinweis: kein befehl passt */
-    DROW_PROMPT_HINT,   /* hinweis: eingabe bearbeitet den prompt */
     DROW_QUIT,          /* quit-bestaetigung */
     DROW_STATUS_MODEL,  /* statuszeile 1 */
     DROW_STATUS_TOKENS, /* statuszeile 2 */
@@ -1486,8 +1445,6 @@ static const char *dlg_title(UIMode mode)
         return "theme";
     case MODE_SESSIONS:
         return "resume";
-    case MODE_PROMPT:
-        return "prompt";
     default:
         return "";
     }
@@ -1570,16 +1527,6 @@ static void dialog_matches(int rows, AppState *st, const Config *cfg,
         d->id_col = names_col(names, total);
         break;
     }
-    case MODE_PROMPT:
-        snprintf(d->search, sizeof d->search, "%s", st->dialog.search);
-        d->match_count =
-            names_match(PROMPT_OPT_NAMES, PROMPT_OPT_COUNT, st->dialog.search,
-                        matches, DIALOG_MATCH_MAX);
-        for (int i = 0; i < d->match_count; i++) {
-            d->match_idx[i] = matches[i];
-        }
-        d->id_col = names_col(PROMPT_OPT_NAMES, PROMPT_OPT_COUNT);
-        break;
     case MODE_SESSIONS: {
         snprintf(d->search, sizeof d->search, "%s", st->dialog.search);
         d->match_count = sessions_match(&st->sessions, st->dialog.search,
@@ -1670,9 +1617,6 @@ static int dock_build(int rows, int cols, AppState *st, const Config *cfg,
         /* eingabe-geometrie: die box waechst mit dem text, der dock
          * laesst oben platz fuer live-zeile und verlauf */
         int list_h = cmd_list_height(st);
-        if (st->prompt_edit && list_h == 0) {
-            list_h = 1; /* der hinweis steht, wo die cmd-liste stuende */
-        }
         /* die quit-bestaetigung belegt die abstands-zeile, der dock
          * ist in beiden zustaenden gleich hoch */
         int input_bottom = bottom_border_for(usable, list_h, false);
@@ -1728,8 +1672,6 @@ static int dock_build(int rows, int cols, AppState *st, const Config *cfg,
             } else if (n < out_max) {
                 out_rows[n++] = (DockRow){DROW_CMD_EMPTY, 0, false};
             }
-        } else if (st->prompt_edit && n < out_max) {
-            out_rows[n++] = (DockRow){DROW_PROMPT_HINT, 0, false};
         }
     } else {
         /* dialog statt eingabefeld: border, suchzeile, eintraege */
@@ -1886,9 +1828,6 @@ static void render_dock_row(const DockRow *row, const DockCtx *d, AppState *st,
     case DROW_CMD_EMPTY:
         row_no_match(r, d->prefix);
         break;
-    case DROW_PROMPT_HINT:
-        row_prompt_hint(r);
-        break;
     case DROW_QUIT:
         row_quit(r);
         break;
@@ -1919,17 +1858,6 @@ static void render_dock_row(const DockRow *row, const DockCtx *d, AppState *st,
                 active = true;
             }
             row_theme_opt(r, row->a, d->search, row->sel, active, d->id_col);
-            break;
-        }
-        case MODE_PROMPT: {
-            bool active = false;
-            if (row->a == PROMPT_DEFAULT) {
-                active = (cfg->system_prompt == NULL);
-            } else if (row->a == PROMPT_OFF && cfg->system_prompt != NULL &&
-                       cfg->system_prompt[0] == '\0') {
-                active = true;
-            }
-            row_prompt_opt(r, row->a, d->search, row->sel, active, d->id_col);
             break;
         }
         case MODE_SESSIONS: {
@@ -2301,6 +2229,25 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                 row_tool_call(&g_row, &lm->tool_calls[ln->tool], ln);
                 row_sgr(&g_row, THEME_ROLE_RESET);
                 row_finish(true);
+            } else if (ln->tool == -3) {
+                /* thinking-zeile (reasoning des modells): dim, ohne
+                 * markdown. die erste bekommt ein "thinking:"-label,
+                 * damit im scrollback klar ist, was hier steht –
+                 * ansonsten waere es von einer antwort nicht zu
+                 * unterscheiden */
+                if (ln->first) {
+                    row_start(main_w);
+                    row_sgr(&g_row, theme_role(THEME_ROLE_DIM));
+                    row_puts(&g_row, " thinking:");
+                    row_sgr(&g_row, THEME_ROLE_RESET);
+                    row_finish(true);
+                }
+                row_start(main_w);
+                row_putc(&g_row, ' '); /* padding wie text */
+                row_sgr(&g_row, theme_role(THEME_ROLE_DIM));
+                row_putn(&g_row, disp + ln->off, (int)ln->len);
+                row_sgr(&g_row, THEME_ROLE_RESET);
+                row_finish(true);
             } else if (lm->role == CHAT_ROLE_TOOL) {
                 /* tool-ergebnis: "output:" vor der ersten zeile,
                  * dahinter der echte output, am ende der (von
@@ -2435,7 +2382,13 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                         continue;
                     }
                     row_start(main_w);
-                    if (ln->tool == -2) {
+                    if (ln->tool == -3) {
+                        /* thinking live: dim, wie im content-loop */
+                        row_putc(&g_row, ' ');
+                        row_sgr(&g_row, theme_role(THEME_ROLE_DIM));
+                        row_putn(&g_row, disp + ln->off, (int)ln->len);
+                        row_sgr(&g_row, THEME_ROLE_RESET);
+                    } else if (ln->tool == -2) {
                         /* tabelle: wie im content-loop (pipes farbig).
                          * blk_start/end sind kopie-offsets */
                         size_t toff = chat_disp_off(ln->msg);
@@ -2476,7 +2429,14 @@ void draw(int rows, int cols, AppState *state, const Config *cfg)
                 const ChatLine *ln = &g_lines[e - 1];
                 if (ln->tool < 0) {
                     row_start(main_w);
-                    row_msg(&g_row, ln, disp);
+                    if (ln->tool == -3) {
+                        row_putc(&g_row, ' ');
+                        row_sgr(&g_row, theme_role(THEME_ROLE_DIM));
+                        row_putn(&g_row, disp + ln->off, (int)ln->len);
+                        row_sgr(&g_row, THEME_ROLE_RESET);
+                    } else {
+                        row_msg(&g_row, ln, disp);
+                    }
                     row_finish(true);
                     live_text = true;
                 }

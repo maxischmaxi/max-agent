@@ -303,6 +303,14 @@ static cJSON *message_to_json(const OaiMessage *msg)
     if (cJSON_AddStringToObject(m, "role", role_str(msg->role)) == NULL) {
         goto fail;
     }
+    /* thinking des modells mit zurueckspielen (agent-loop): nur
+     * sinnvoll und nur erlaubt auf assistant-nachrichten        */
+    if (msg->role == OAI_ROLE_ASSISTANT && msg->reasoning != NULL &&
+        msg->reasoning[0] != '\0' &&
+        cJSON_AddStringToObject(m, "reasoning_content", msg->reasoning) ==
+            NULL) {
+        goto fail;
+    }
     if (msg->content_parts_len > 0) {
         /* multimodaler content: array aus text- und image-parts (vision) */
         cJSON *parts = cJSON_AddArrayToObject(m, "content");
@@ -534,6 +542,11 @@ static cJSON *params_to_json(const OaiChatCompletionParams *p, bool stream)
             goto out;
         }
     }
+    if (p->has_reasoning_effort &&
+        cJSON_AddStringToObject(root, "reasoning_effort",
+                                p->reasoning_effort) == NULL) {
+        goto out;
+    }
 
     if (p->tools_len > 0) {
         tools = cJSON_AddArrayToObject(root, "tools");
@@ -716,6 +729,24 @@ static int parse_chunk_tool_calls(const cJSON *arr, OaiChunkToolCall **out,
     return 0;
 }
 
+/* anteil der prompt_tokens aus dem server-cache: OpenAI legt das
+ * in prompt_tokens_details.cached_tokens, andere endpoints
+ * (z.B. manche Ollama/proxy-varianten) melden es top-level als
+ * cached_tokens. 0, wenn der endpoint nichts dergleichen meldet. */
+static int usage_cached_tokens(const cJSON *usage)
+{
+    const cJSON *details =
+        cJSON_GetObjectItemCaseSensitive(usage, "prompt_tokens_details");
+    if (cJSON_IsObject(details)) {
+        int cached = get_int(details, "cached_tokens", 0);
+        if (cached > 0) {
+            return cached;
+        }
+    }
+    int cached = get_int(usage, "cached_tokens", 0);
+    return (cached > 0) ? cached : 0;
+}
+
 static int parse_chunk(const cJSON *root, OaiChatCompletionChunk *out)
 {
     memset(out, 0, sizeof *out);
@@ -730,6 +761,7 @@ static int parse_chunk(const cJSON *root, OaiChatCompletionChunk *out)
         out->usage.prompt_tokens = get_int(usage, "prompt_tokens", 0);
         out->usage.completion_tokens = get_int(usage, "completion_tokens", 0);
         out->usage.total_tokens = get_int(usage, "total_tokens", 0);
+        out->usage.cached_tokens = usage_cached_tokens(usage);
     }
 
     const cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
@@ -762,6 +794,8 @@ static int parse_chunk(const cJSON *root, OaiChatCompletionChunk *out)
         if (cJSON_IsObject(delta)) {
             choice->role = get_string_dup(delta, "role");
             choice->content_delta = get_content_dup(delta);
+            choice->reasoning_delta =
+                get_string_dup(delta, "reasoning_content");
             if (parse_chunk_tool_calls(
                     cJSON_GetObjectItemCaseSensitive(delta, "tool_calls"),
                     &choice->tool_call_deltas,
@@ -809,6 +843,8 @@ static int parse_completion(const cJSON *root, OaiChatCompletion *out)
         if (cJSON_IsObject(msg)) {
             choice->message.role = get_string_dup(msg, "role");
             choice->message.content = get_content_dup(msg);
+            choice->message.reasoning =
+                get_string_dup(msg, "reasoning_content");
             if (parse_tool_calls(
                     cJSON_GetObjectItemCaseSensitive(msg, "tool_calls"),
                     &choice->message.tool_calls,
@@ -824,6 +860,7 @@ static int parse_completion(const cJSON *root, OaiChatCompletion *out)
         out->usage.prompt_tokens = get_int(usage, "prompt_tokens", 0);
         out->usage.completion_tokens = get_int(usage, "completion_tokens", 0);
         out->usage.total_tokens = get_int(usage, "total_tokens", 0);
+        out->usage.cached_tokens = usage_cached_tokens(usage);
     }
     return 0;
 }
@@ -862,6 +899,7 @@ void oai_chat_completion_free(OaiChatCompletion *completion)
         OaiChoice *choice = &completion->choices[i];
         free(choice->message.role);
         free(choice->message.content);
+        free(choice->message.reasoning);
         tool_calls_free(choice->message.tool_calls,
                         choice->message.tool_calls_len);
         free(choice->finish_reason);
@@ -881,6 +919,7 @@ void oai_chat_completion_chunk_free(OaiChatCompletionChunk *chunk)
         OaiChunkChoice *choice = &chunk->choices[i];
         free(choice->role);
         free(choice->content_delta);
+        free(choice->reasoning_delta);
         for (size_t j = 0; j < choice->tool_call_deltas_len; j++) {
             free(choice->tool_call_deltas[j].id);
             free(choice->tool_call_deltas[j].name);

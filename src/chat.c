@@ -76,6 +76,7 @@ int chat_append(Chat *chat, ChatRole role, const char *text)
     ChatMessage *m = &chat->msgs[chat->len];
     m->role = role;
     m->text = copy;
+    m->reasoning = NULL;
     m->tool_calls = NULL;
     m->tool_calls_len = 0;
     m->tool_call_id = NULL;
@@ -115,6 +116,8 @@ static void msg_free_fields(ChatMessage *m)
     m->tool_call_id = NULL;
     free(m->text);
     m->text = NULL;
+    free(m->reasoning);
+    m->reasoning = NULL;
 }
 
 bool chat_pop(Chat *chat)
@@ -157,6 +160,65 @@ bool chat_append_text(Chat *chat, const char *text)
     memcpy(grown + old_len, text, add + 1);
     m->text = grown;
     return true;
+}
+
+/* thinking-fragment an die letzte nachricht: gleiche logik wie
+ * chat_append_text, nur in das reasoning-feld. '\r' filtert der
+ * aufrufer hier selbst – die text-variante hat das schon beim
+ * chat_append erledigt. */
+bool chat_append_reasoning(Chat *chat, const char *text)
+{
+    if (chat == NULL || chat->len == 0 || text == NULL) {
+        return false;
+    }
+    ChatMessage *m = &chat->msgs[chat->len - 1];
+    if (m->role != CHAT_ROLE_ASSISTANT) {
+        return false;
+    }
+    /* '\r' rausfiltern (wie chat_append): es wuerde beim zeichnen
+     * den cursor an den zeilenanfang zurueckwerfen */
+    size_t add = 0;
+    for (const char *s = text; *s != '\0'; s++) {
+        if (*s != '\r') {
+            add++;
+        }
+    }
+    if (add == 0) {
+        return true; /* no-op, aber kein fehler */
+    }
+    size_t old_len = (m->reasoning != NULL) ? strlen(m->reasoning) : 0;
+    if (add > SIZE_MAX - old_len - 1) {
+        return false;
+    }
+    char *grown = realloc(m->reasoning, old_len + add + 1);
+    if (grown == NULL) {
+        return false;
+    }
+    char *p = grown + old_len;
+    for (const char *s = text; *s != '\0'; s++) {
+        if (*s != '\r') {
+            *p++ = *s;
+        }
+    }
+    *p = '\0';
+    m->reasoning = grown;
+    return true;
+}
+
+int chat_set_reasoning(Chat *chat, char *reasoning)
+{
+    if (chat == NULL || chat->len == 0) {
+        return -1;
+    }
+    ChatMessage *m = &chat->msgs[chat->len - 1];
+    free(m->reasoning);
+    m->reasoning = NULL;
+    if (reasoning == NULL || reasoning[0] == '\0') {
+        free(reasoning);
+        return 0; /* leeres reasoning loescht vorhandenes */
+    }
+    m->reasoning = reasoning; /* ownership beim chat */
+    return 0;
 }
 
 void chat_clear(Chat *chat)
@@ -759,6 +821,7 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
             continue;
         }
         ChatRole role = chat->msgs[mi].role;
+        const ChatMessage *cmsg = &chat->msgs[mi];
         size_t count_before = count;
 
         /* anzeige-kopie: roh -> dekodiert. schlaegt das dekodieren
@@ -767,12 +830,45 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
         char *dec = chat_decode_escapes(raw, ESC_DECODE_TEXT);
         const char *text = (dec != NULL) ? dec : raw;
         size_t text_off = 0;
+
+        /* thinking als PREFIX der anzeige-kopie: reasoning + '\n' +
+         * text in EINEM string, die wrap-schleife laeuft ganz
+         * normal darueber. zeilen, die im prefix beginnen (off <
+         * think_len), werden nachtraeglich als thinking markiert
+         * (tool == -3) und dim gerendert – markdown gilt dort
+         * nicht. text und reasoning bleiben in der NACHRICHT
+         * getrennt: api-round-trip und session-log sehen nie den
+         * kombinierten string. */
+        char *combined = NULL;
+        size_t think_len = 0;
+        if (role == CHAT_ROLE_ASSISTANT && cmsg->reasoning != NULL &&
+            cmsg->reasoning[0] != '\0') {
+            char *think = chat_decode_escapes(cmsg->reasoning, ESC_DECODE_TEXT);
+            const char *think_text = (think != NULL) ? think : cmsg->reasoning;
+            size_t tl = strlen(think_text);
+            size_t al = strlen(text);
+            combined = malloc(tl + 1 + al + 1);
+            if (combined == NULL) {
+                die("out of memory");
+            }
+            memcpy(combined, think_text, tl);
+            combined[tl] = '\n'; /* trennzeilen-umbruch zwischen */
+                                 /* thinking und antwort-text    */
+            memcpy(combined + tl + 1, text, al + 1);
+            free(think);
+            free(dec);
+            dec = NULL;
+            text = combined;
+            think_len = tl;
+        }
+
         disp_append(text, &text_off);
         if (mi < g_disp_offs_n) {
             g_disp_offs[mi] = text_off;
         }
-        /* dec bleibt bis zum ende der iteration am leben: alle
-         * off/len verweisen ueber `text` auf dec (bzw. die kopie) */
+        /* dec (bzw. combined) bleibt bis zum ende der iteration am
+         * leben: alle off/len verweisen ueber `text` auf dec (bzw.
+         * die kopie) */
 
         /* markdown-bloecke NUR fuer ki-antworten: tabellen werden
          * als ausgerichtete darstellung emittiert (volle breite),
@@ -954,20 +1050,34 @@ size_t chat_wrap(const Chat *chat, int width, ChatLine *out, size_t out_max)
             }
         }
 
+        /* thinking-zeilen markieren: jede text-zeile, die im
+         * reasoning-prefix beginnt (off < think_len), wird zur
+         * thinking-zeile (tool == -3) – der renderer zeigt sie dim,
+         * ohne markdown. tabellen im thinking bleiben tabellen
+         * (tool == -2, unmarkiert) – kosmetisch, aber harmlos. */
+        if (think_len > 0) {
+            for (size_t k = count_before; k < count && k < out_max; k++) {
+                if (out[k].tool == -1 && out[k].off < think_len) {
+                    out[k].tool = -3;
+                }
+            }
+        }
+
         /* offs dieser nachricht in die kopie verschieben: die
          * zeilen wurden relativ zum nachricht-text geplant, die
-         * kopie enthaelt ihn aber ab text_off. NUR textzeilen
-         * (tool == -1) zeigen in den nachricht-text – tabellen-
-         * zeilen (tool == -2) in den tabellen-display-string,
-         * tool-call-zeilen (tool >= 0) in den call-display-string,
-         * die bleiben wie sie sind. */
+         * kopie enthaelt ihn aber ab text_off. text- und thinking-
+         * zeilen (tool -1/-3) zeigen in den nachricht-text –
+         * tabellen-zeilen (tool == -2) in den tabellen-display-
+         * string, tool-call-zeilen (tool >= 0) in den call-display-
+         * string, die bleiben wie sie sind. */
         if (text_off > 0) {
             for (size_t k = count_before; k < count && k < out_max; k++) {
-                if (out[k].tool == -1) {
+                if (out[k].tool == -1 || out[k].tool == -3) {
                     out[k].off += text_off;
                 }
             }
         }
+        free(combined);
         free(dec); /* jetzt erst: die zeilen zeigen in die kopie */
     }
     return count;

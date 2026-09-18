@@ -689,12 +689,6 @@ static void handle_settings(AppState *state, Config *cfg, Key k)
             state->dialog = (DialogState){0};
             state->dirty = true;
             break;
-        case SET_SYSTEM_PROMPT:
-            /* submenu: default / off / edit, frische suche */
-            state->prompt_sub = true;
-            state->dialog = (DialogState){0};
-            state->dirty = true;
-            break;
         case SET_CONFIRM_QUIT:
             /* boolean: enter schaltet nur um, dialog bleibt offen,
              * damit man den neuen wert direkt sieht */
@@ -752,76 +746,6 @@ static void handle_theme(AppState *state, Config *cfg, Key k)
                 config_persist(cfg);
                 state->dirty = true; /* farben gelten sofort */
             }
-        }
-        break;
-    }
-    default:
-        break;
-    }
-}
-
-/* system-prompt-untermenue. "default" und "off" setzen die config
- * direkt (der dialog bleibt offen, man sieht den neuen zustand
- * sofort); "edit" schliesst den dialog und uebergibt an das
- * eingabefeld, das den vollen zeilen-editor mitbringt. */
-static void handle_prompt(AppState *state, Config *cfg, Key k)
-{
-    if (dialog_navigate(state, k)) {
-        state->dirty = true;
-        return;
-    }
-
-    switch (k.kind) {
-    case KEY_ESCAPE:
-        /* zurueck in die settings-liste, nicht dialog schliessen */
-        state->prompt_sub = false;
-        state->dialog = (DialogState){0};
-        state->confirm_quit = false;
-        state->dirty = true;
-        break;
-    case KEY_ENTER:
-    case KEY_NEWLINE: {
-        int hits[DIALOG_MATCH_MAX];
-        int n = names_match(PROMPT_OPT_NAMES, PROMPT_OPT_COUNT,
-                            state->dialog.search, hits, DIALOG_MATCH_MAX);
-        if (n == 0 || state->dialog.selected >= n) {
-            break; /* kein treffer: nichts zu tun */
-        }
-        switch ((PromptOpt)hits[state->dialog.selected]) {
-        case PROMPT_DEFAULT:
-            free(cfg->system_prompt);
-            cfg->system_prompt = NULL; /* eingebaute vorlage */
-            config_persist(cfg);
-            (void)session_prompt_changed(&state->session, NULL);
-            state->dirty = true;
-            break;
-        case PROMPT_OFF:
-            free(cfg->system_prompt);
-            cfg->system_prompt = dup_str(""); /* bewusst keiner */
-            if (cfg->system_prompt == NULL) {
-                die("out of memory");
-            }
-            config_persist(cfg);
-            (void)session_prompt_changed(&state->session, "");
-            state->dirty = true;
-            break;
-        case PROMPT_EDIT:
-            /* dialog zu, eingabefeld auf. steht schon ein eigener
-             * text in der config, wird er zum bearbeiten vorgelegt;
-             * bei default/aus faengt man leer an. */
-            state->settings_dialog = false;
-            state->prompt_sub = false;
-            state->dialog = (DialogState){0};
-            state->prompt_edit = true;
-            input_set_text(&state->input, (cfg->system_prompt != NULL &&
-                                           cfg->system_prompt[0] != '\0')
-                                              ? cfg->system_prompt
-                                              : "");
-            state->cmd_active = false;
-            state->dirty = true;
-            break;
-        case PROMPT_OPT_COUNT:
-            break;
         }
         break;
     }
@@ -890,7 +814,7 @@ static void sessions_dialog_close(AppState *state)
     state->dirty = true;
 }
 
-static void handle_sessions(AppState *state, Config *cfg, Key k)
+static void handle_sessions(AppState *state, Key k)
 {
     if (dialog_navigate(state, k)) {
         state->dirty = true;
@@ -920,21 +844,9 @@ static void handle_sessions(AppState *state, Config *cfg, Key k)
         if (!state->session.active || strcmp(state->session.id, id) != 0) {
             session_end(&state->session);
             if (session_open(&state->session, id) == 0) {
-                /* prompt-snapshot der session wiederherstellen:
-                 * sie soll danach exakt so weitergehen, wie sie
-                 * angefangen wurde (NULL = default, "" = aus) */
-                free(cfg->system_prompt);
-                cfg->system_prompt = (state->session.system_prompt != NULL)
-                                         ? dup_str(state->session.system_prompt)
-                                         : NULL;
-                if (cfg->system_prompt == NULL &&
-                    state->session.system_prompt != NULL) {
-                    die("out of memory");
-                }
-                config_persist(cfg);
-
                 chat_clear(&state->chat);
-                state->ctx.total_prompt = 0;
+                state->ctx.last_prompt = 0;
+                state->ctx.last_cached = 0;
                 state->ctx.total_completion = 0;
                 state->ctx.dropped = 0;
                 ctx_reset(&state->ctx); /* alte summary weg, das
@@ -1076,6 +988,44 @@ static void cmd_parse(const AppState *st, char *word, size_t word_sz,
     }
 }
 
+/* /compact: die manuelle compaction als mini-turn. derselbe rahmen
+ * wie eine nachricht – busy-spinner, redraw/tick-hooks, arbeitszeit –
+ * nur dass send_compact_now statt send_stream laeuft (kein platz-
+ * halter im chat, die notices kommen aus send.c). r/c sind die
+ * lokalen kopien von handle_all: ein resize waehrend des calls
+ * aktualisiert den StreamRedrawCtx, nicht die main-variablen. */
+static void run_compact(AppState *state, Config *cfg, int r, int c)
+{
+    input_reset(&state->input);
+    state->cmd_active = false;
+    state->busy = true;
+    state->busy_start_ms = mono_ms();
+    draw(r, c, state, cfg);
+
+    StreamRedrawCtx rc = {
+        .state = state,
+        .cfg = cfg,
+        .rows = r,
+        .cols = c,
+    };
+    SendHooks hooks = {
+        .ctx = &rc,
+        .redraw = stream_redraw,
+        .tick = stream_tick,
+    };
+    (void)send_compact_now(state, cfg, &hooks);
+
+    state->busy = false;
+    /* compaction ist arbeit der ki wie ein turn: mitzaehlen, der
+     * spinner zeigt sie ja auch als solche */
+    if (state->busy_start_ms > 0) {
+        state->worked_ms += mono_ms() - state->busy_start_ms;
+        state->busy_start_ms = 0;
+        session_worked_set(&state->session, state->worked_ms);
+    }
+    state->dirty = true;
+}
+
 static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
                        Key k)
 {
@@ -1103,27 +1053,6 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
         char word[64];
         char args[512];
         cmd_parse(state, word, sizeof word, args, sizeof args);
-
-        /* system-prompt bearbeiten: enter speichert und geht zurueck
-         * in den chat. der text landet NICHT in der history – das
-         * ist keine nachricht an das modell. leeres feld heisst
-         * hier "zurueck zur eingebauten vorlage", nicht "aus": wer
-         * den prompt abschalten will, nimmt die option "off". */
-        if (state->prompt_edit) {
-            char *text = chat_flatten_input(input);
-            free(cfg->system_prompt);
-            cfg->system_prompt = text; /* NULL = wieder default */
-            config_persist(cfg);
-            /* snapshot der offenen session nachziehen: ein resume soll
-             * den prompt wiederherstellen, den die session zuletzt
-             * hatte, nicht den von ihrem anfang */
-            (void)session_prompt_changed(&state->session, cfg->system_prompt);
-            input_reset(input);
-            state->prompt_edit = false;
-            state->cmd_active = false;
-            state->dirty = true;
-            break;
-        }
 
         /* alles abgeschickte kommt in die history – auch befehle,
          * die will man genauso wiederholen. muss VOR der
@@ -1157,13 +1086,8 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
             case CMD_SETTINGS:
                 cmd_settings(state);
                 break;
-            case CMD_SYSTEM_PROMPT:
-                /* /system-prompt: das terminal geht an den editor
-                 * und kommt danach hierher zurueck. r/c sind die
-                 * zeiger der main-schleife: draw_content_reset
-                 * druckt den schwanz, das frame danach sieht die
-                 * (vom editor moeglichst andere) terminalgroesse */
-                cmd_system_prompt(state, cfg, &r, &c);
+            case CMD_COMPACT:
+                run_compact(state, cfg, r, c);
                 break;
             default: {
                 char prefix[64];
@@ -1189,8 +1113,8 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
                     case CMD_SETTINGS:
                         cmd_settings(state);
                         break;
-                    case CMD_SYSTEM_PROMPT:
-                        cmd_system_prompt(state, cfg, &r, &c);
+                    case CMD_COMPACT:
+                        run_compact(state, cfg, r, c);
                         break;
                     default:
                         break;
@@ -1289,7 +1213,6 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
         state->dirty = true;
         break;
     case KEY_ESCAPE:
-        state->prompt_edit = false;     /* bearbeitung verworfen */
         history_reset(&state->history); /* entwurf ist hinfaellig */
         input_reset(input);
         state->cmd_active = input_in_cmd(input);
@@ -1415,16 +1338,9 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
         state->dirty = true;
         break;
     case KEY_UP:
-        /* history-blaettern NUR im normalen chat-input. das system-
-         * prompt-feld ist ein anderer modus (prompt_edit): dort
-         * sind pfeile nur cursorbewegung, die nachrichten-history
-         * hat dort nichts verloren. (dialoge kommen gar nicht erst
-         * hierher – handle_key leitet sie an dialog_navigate.) */
-        if (state->prompt_edit) {
-            (void)input_screen_up(input, input_field_width(c));
-            state->dirty = true;
-            break;
-        }
+        /* history-blaettern im normalen chat-input.
+         * (dialoge kommen gar nicht erst hierher – handle_key
+         * leitet sie an dialog_navigate.) */
         /* in einer mehrzeiligen eingabe erst die zeile wechseln;
          * erst an der obersten zeile geht es in die history. genau
          * so verhalten sich zsh und fish.
@@ -1440,11 +1356,6 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
         history_back(state, input);
         break;
     case KEY_DOWN:
-        if (state->prompt_edit) {
-            (void)input_screen_down(input, input_field_width(c));
-            state->dirty = true;
-            break;
-        }
         if (input_screen_down(input, input_field_width(c))) {
             state->dirty = true;
             break;
@@ -1453,16 +1364,10 @@ static void handle_all(AppState *state, Config *cfg, int *rows, int *cols,
         break;
     case KEY_CTRL_P:
         /* readline: ctrl+p/n sind immer history, auch mitten in
-         * einer mehrzeiligen eingabe – aber nie im prompt-feld */
-        if (state->prompt_edit) {
-            break;
-        }
+         * einer mehrzeiligen eingabe */
         history_back(state, input);
         break;
     case KEY_CTRL_N:
-        if (state->prompt_edit) {
-            break;
-        }
         history_forward(state, input);
         break;
     case KEY_NONE:
@@ -1499,10 +1404,8 @@ void handle_key(AppState *state, Config *cfg, int *rows, int *cols)
         handle_settings(state, cfg, k);
     } else if (ui_mode(state) == MODE_THEME) {
         handle_theme(state, cfg, k);
-    } else if (ui_mode(state) == MODE_PROMPT) {
-        handle_prompt(state, cfg, k);
     } else if (ui_mode(state) == MODE_SESSIONS) {
-        handle_sessions(state, cfg, k);
+        handle_sessions(state, k);
     } else if (ui_mode(state) == MODE_MODELS) {
         handle_models(state, cfg, k);
     } else {
